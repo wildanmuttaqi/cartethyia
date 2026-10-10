@@ -216,6 +216,11 @@ compliant crawlers not to crawl the site; it is not an access-control mechanism.
 Compose trusts forwarded client IP headers only from `172.18.0.0/16`, the
 default Docker bridge subnet used by this stack. If the VPS uses another subnet,
 set `TRUSTED_PROXY_CIDRS` in `.env` to that subnet before starting the stack.
+If another reverse proxy sits in front of this Nginx, `nginx.conf` must trust
+that proxy's source IP with `set_real_ip_from`; it currently trusts only
+`10.0.0.19` and reads the client address from `X-Forwarded-For`. The upstream
+proxy must set or append that header with the actual client address. Replace
+`10.0.0.19` if the upstream proxy uses a different address.
 
 PostgreSQL data persists in a named volume and is not published to the host. The
 Compose files use a local-only default password; change it in the app's
