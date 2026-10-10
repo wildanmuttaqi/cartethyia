@@ -6,7 +6,7 @@ services:
     image: cartethyia:local
     container_name: cartethyia
     ports:
-      - "20132:12800"
+      - "127.0.0.1:20132:12800"
     env_file:
       - "${CARTETHYIA_ENV_FILE:-.env}"
     environment:
@@ -27,6 +27,19 @@ services:
       # Lite database, install id, and payload captures live under /app/data;
       # without this mount a container replace wipes them.
       - cartethyia-data:/app/data
+    restart: unless-stopped
+    networks:
+      - cartethyia
+
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    container_name: cartethyia-cloudflared
+    profiles: ["tunnel"]
+    command: ["tunnel", "--no-autoupdate", "run"]
+    environment:
+      TUNNEL_TOKEN: ${CLOUDFLARE_TUNNEL_TOKEN:-}
+    depends_on:
+      - cartethyia
     restart: unless-stopped
     networks:
       - cartethyia

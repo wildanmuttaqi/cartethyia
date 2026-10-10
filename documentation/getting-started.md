@@ -192,13 +192,25 @@ Docker Compose defaults to Full mode using the locally cached
 
 ```bash
 docker compose up --build -d
-docker compose logs -f app
+docker compose logs -f cartethyia
 ```
 
 Stop the stack with:
 
 ```bash
 docker compose down
+```
+
+For Cloudflare Tunnel, set `CLOUDFLARE_TUNNEL_TOKEN` in `.env` and set
+`CARTETHYIA_PUBLIC_ORIGIN` to the public HTTPS hostname. Configure that hostname
+in Cloudflare Zero Trust to route to `http://cartethyia:12800`. The `cloudflared`
+container shares the private Compose network with Cartethyia; the app's host port
+is bound to `127.0.0.1` and does not need to be opened to the internet. Start the
+optional tunnel profile with:
+
+```bash
+docker compose --profile tunnel up --build -d
+docker compose logs -f cloudflared
 ```
 
 PostgreSQL data persists in a named volume and is not published to the host. The
