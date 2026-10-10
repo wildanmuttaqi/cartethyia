@@ -1,0 +1,74 @@
+services:
+  cartethyia:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: cartethyia:local
+    container_name: cartethyia
+    ports:
+      - "20132:12800"
+    env_file:
+      - "${CARTETHYIA_ENV_FILE:-.env}"
+    environment:
+      NODE_ENV: production
+      PORT: "12800"
+      DASHBOARD_DIST: /app/dist/dashboard
+      CARTETHYIA_DATA_DIR: /app/data
+      CARTETHYIA_PUBLIC_ORIGIN: ${CARTETHYIA_PUBLIC_ORIGIN:-http://localhost:20132}
+      CARTETHYIA_DB_MODE: full
+      DATABASE_URL: postgres://cartethyia:local-only-cartethyia@cartethyia-postgres:5432/cartethyia
+      REDIS_URL: redis://cartethyia-redis:6379
+    depends_on:
+      cartethyia-redis:
+        condition: service_healthy
+      cartethyia-postgres:
+        condition: service_healthy
+    volumes:
+      # Lite database, install id, and payload captures live under /app/data;
+      # without this mount a container replace wipes them.
+      - cartethyia-data:/app/data
+    restart: unless-stopped
+    networks:
+      - cartethyia
+
+  cartethyia-redis:
+    image: redis:7.4.2-alpine
+    container_name: cartethyia-redis
+    restart: unless-stopped
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    networks:
+      - cartethyia
+
+  cartethyia-postgres:
+    image: postgres:16-alpine
+    pull_policy: never
+    container_name: cartethyia-postgres
+    environment:
+      POSTGRES_USER: cartethyia
+      POSTGRES_PASSWORD: local-only-cartethyia
+      POSTGRES_DB: cartethyia
+    volumes:
+      - postgresdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U cartethyia -d cartethyia"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+    networks:
+      - cartethyia
+
+volumes:
+  redisdata:
+  cartethyia-data:
+  postgresdata:
+
+networks:
+  cartethyia:
+    driver: bridge
