@@ -12,6 +12,10 @@ const OPENROUTER_REQUIRED_HEADERS: Readonly<Record<string, string>> = {
   "HTTP-Referer": "https://endpoint-proxy.local",
   "X-Title": "Endpoint Proxy",
 };
+const OPENROUTER_ENDPOINT_PATHS: Readonly<Partial<Record<ModelDefinition["wireFamily"], string>>> = {
+  chat: "/chat/completions",
+  responses: "/responses",
+};
 
 /**
  * OpenRouter's non-chat service models.
@@ -38,14 +42,14 @@ export const OPENROUTER_MODELS: readonly ModelDefinition[] = [
 /** OpenRouter adapter spec; the registry builds it via `createApiKeyAdapter`. */
 export const OPENROUTER_SPEC: ApiKeyProviderSpec = {
   provider_id: OPENROUTER_PROVIDER_ID,
-  endpoint_paths_by_wire_family: {},
+  endpoint_paths_by_wire_family: OPENROUTER_ENDPOINT_PATHS,
   extra_headers: OPENROUTER_REQUIRED_HEADERS,
 };
 
 export async function discoverOpenrouterModels(
   input: DiscoveryInput,
 ): Promise<readonly ModelDefinition[] | null> {
-  return fetchOpenAICompatibleModels({
+  const discovered = await fetchOpenAICompatibleModels({
     baseUrl: providerBaseUrl("openrouter"),
     headers: {
       authorization: `Bearer ${input.credential}`,
@@ -54,4 +58,10 @@ export async function discoverOpenrouterModels(
     ...(input.signal ? { signal: input.signal } : {}),
     ...(input.fetcher ? { fetcher: input.fetcher } : {}),
   });
+  if (discovered === null) return null;
+  return discovered.map((model) => ({
+    ...model,
+    endpointPath:
+      OPENROUTER_ENDPOINT_PATHS[model.wireFamily] ?? model.endpointPath,
+  }));
 }

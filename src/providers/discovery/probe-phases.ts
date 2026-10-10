@@ -203,7 +203,12 @@ export async function resolveProbeTarget(args: {
     const profile = providerWireRow?.compatibilityProfile as CompatibilityProfile | null;
     const ep =
       profile?.endpoint_paths_by_wire_family?.[family] ??
-      staticEndpointForWire(bundledModelCatalog, providerId, family) ??
+      staticEndpointForWire(
+        bundledModelCatalog,
+        providerId,
+        family,
+        requestedServiceKind,
+      ) ??
       discoveryPathsFor(providerId)?.[family];
     return stripEndpointBasePath(
       ep ?? defaultEndpoints[family] ?? "/v1/chat/completions",

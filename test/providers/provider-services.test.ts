@@ -5,6 +5,79 @@ import {
   providerSupportsWebSearch,
 } from "../../src/providers/provider-metadata";
 import { sanitizeProviderResponse } from "../../src/console/providers/catalog/provider-operations";
+import {
+  discoverOpenrouterModels,
+  OPENROUTER_MODELS,
+  OPENROUTER_SPEC,
+} from "../../src/providers/integrations/openrouter";
+import { discoveryPathsFor, staticEndpointForWire } from "../../src/providers/discovery/probe-wire";
+import { resolveProbeTarget } from "../../src/providers/discovery/probe-phases";
+import type { CartethyiaDatabase } from "../../src/persistence/postgres";
+
+describe("static provider endpoints", () => {
+  test("does not route OpenRouter chat probes through the System One endpoint", () => {
+    const catalog = new Map([["openrouter", OPENROUTER_MODELS]]);
+
+    expect(staticEndpointForWire(catalog, "openrouter", "chat")).toBeUndefined();
+    expect(
+      staticEndpointForWire(catalog, "openrouter", "chat", "systemone"),
+    ).toBe("/systemone");
+    expect(discoveryPathsFor("openrouter")).toEqual({
+      chat: "/chat/completions",
+      responses: "/responses",
+    });
+    expect(OPENROUTER_SPEC.endpoint_paths_by_wire_family).toEqual(
+      discoveryPathsFor("openrouter"),
+    );
+  });
+
+  test("resolves LLM chat and native System One to separate OpenRouter paths", async () => {
+    const catalog = new Map([["openrouter", OPENROUTER_MODELS]]);
+    const shared = {
+      db: {} as unknown as CartethyiaDatabase,
+      bundledModelCatalog: catalog,
+      defaultEndpoints: {
+        chat: "/v1/chat/completions",
+        responses: "/v1/responses",
+        messages: "/v1/messages",
+      },
+      providerId: "openrouter",
+      providerWireRow: undefined,
+    };
+    const modelId = "apodex/apodex-1.1-mini:free";
+    const chat = await resolveProbeTarget({
+      ...shared,
+      modelId,
+      request: { modelId, wireFamily: "chat", serviceKind: "llm" },
+    });
+    const systemOne = await resolveProbeTarget({
+      ...shared,
+      modelId: "typesafe/jev-1.13",
+      request: {
+        modelId: "typesafe/jev-1.13",
+        wireFamily: "chat",
+        serviceKind: "systemone",
+      },
+    });
+
+    expect(chat.endpointPath).toBe("/chat/completions");
+    expect(systemOne.endpointPath).toBe("/systemone");
+  });
+
+  test("normalizes generic model-discovery routes to OpenRouter's API base", async () => {
+    const discovered = await discoverOpenrouterModels({
+      credential: "test-api-key",
+      fetcher: (async () =>
+        new Response(
+          JSON.stringify({ data: [{ id: "apodex/apodex-1.1-mini:free" }] }),
+          { headers: { "content-type": "application/json" } },
+        )) as unknown as typeof fetch,
+    });
+
+    expect(discovered?.[0]?.endpointPath).toBe("/chat/completions");
+  });
+});
+
 describe("provider service taxonomy", () => {
   test("defaults providers to LLM and declares real search surfaces", () => {
     expect(providerServiceKinds("openai")).toEqual(["llm"]);

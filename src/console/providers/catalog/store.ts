@@ -449,18 +449,16 @@ export class DrizzleProviderCatalogStore implements ProviderCatalogStore {
       throw new ConsoleDomainError("provider_not_found", 404, `Provider ${providerId} not found`);
     }
     const family = (wireFamily ?? "chat") as WireFamily;
-    // Static endpoint from the provider's own bundled catalog via the probing
-    // service (the same startup-built map this store is constructed with).
-    // Without this, bundled providers on versioned bases (cline) get the
-    // generic `/v1/…` default, which joins into an unreachable path and every
-    // probe/dispatch 404s.
-    const staticEndpoint = await this.probing.resolveStaticEndpoint(providerId, family);
+    // Resolve the endpoint from the provider's static catalog or registry
+    // contract through the same startup-built map probes use. Without this,
+    // providers on versioned bases can get a generic path that is unreachable.
+    const providerEndpoint = await this.probing.resolveProviderEndpoint(providerId, family);
     const endpointPath = endpointPathForProviderModel(
       providerId,
       family,
       owner[0].compatibilityProfile,
       owner[0].baseUrl,
-      staticEndpoint === undefined ? undefined : { [family]: staticEndpoint },
+      providerEndpoint === undefined ? undefined : { [family]: providerEndpoint },
     );
     if (modelIds.length === 0) return;
     // Single multi-row insert (was N sequential round-trips) and upsert the

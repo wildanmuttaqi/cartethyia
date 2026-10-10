@@ -24,6 +24,7 @@ import { modelsDevCatalog } from "./models-dev-catalog";
 import { fetchOpenAICompatibleModels } from "./openai-model-discovery";
 import {
   applyDiscoveredWire,
+  discoveryPathsFor,
   resolveDiscoveredWire,
   staticEndpointForWire,
   type DiscoveredModelWire,
@@ -178,15 +179,17 @@ export class ProviderProbingService {
   }
 
   /**
-   * Static endpoint for one provider + wire family, if the bundled catalog
-   * ships a static definition for it. Used by manual registration (via the
-   * console store) so it resolves the same provider-truth endpoints as probes.
+   * Resolves a provider's model endpoint from its static catalog or registry
+   * contract. Manual model registration uses the same route as probes.
    */
-  async resolveStaticEndpoint(
+  async resolveProviderEndpoint(
     providerId: string,
     wireFamily: WireFamily,
   ): Promise<string | undefined> {
-    return staticEndpointForWire(this.bundledModelCatalog, providerId, wireFamily);
+    return (
+      staticEndpointForWire(this.bundledModelCatalog, providerId, wireFamily) ??
+      discoveryPathsFor(providerId)?.[wireFamily]
+    );
   }
 
   /** One-shot connectivity test: resolves a usable account + the real per-provider

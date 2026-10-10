@@ -16,7 +16,7 @@
  * against. `discoveryPathsFor` now reads the registry, so a provider declares
  * its endpoint paths once.
  */
-import type { WireFamily } from "../../transport/canonical-model";
+import type { ServiceKind, WireFamily } from "../../transport/canonical-model";
 import type { CompatibilityProfile } from "../provider-metadata";
 import { isBundledProviderId, type ModelDefinition } from "../provider-registry";
 import { PROVIDER_CAPABILITIES } from "../default-registry";
@@ -167,8 +167,15 @@ export function staticEndpointForWire(
   catalog: ReadonlyMap<string, readonly ModelDefinition[]>,
   providerId: string,
   wireFamily: WireFamily,
+  serviceKind: ServiceKind = "llm",
 ): string | undefined {
-  return catalog.get(providerId)?.find((def) => def.wireFamily === wireFamily)?.endpointPath;
+  return catalog
+    .get(providerId)
+    ?.find(
+      (def) =>
+        def.wireFamily === wireFamily &&
+        (def.serviceKind ?? "llm") === serviceKind,
+    )?.endpointPath;
 }
 
 function matchModelWireFamily(

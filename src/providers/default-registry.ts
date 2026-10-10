@@ -374,6 +374,10 @@ export const PROVIDER_CAPABILITIES = {
     loadModels: async () => (await import("./integrations/hermes")).HERMES_MODELS,
   },
   openrouter: {
+    endpointPathsByWireFamily: {
+      chat: "/chat/completions",
+      responses: "/responses",
+    },
     loadAdapter: async () => createApiKeyAdapter((await import("./integrations/openrouter")).OPENROUTER_SPEC),
     loadModels: async () => (await import("./integrations/openrouter")).OPENROUTER_MODELS,
     loadModelDiscovery: async () => async ({ credential }) => (await import("./integrations/openrouter")).discoverOpenrouterModels({ credential }),
