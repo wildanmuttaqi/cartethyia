@@ -5,8 +5,8 @@ services:
       dockerfile: Dockerfile
     image: cartethyia:local
     container_name: cartethyia
-    ports:
-      - "127.0.0.1:20132:12800"
+    expose:
+      - "12800"
     env_file:
       - "${CARTETHYIA_ENV_FILE:-.env}"
     environment:
@@ -14,7 +14,7 @@ services:
       PORT: "12800"
       DASHBOARD_DIST: /app/dist/dashboard
       CARTETHYIA_DATA_DIR: /app/data
-      CARTETHYIA_PUBLIC_ORIGIN: ${CARTETHYIA_PUBLIC_ORIGIN:-http://localhost:20132}
+      CARTETHYIA_PUBLIC_ORIGIN: ${CARTETHYIA_PUBLIC_ORIGIN:-http://localhost}
       CARTETHYIA_DB_MODE: full
       DATABASE_URL: postgres://cartethyia:local-only-cartethyia@cartethyia-postgres:5432/cartethyia
       REDIS_URL: redis://cartethyia-redis:6379
@@ -31,15 +31,17 @@ services:
     networks:
       - cartethyia
 
-  cloudflared:
-    image: cloudflare/cloudflared:latest
-    container_name: cartethyia-cloudflared
-    profiles: ["tunnel"]
-    command: ["tunnel", "--protocol", "http2", "--no-autoupdate", "run"]
-    environment:
-      TUNNEL_TOKEN: ${CLOUDFLARE_TUNNEL_TOKEN:-}
+  nginx:
+    image: nginx:alpine
+    container_name: cartethyia-nginx
+    ports:
+      - "80:80"
     depends_on:
-      - cartethyia
+      cartethyia:
+        condition: service_healthy
+    volumes:
+      - ./nginx.conf:/etc/nginx/conf.d/default.conf:ro
+      - ./robots.txt:/usr/share/nginx/html/robots.txt:ro
     restart: unless-stopped
     networks:
       - cartethyia

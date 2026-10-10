@@ -187,8 +187,7 @@ Useful endpoints:
 
 ## 7. Docker
 
-Docker Compose defaults to Full mode using the locally cached
-`postgres:16-alpine` image and bundled Redis coordination:
+Docker Compose defaults to Full mode with PostgreSQL and Redis services:
 
 ```bash
 docker compose up --build -d
@@ -201,21 +200,19 @@ Stop the stack with:
 docker compose down
 ```
 
-For Cloudflare Tunnel, set `CLOUDFLARE_TUNNEL_TOKEN` in `.env` and set
-`CARTETHYIA_PUBLIC_ORIGIN` to the public HTTPS hostname. Configure that hostname
-in Cloudflare Zero Trust to route to `http://cartethyia:12800`. The `cloudflared`
-container shares the private Compose network with Cartethyia; the app's host port
-is bound to `127.0.0.1` and does not need to be opened to the internet. Start the
-optional tunnel profile with:
+Nginx publishes HTTP on port `80` and proxies traffic to Cartethyia over the
+private Compose network. Point your domain's DNS record to the VPS public IP and
+set `CARTETHYIA_PUBLIC_ORIGIN` in `.env` to `http://your-domain`. Allow inbound
+TCP port `80` in the VPS, Proxmox, and provider firewalls. Start the stack with:
 
 ```bash
-docker compose --profile tunnel up --build -d
-docker compose logs -f cloudflared
+docker compose up --build -d
+docker compose logs -f nginx
 ```
 
-The Compose tunnel uses HTTP/2, which requires outbound TCP port `7844` from the
-VPS. Allow that egress in the VPS/provider and Proxmox firewalls; opening an
-inbound port on the VPS is not required for the tunnel connection.
+This setup serves plain HTTP only. Do not use it to send credentials over an
+untrusted network until HTTPS is configured. The root `robots.txt` asks
+compliant crawlers not to crawl the site; it is not an access-control mechanism.
 
 PostgreSQL data persists in a named volume and is not published to the host. The
 Compose files use a local-only default password; change it in the app's
