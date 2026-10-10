@@ -213,6 +213,9 @@ docker compose logs -f nginx
 This setup serves plain HTTP only. Do not use it to send credentials over an
 untrusted network until HTTPS is configured. The root `robots.txt` asks
 compliant crawlers not to crawl the site; it is not an access-control mechanism.
+Compose trusts forwarded client IP headers only from `172.18.0.0/16`, the
+default Docker bridge subnet used by this stack. If the VPS uses another subnet,
+set `TRUSTED_PROXY_CIDRS` in `.env` to that subnet before starting the stack.
 
 PostgreSQL data persists in a named volume and is not published to the host. The
 Compose files use a local-only default password; change it in the app's
