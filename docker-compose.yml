@@ -35,7 +35,7 @@ services:
     image: cloudflare/cloudflared:latest
     container_name: cartethyia-cloudflared
     profiles: ["tunnel"]
-    command: ["tunnel", "--no-autoupdate", "run"]
+    command: ["tunnel", "--protocol", "http2", "--no-autoupdate", "run"]
     environment:
       TUNNEL_TOKEN: ${CLOUDFLARE_TUNNEL_TOKEN:-}
     depends_on:
@@ -60,7 +60,6 @@ services:
 
   cartethyia-postgres:
     image: postgres:16-alpine
-    pull_policy: never
     container_name: cartethyia-postgres
     environment:
       POSTGRES_USER: cartethyia

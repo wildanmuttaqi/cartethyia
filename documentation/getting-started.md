@@ -213,6 +213,10 @@ docker compose --profile tunnel up --build -d
 docker compose logs -f cloudflared
 ```
 
+The Compose tunnel uses HTTP/2, which requires outbound TCP port `7844` from the
+VPS. Allow that egress in the VPS/provider and Proxmox firewalls; opening an
+inbound port on the VPS is not required for the tunnel connection.
+
 PostgreSQL data persists in a named volume and is not published to the host. The
 Compose files use a local-only default password; change it in the app's
 `DATABASE_URL` and PostgreSQL service settings before exposing or sharing this
