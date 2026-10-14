@@ -47,6 +47,19 @@ services:
     networks:
       - cartethyia
 
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    container_name: cartethyia-cloudflared
+    command: tunnel --no-autoupdate run --token ${CLOUDFLARE_TUNNEL_TOKEN:-}
+    depends_on:
+      nginx:
+        condition: service_started
+    profiles:
+      - cloudflare
+    restart: unless-stopped
+    networks:
+      - cartethyia
+
   cartethyia-redis:
     image: redis:7.4.2-alpine
     container_name: cartethyia-redis
