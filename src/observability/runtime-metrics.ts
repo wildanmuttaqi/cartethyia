@@ -11,12 +11,11 @@ import { readFileSync } from "node:fs";
 import { metrics } from "./metrics";
 import { trackMemoryUsage } from "./performance-metrics";
 import { log } from "./logger";
-import { resolveMemoryLimitOverrideBytes } from "../config";
-
+import { resolveMemoryLimitOverrideBytes } from "../config/timeouts";
+import { CONFIG_SPEC, readFlag } from "../config/spec";
 /** Live collection sizes sampled alongside process memory. */
 export interface RuntimeMetricSources {
   readonly routingRoundRobinEntries: () => { readonly combo: number; readonly provider: number };
-  readonly poolAgentEntries: () => number;
   /**
    * Tracked keys in the in-memory IP abuse store, or 0 when the store is
    * Redis-backed. Unlike the routing maps this one is fed by client-supplied
@@ -25,6 +24,11 @@ export interface RuntimeMetricSources {
   readonly ipAbuseKeys: () => number;
   /** Tracked keys in the in-process quota cache tier (0 when Redis-only paths are idle). */
   readonly quotaCacheEntries: () => number;
+  /**
+   * Live in-flight request count. Zero means the gateway is idle, so a
+   * synchronous full collection is safe (no request to stall).
+   */
+  readonly inFlight: () => number;
 }
 
 /** Cooldown between memory-pressure warnings so a sustained high-water mark does not flood logs. */
@@ -33,18 +37,30 @@ const PRESSURE_LOG_WINDOW_MS = 60_000;
 const PRESSURE_GC_WINDOW_MS = 60_000;
 /** Fraction of the resolved limit at which memory pressure is reported. */
 const PRESSURE_THRESHOLD = 0.8;
+/**
+ * Fallback limit used when neither an override nor a cgroup limit is
+ * discoverable (native development, macOS, Windows). Without it the pressure
+ * check bails and `Bun.gc` never runs, so an idle process holds its startup
+ * peak forever. 512 MiB keeps reclaim active without assuming a container.
+ */
+const DEFAULT_MEMORY_LIMIT_BYTES = 512 * 1024 * 1024;
+/** Cooldown between idle full collections. */
+const IDLE_GC_WINDOW_MS = 5 * 60_000;
+/** RSS retained above the post-collection baseline before another idle collection runs. */
+const IDLE_GC_MIN_GROWTH_BYTES = 32 * 1024 * 1024;
 
 /**
  * Resolves the effective memory limit for the process.
  *
  * Precedence: an explicit `CARTETHYIA_MEMORY_LIMIT_BYTES` override, then the
- * cgroup v2/v1 limit when running in a container. Returns `undefined` when no
- * limit is discoverable (native development, macOS, Windows).
+ * cgroup v2/v1 limit when running in a container. Falls back to
+ * {@link DEFAULT_MEMORY_LIMIT_BYTES} when no limit is discoverable (native
+ * development, macOS, Windows) so pressure-based reclaim still runs.
  */
 export function resolveMemoryLimitBytes(): number | undefined {
   const override = resolveMemoryLimitOverrideBytes();
   if (override !== undefined) return override;
-  if (process.platform !== "linux") return undefined;
+  if (process.platform !== "linux") return DEFAULT_MEMORY_LIMIT_BYTES;
   for (const path of [
     "/sys/fs/cgroup/memory.max",
     "/sys/fs/cgroup/memory/memory.limit_in_bytes",
@@ -59,7 +75,7 @@ export function resolveMemoryLimitBytes(): number | undefined {
       // File absent (cgroup v1 vs v2) or unreadable — try the next source.
     }
   }
-  return undefined;
+  return DEFAULT_MEMORY_LIMIT_BYTES;
 }
 
 /** Samples process memory and bounded-collection sizes into the metric registry. */
@@ -68,11 +84,30 @@ export class RuntimeMetricsSampler {
   private readonly gcOnPressure: boolean;
   private lastPressureLogAt = 0;
   private lastGcAt = 0;
+  private lastIdleGcAt = 0;
+  private rssAtLastGc = 0;
+  private inFlightSource: () => number = () => 0;
+
+  /**
+   * Binds the live in-flight count after the request state store exists. The
+   * sampler is constructed before that store, so the source is late-bound.
+   */
+  bindInFlight(source: () => number): void {
+    this.inFlightSource = source;
+  }
 
   constructor(
     private readonly sources: RuntimeMetricSources,
     limitBytes: number | undefined = resolveMemoryLimitBytes(),
-    gcOnPressure = true,
+    // Off by default: a forced collection is not how memory is meant to come
+    // back. The synchronous form (`Bun.gc(true)`) stops the shared event loop
+    // outright, so every concurrent request stalls inside it — which reads as
+    // a latency spike with no upstream cause. And it hides the actual defect:
+    // a process that only returns memory when something forces it to is a
+    // process that is still holding it. Bounded caches, released streams, and
+    // batched writers reclaim naturally; this is opt-in for an operator who
+    // has measured that they need it.
+    gcOnPressure = readFlag("CARTETHYIA_FORCED_GC", CONFIG_SPEC.CARTETHYIA_FORCED_GC),
   ) {
     this.limitBytes = limitBytes;
     this.gcOnPressure = gcOnPressure;
@@ -96,6 +131,7 @@ export class RuntimeMetricsSampler {
     metrics.cartethyia_quota_cache_entries.set(this.sources.quotaCacheEntries());
 
     this.checkPressure(memory.rss);
+    this.checkIdleReclaim(memory.rss);
   }
 
   private checkPressure(rss: number): void {
@@ -114,5 +150,28 @@ export class RuntimeMetricsSampler {
       `[memory] RSS ${(rss / 1024 / 1024).toFixed(1)}MiB exceeds 80% of the ` +
         `${(this.limitBytes / 1024 / 1024).toFixed(1)}MiB limit`,
     );
+  }
+
+  /**
+   * Reclaims memory while the gateway is idle.
+   *
+   * Triggered on RSS growth rather than heap growth: this process holds most of
+   * its footprint off-heap (adapters, TLS contexts, buffers), and `heapUsed`
+   * barely moves when those are allocated — a heap-based gate never opens, which
+   * is why an idle gateway held its startup peak indefinitely.
+   *
+   * A synchronous full collection is safe here because no request is in flight to
+   * stall, and it is the only form that actually returns pages to the OS; the
+   * async form used under pressure does not.
+   */
+  private checkIdleReclaim(rss: number): void {
+    if (!this.gcOnPressure) return;
+    if (this.inFlightSource() > 0) return;
+    const now = Date.now();
+    if (now - this.lastIdleGcAt < IDLE_GC_WINDOW_MS) return;
+    if (this.rssAtLastGc !== 0 && rss - this.rssAtLastGc < IDLE_GC_MIN_GROWTH_BYTES) return;
+    this.lastIdleGcAt = now;
+    Bun.gc(true);
+    this.rssAtLastGc = process.memoryUsage().rss;
   }
 }

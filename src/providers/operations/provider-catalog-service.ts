@@ -1,27 +1,25 @@
 // Provider assembly: builtin registry construction, BYOK wiring, and DB catalog materialization.
-import type { WireFamily } from "../../transport/canonical-model";
+import type { WireFamily } from "../../protocol/canonical-model";
 
 import { and, eq, isNotNull, isNull, notInArray, sql } from "drizzle-orm";
-import { GatewayError } from "../../transport/gateway-error";
-import {
-  isBundledProviderId,
-  parseProviderId,
-  type ProviderId,
-  type ModelDefinition,
-  ProviderRegistry,
-} from "../provider-registry";
-import { OpenAICompatibleAdapter } from "../compatible-adapter";
+import { mergeJson } from "../../persistence/dialect";
+import { GatewayError } from "../../protocol/gateway-error";
+import { isBundledProviderId, parseProviderId, type ProviderId } from "../provider-contracts";
+import type { ModelDefinition } from "../provider-model-definition";
+import { ProviderRegistry } from "../provider-registry";
+import { OpenAICompatibleAdapter } from "../adapters/compatible-adapter";
 import { resolveByokWireProfile } from "./byok-wire-profile";
 import { BUNDLED_PROVIDER_MODULES } from "../default-registry";
 import { getCachedModels } from "./model-catalog-cache";
-import type { CartethyiaDatabase } from "../../persistence/postgres";
+import { seedBundledModels } from "./provider-catalog-seeder";
+import type { CartethyiaDatabase } from "../../persistence/db-handle";
 import { providers } from "../../persistence/schema";
 import type { CompatibilityProfile } from "../provider-metadata";
 import { resolveCustomCliHeaders } from "./custom-cli-headers";
 import { GATEWAY_USER_AGENT } from "./gateway-user-agent";
 import { isIP } from "node:net";
 import { isAddressAllowed } from "../../network/ssrf";
-import type { SsrfPolicy } from "../../config";
+import type { SsrfPolicy } from "../../config/network";
 /**
  * Idempotently materializes every shipped provider in the database catalog.
  * The canonical provider definition supplies identity and routing defaults;
@@ -55,7 +53,11 @@ export async function seedBundledProviders(db: CartethyiaDatabase): Promise<void
       set: {
         wireFamilyDefault: sql`excluded.wire_family_default`,
         requiresAccount: sql`excluded.requires_account`,
-        compatibilityProfile: sql`COALESCE(${providers.compatibilityProfile}, '{}'::jsonb) || COALESCE(excluded.compatibility_profile, '{}'::jsonb)`,
+        compatibilityProfile: mergeJson(
+          sql`COALESCE(${providers.compatibilityProfile}, '{}')`,
+          sql`COALESCE(excluded.compatibility_profile, '{}')`,
+          db,
+        ),
       },
     });
 }
@@ -64,7 +66,7 @@ export async function seedBundledProviders(db: CartethyiaDatabase): Promise<void
  * Retires the global (`tenant_id IS NULL`) provider rows the bundle no longer
  * declares.
  *
- * Without this, dropping a provider from `provider-metadata.ts` left its
+ * Without this, dropping a provider from `metadata.ts` left its
  * `providers` row in place forever — the seed only ever adds. The row still
  * satisfied `list()`'s `globalOrOwnedBy`, but `isBundledProviderId`, the
  * predicate behind `isBuiltIn`, answered `false` for it, so the console drew it
@@ -123,6 +125,17 @@ export interface BundledProviderCatalog {
   readonly modelsByProvider: ReadonlyMap<string, readonly ModelDefinition[]>;
 }
 
+/**
+ * Every bundled provider's compiled catalog.
+ *
+ * All of them, whether or not the provider has an account. The compiled
+ * catalog is a property of the provider, not of this deployment's
+ * credentials, and gating the seed on `providersWithAccounts` meant a provider
+ * with no account yet listed no models at all — the console showed an empty
+ * catalog for a provider it had just shipped. It also meant the orphan prune
+ * in `seedBundledModels` never ran for those providers, so a row left behind by
+ * an older catalog survived forever, since pruning is part of the same walk.
+ */
 export async function bundledModelCatalog(
   registry: ProviderRegistry,
 ): Promise<BundledProviderCatalog> {
@@ -133,7 +146,7 @@ export async function bundledModelCatalog(
       : [];
     modelsByProvider.set(registration.provider_id, definitions);
     // Only a row that contradicts the registration map is a mistake. Two rows
-    // of the same wire family may legitimately serve different paths (Studio
+    // of the same wire family may legitimately serve different paths (a web
     // UltraSpeed is `/fastchat/open-apis/bot/chat` while flash/pro stay on
     // `/open-apis/bot/chat`); dispatch always uses the row's own
     // `ModelDefinition.endpointPath` via `candidate.endpoint_path`.
@@ -153,6 +166,21 @@ export async function bundledModelCatalog(
   }
   return { modelsByProvider };
 }
+
+/**
+ * Re-seeds the compiled catalogs, called when a provider gains an account after
+ * boot. Seeding is no longer account-gated, so this is now simply the same walk
+ * as at boot; it exists because an account makes the rows routable and the
+ * snapshot must reflect that without waiting for a restart.
+ */
+export async function refreshActiveProviderCatalogs(
+  db: CartethyiaDatabase,
+  registry: ProviderRegistry,
+): Promise<void> {
+  const catalog = await bundledModelCatalog(registry);
+  await seedBundledModels(db, catalog.modelsByProvider);
+}
+
 
 /**
  * Last successfully applied BYOK config per normalized provider ID.

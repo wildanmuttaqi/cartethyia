@@ -1,26 +1,17 @@
 import { asCookie, clearCsrfCookie, newCsrfToken, setCsrfCookie } from "../../security/csrf";
 import { Elysia, t } from "elysia";
 import { eq } from "drizzle-orm";
-import { isRecord } from "../../protocol/primitives";
-import {
-  userRecord,
-  readUsers,
-  readUser,
-  returningRows,
-  assertMutationApplied,
-} from "./service";
+import { isRecord } from "../../protocol/codecs";
+import { userRecord, returningRows, assertMutationApplied } from "./row-coercion";
+import { readUsers, readUser } from "./user-store";
 import { consoleUsers, adminAuditLog } from "../../persistence/schema";
-import type { ConsoleCredentialService } from "./service";
-import type { CartethyiaDatabase } from "../../persistence/postgres";
-import {
-  type SessionCookiePolicy,
-  defaultSessionCookiePolicy,
-  type ConsoleSessionService,
-} from "./service";
-import type { ConsoleLockoutService } from "./service";
-import type { FirstBootSetupService } from "./service";
+import type { ConsoleCredentialService } from "./credentials";
+import type { CartethyiaDatabase } from "../../persistence/db-handle";
+import { type SessionCookiePolicy, defaultSessionCookiePolicy, type ConsoleSessionService } from "./session-service";
+import type { ConsoleLockoutService } from "./lockout";
+import type { FirstBootSetupService } from "./setup-service";
 import { isTrustedProxyPeer, resolveClientIdentity } from "../../security/ip-boundary";
-import type { TrustedProxyBoundary } from "../../config";
+import type { TrustedProxyBoundary } from "../../config/network";
 import { readSessionCookie } from "./session-resolver";
 export interface LoginRequest {
   readonly username: string;
@@ -65,6 +56,34 @@ export interface SetupRequest {
 export interface SetupResponse {
   readonly status: "success" | "failed";
   readonly message?: string;
+}
+
+/**
+ * Result of a first-boot restore.
+ *
+ * `warnings` is what a partial restore had to leave out, so the wizard can
+ * report that instead of only "it worked".
+ */
+/** A backup's cover, so the wizard can show what a file holds before restoring. */
+export interface SetupInspectResponse extends SetupResponse {
+  readonly format?: "native" | "nine_router";
+  readonly version?: number;
+  readonly exportedAt?: string;
+  readonly rows?: readonly {
+    readonly section: string;
+    readonly table: string;
+    readonly count: number;
+    readonly supported: boolean;
+  }[];
+  readonly total?: number;
+  readonly warnings?: readonly { readonly table?: string; readonly column?: string; readonly reason: string }[];
+}
+
+export interface SetupRestoreResponse extends SetupResponse {
+  readonly restored?: Record<string, number>;
+  readonly warnings?: readonly { readonly table?: string; readonly column?: string; readonly reason: string }[];
+  /** The administrator this install was given, since the file carries none. */
+  readonly createdAdmin?: boolean;
 }
 
 export interface LogoutResponse {
@@ -135,6 +154,33 @@ function clearSessionCookie(cookies: unknown, policy: SessionCookiePolicy): void
   const cookie = asCookie(cookies.session_token);
   if (!cookie || typeof cookie.set !== "function") return;
   cookie.set({ ...cookieOptions(policy, "", 0), expires: new Date(0) });
+}
+
+
+/**
+ * A wrong password or unknown user, with the attempts left before the lock.
+ * The count comes from the row the failure just wrote, so it can never claim
+ * attempts remain after the lock has already been taken.
+ */
+async function failedLoginMessage(
+  lockoutService: ConsoleLockoutService,
+  lockoutKey: string,
+): Promise<string> {
+  const remaining = lockoutService.maxFailures - (await lockoutService.failureCount(lockoutKey));
+  const left = remaining === 1 ? "1 attempt left" : `${remaining} attempts left`;
+  return `Wrong username or password. ${left} before this login is locked for 1 hour.`;
+}
+
+/** The body of the 429 a locked login gets. The caller sets the status and header. */
+async function lockedOutMessage(
+  lockoutService: ConsoleLockoutService,
+  lockoutKey: string,
+): Promise<LoginResponse> {
+  const minutes = Math.max(1, Math.ceil((await lockoutService.remainingLockSeconds(lockoutKey)) / 60));
+  return {
+    status: "failed",
+    message: `This login is locked after repeated failures. Try again in ${minutes} minutes.`,
+  };
 }
 
 function parseLoginRequest(body: unknown): LoginRequest | undefined {
@@ -224,13 +270,13 @@ export function createConsoleAuthRoutes(
         if (isBanned) {
           set.status = 429;
           set.headers["retry-after"] = String(await lockoutService.remainingLockSeconds(lockoutKey));
-          return {
-            status: "failed",
-            message: "This login has been blocked due to repeated failed authentication attempts.",
-          } satisfies LoginResponse;
+          return lockedOutMessage(lockoutService, lockoutKey);
         }
         set.status = 401;
-        return { status: "failed", message: "Invalid credentials" } satisfies LoginResponse;
+        return {
+          status: "failed",
+          message: await failedLoginMessage(lockoutService, lockoutKey),
+        } satisfies LoginResponse;
       }
 
       const valid = await credentialService.verifyPassword(input.password, user.passwordHash);
@@ -239,13 +285,13 @@ export function createConsoleAuthRoutes(
         if (isBanned) {
           set.status = 429;
           set.headers["retry-after"] = String(await lockoutService.remainingLockSeconds(lockoutKey));
-          return {
-            status: "failed",
-            message: "This login has been blocked due to repeated failed authentication attempts.",
-          } satisfies LoginResponse;
+          return lockedOutMessage(lockoutService, lockoutKey);
         }
         set.status = 401;
-        return { status: "failed", message: "Invalid credentials" } satisfies LoginResponse;
+        return {
+          status: "failed",
+          message: await failedLoginMessage(lockoutService, lockoutKey),
+        } satisfies LoginResponse;
       }
 
       await lockoutService.clearFailures(lockoutKey);
@@ -335,6 +381,86 @@ export function createConsoleAuthRoutes(
         throw error;
       }
       return { status: "success", message: "Setup completed" } satisfies SetupResponse;
+    },
+  );
+
+  app.post(
+    "/setup/inspect",
+    {
+      body: t.Object({
+        backup: t.Unknown(),
+      }),
+    },
+    async ({ body, set }) => {
+      // Gated on first boot, like the restore itself: a backup's cover names the
+      // tables and row counts of a real configuration, and it must not be
+      // readable once an account exists to protect.
+      if (!(await setupService.requiresSetup())) {
+        set.status = 400;
+        return { status: "failed", message: "Setup already completed" } satisfies SetupResponse;
+      }
+      try {
+        return { status: "success", ...setupService.inspectBackup(body.backup) } satisfies SetupInspectResponse;
+      } catch (error) {
+        set.status = 400;
+        return {
+          status: "failed",
+          message: error instanceof Error ? error.message : "Could not read that backup",
+        } satisfies SetupInspectResponse;
+      }
+    },
+  );
+
+  app.post(
+    "/setup/restore",
+    {
+      body: t.Object({
+        backup: t.Unknown(),
+        // Supplied when the file carries no console user: the restore is still
+        // worth keeping, but nobody could sign in to it.
+        username: t.Optional(t.String()),
+        password: t.Optional(t.String()),
+        display_name: t.Optional(t.String()),
+      }),
+    },
+    async ({ body, set }) => {
+      if (!(await setupService.requiresSetup())) {
+        set.status = 400;
+        return { status: "failed", message: "Setup already completed" } satisfies SetupResponse;
+      }
+      const admin =
+        typeof body.password === "string" && body.password.length > 0
+          ? {
+              password: body.password,
+              ...(typeof body.username === "string" ? { username: body.username } : {}),
+              ...(typeof body.display_name === "string" ? { displayName: body.display_name } : {}),
+            }
+          : undefined;
+      let outcome: Awaited<ReturnType<FirstBootSetupService["restoreBackup"]>>;
+      try {
+        outcome = await setupService.restoreBackup(body.backup, admin);
+      } catch (error) {
+        if (error instanceof Error && error.message === "Setup already completed") {
+          set.status = 400;
+          return { status: "failed", message: error.message } satisfies SetupResponse;
+        }
+        const message = error instanceof Error ? error.message : "Restore failed";
+        set.status = 400;
+        return { status: "failed", message } satisfies SetupResponse;
+      }
+      // The restore may have recovered only part of the file. Say so, rather
+      // than letting a 200 imply the whole backup came back.
+      const partial = outcome.warnings.length > 0;
+      const message = partial
+        ? `Backup restored partially: ${outcome.warnings.length} part${outcome.warnings.length === 1 ? "" : "s"} could not be recovered`
+        : "Backup restored";
+      return {
+        status: "success",
+        message,
+        restored: outcome.restored,
+        ...(partial ? { warnings: outcome.warnings } : {}),
+        createdAdmin: outcome.createdAdmin,
+      } satisfies SetupRestoreResponse;
     },
   );
 

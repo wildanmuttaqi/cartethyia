@@ -3,8 +3,8 @@ import type { ReactNode } from "react";
 import { Button } from "./ui/button";
 import { Dialog } from "./ui/dialog";
 import { ClipboardButton } from "./patterns/clipboard-button";
-import { downloadTextFile } from "../shared/download";
-import { toast } from "../shared/toast";
+import { downloadTextFile } from "../lib/download";
+import { toast } from "../lib/toast";
 
 /**
  * The one-time reveal of a freshly generated key secret.
@@ -28,7 +28,7 @@ export function ApiKeySecretDialog({
     if (secret === null) return;
     downloadTextFile(
       "cartethyia-api-key.txt",
-      `Cartethyia API key\n\n${secret}\n\nKeep this secret. It is shown only once.\n`,
+      `Cartethyia API key\n\n${secret}\n\nKeep this secret. Reveal it again from the key's Share button.\n`,
       "text/plain;charset=utf-8",
     );
     toast.success("Key saved to your downloads.");
@@ -39,30 +39,21 @@ export function ApiKeySecretDialog({
       open={secret !== null}
       onClose={onClose}
       title="New API key"
-      description="The secret is shown once. Copy or save it before closing."
+      description="Copy it now, or reveal it again later from the key's Share button."
       size="md"
     >
-      <div style={{ display: "flex", flexDirection: "column", gap: "14px" }}>
-        <p style={{ fontSize: "13px", color: "var(--text-secondary)", lineHeight: 1.5, margin: 0 }}>
-          Copy this secret now — the console never shows it again. Any client still
-          using a previous secret starts getting 401s as soon as the credential is
-          rotated.
+      <div className="flex flex-col gap-7">
+        <p className="text-body text-text-secondary m-0 leading-normal">
+          A personal key stays recoverable. Open the key's Share button and choose
+          Reveal to see it again and copy it. Rotating the key replaces this secret,
+          and any client still using it starts getting 401s.
         </p>
         <code
-          style={{
-            display: "block",
-            padding: "10px 12px",
-            borderRadius: "8px",
-            background: "var(--surface-1)",
-            border: "1px solid var(--inner-border)",
-            fontSize: "12px",
-            wordBreak: "break-all",
-            color: "var(--text-primary)",
-          }}
+          className="block rounded-inset border border-inner-border bg-surface-1 py-5 px-6 text-caption text-text-primary break-all"
         >
           {secret}
         </code>
-        <div style={{ display: "flex", gap: "8px", flexWrap: "wrap" }}>
+        <div className="flex gap-4 flex-wrap">
           <ClipboardButton
             value={secret ?? ""}
             size="sm"

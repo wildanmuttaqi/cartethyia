@@ -1,11 +1,12 @@
-import { GatewayError } from "../../transport/gateway-error";
+import { GatewayError } from "../../protocol/gateway-error";
 import { mapUpstreamHttpError } from "../../transport/failure-policy";
-import { usageFromProvider } from "../usage";
-import type { CanonicalEvent, CanonicalRequest } from "../../transport/canonical-model";
-import type { ProviderDispatchTarget, ProviderAdapter, ProviderDispatchContext } from "../provider-registry";
+import { usageFromProvider } from "../provider-usage";
+import type { CanonicalEvent, CanonicalRequest } from "../../protocol/canonical-model";
+import type { ProviderDispatchTarget, ProviderAdapter, ProviderDispatchContext } from "../provider-contracts";
 import { providerBaseUrl } from "../provider-metadata";
 import { abortGatewayError, createUpstreamDeadlineLifecycle } from "../operations/upstream-deadline";
-import { normalizeBearerToken } from "../../protocol/primitives";
+import { normalizeBearerToken } from "../../protocol/codecs";
+import { accessTokenFromSecret } from "../../security/credential-codec";
 
 export const PERPLEXITY_BASE_URL = providerBaseUrl("perplexity");
 export const PERPLEXITY_PROVIDER_ID = "perplexity" as const;
@@ -13,8 +14,8 @@ export const PERPLEXITY_SEARCH_ENDPOINT = `${PERPLEXITY_BASE_URL}/search`;
 
 
 
-import { defineModel } from "../model-definition";
-import type { ModelDefinition } from "../provider-registry";
+import { defineModel } from "../provider-model-definition";
+import type { ModelDefinition } from "../provider-model-definition";
 
 export const PERPLEXITY_MODELS: readonly ModelDefinition[] = [
   defineModel({
@@ -53,17 +54,7 @@ function extractSearchQuery(request: CanonicalRequest): string {
 function tokenFromContext(context: ProviderDispatchContext): string {
   const secret = context.credential.secret;
   if (!secret || secret.length === 0) return "";
-  const raw = new TextDecoder().decode(secret).trim();
-  if (raw.startsWith("{")) {
-    try {
-      const parsed = JSON.parse(raw) as Record<string, unknown>;
-      const v = parsed["accessToken"] ?? parsed["api_key"] ?? parsed["apiKey"];
-      if (typeof v === "string" && v.length > 0) return v.trim();
-    } catch {
-      // fall through
-    }
-  }
-  return normalizeBearerToken(raw);
+  return normalizeBearerToken(accessTokenFromSecret(secret));
 }
 
 

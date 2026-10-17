@@ -19,7 +19,7 @@
  * do not collapse to a single key, a per-IP limit becomes a per-spelling limit.
  */
 import { describe, expect, test } from "bun:test";
-import type { TrustedProxyBoundary } from "../../src/config";
+import type { TrustedProxyBoundary } from "../../src/config/network";
 import {
   canonicalClientIpKey,
   isTrustedProxyPeer,
@@ -223,7 +223,7 @@ describe("isTrustedProxyPeer: IPv4-mapped IPv6", () => {
     // `isTrustedProxyPeer` returns false for a peer the allowlist covers, and
     // `canonicalClientIpKey` yields `v6:…ffff7f000001` instead of
     // `v4:2130706433` — two keys for one host, which is what the
-    // one-active-key-per-IP rule in the share router deduplicates on.
+    // issued child keys store for consistent usage reporting and audit.
     //
     // Reachability: the peer string comes from `server.requestIP`, so a runtime
     // that reports the expanded form reintroduces the original bug this helper
@@ -583,11 +583,8 @@ describe("canonicalClientIpKey", () => {
   test("one host gets one key across every mapped spelling", () => {
     // The defect this pins: `unwrapMappedIpv4` tested `startsWith("::ffff:")`, so
     // any form that writes the leading zero groups out missed the prefix test, fell
-    // through to `ipv6ToBigInt`, and was treated as an unrelated IPv6 address. One
-    // host then held TWO keys — which is what the one-active-key-per-IP rule in the
-    // share router deduplicates on, so a caller reaching the endpoint through a
-    // runtime reporting the expanded form got a second active key instead of being
-    // refused.
+    // through to `ipv6ToBigInt`, and was treated as an unrelated IPv6 address.
+    // Canonicalization keeps recorded client IPs consistent across spellings.
     //
     // The mapped range is now recognized structurally, by normalizing to eight
     // 16-bit groups first. That is the only way to compare spellings: a dotted tail

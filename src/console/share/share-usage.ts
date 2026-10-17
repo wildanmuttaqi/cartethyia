@@ -1,11 +1,16 @@
-import { and, desc, eq, gte, inArray, isNotNull, sql } from "drizzle-orm";
-import type { CartethyiaDatabase } from "../../persistence/postgres";
-import type { ApiKeyRecord } from "../../persistence/api-key-store";
+import { and, eq, inArray } from "drizzle-orm";
+import type { CartethyiaDatabase } from "../../persistence/db-handle";
+import type { ApiKeyRecord } from "../../persistence/stores/api-key-store";
 import { CachedPreferencesReader, DrizzlePreferencesReader } from "../../persistence/tenant-preferences";
 import { maskClientIp } from "../../observability/redaction";
-import { gatewayErrorSql } from "../../observability/telemetry-status";
-import { telemetryEvents, telemetryUsageTotals } from "../../persistence/schema";
+import { queryTelemetryEvents, type TelemetryEventRecord } from "../../observability/event-log";
+import { isGatewayError } from "../../observability/telemetry-status";
+import type { RedisClient } from "../../persistence/redis";
+import { cachedRead } from "../shared/read-through-cache";
+import { SHARE_STATS_CACHE_TTL_SECONDS } from "./share-stats";
+import { telemetryUsageTotals } from "../../persistence/schema";
 import { shouldMaskClientIp } from "../shared/ip-privacy";
+import { utcDayStart } from "../shared/day";
 
 export interface SharedKeyTokenUsage {
   readonly requests: number;
@@ -67,10 +72,17 @@ export interface ShareActivityPort {
   getSharedKeyDetail(tenantId: string, childKeyId: string): Promise<SharedKeyActivityDetail>;
 }
 
-function utcDayStart(now: Date): Date {
-  const start = new Date(now);
-  start.setUTCHours(0, 0, 0, 0);
-  return start;
+/** Folds one event into a per-key usage bucket. */
+function addEventUsage(bucket: SharedKeyTokenUsage, event: TelemetryEventRecord): SharedKeyTokenUsage {
+  const inputTokens = bucket.inputTokens + (event.inputTokens ?? 0);
+  const outputTokens = bucket.outputTokens + (event.outputTokens ?? 0);
+  return {
+    requests: bucket.requests + 1,
+    errors: bucket.errors + (isGatewayError(event.status, event.httpStatus) ? 1 : 0),
+    inputTokens,
+    outputTokens,
+    totalTokens: inputTokens + outputTokens,
+  };
 }
 
 function tokenUsage(row: {
@@ -90,31 +102,33 @@ function tokenUsage(row: {
   };
 }
 
-export function createShareUsagePort(db: CartethyiaDatabase): ShareActivityPort {
+/**
+ * Cache key for one child key's activity detail.
+ *
+ * The masked/unmasked choice is part of the key: caching a payload computed
+ * while the tenant's privacy switch was off, then serving it after the switch
+ * turned on, would leak a raw client address for the TTL. Splitting the key by
+ * that flag keeps a privacy change effective on the next read.
+ */
+function shareKeyDetailCacheKey(tenantId: string, childKeyId: string, hideClientIp: boolean): string {
+  return `share:v1:detail:${tenantId}:${childKeyId}:${hideClientIp ? "m" : "r"}`;
+}
+
+interface ShareUsagePortDeps {
+  readonly db: CartethyiaDatabase;
+  readonly redis?: RedisClient | undefined;
+}
+
+export function createShareUsagePort(deps: ShareUsagePortDeps): ShareActivityPort {
+  const { db, redis } = deps;
   const preferences = new CachedPreferencesReader(new DrizzlePreferencesReader(db));
   return {
     async getSharedKeySummaries(tenantId, children) {
       if (children.length === 0) return [];
       const childIds = children.map((child) => child.id);
       const todayStart = utcDayStart(new Date());
-      const [todayRows, lifetimeRows, hideClientIp] = await Promise.all([
-        db
-          .select({
-            apiKeyId: telemetryEvents.apiKeyId,
-            requests: sql<number>`count(*)`,
-            errors: sql<number>`count(*) filter (where ${gatewayErrorSql(telemetryEvents.status, telemetryEvents.httpStatus)})`,
-            inputTokens: sql<number>`coalesce(sum(${telemetryEvents.inputTokens}), 0)`,
-            outputTokens: sql<number>`coalesce(sum(${telemetryEvents.outputTokens}), 0)`,
-          })
-          .from(telemetryEvents)
-          .where(
-            and(
-              eq(telemetryEvents.tenantId, tenantId),
-              inArray(telemetryEvents.apiKeyId, childIds),
-              gte(telemetryEvents.createdAt, todayStart),
-            ),
-          )
-          .groupBy(telemetryEvents.apiKeyId),
+      const [todayEvents, lifetimeRows, hideClientIp] = await Promise.all([
+        queryTelemetryEvents({ tenantId, apiKeyIds: childIds, since: todayStart }),
         db
           .select({
             apiKeyId: telemetryUsageTotals.entityId,
@@ -134,14 +148,16 @@ export function createShareUsagePort(db: CartethyiaDatabase): ShareActivityPort 
           ),
         shouldMaskClientIp(preferences, tenantId),
       ]);
-      const todayByKey = new Map<string, (typeof todayRows)[number]>();
-      for (const row of todayRows) {
-        if (row.apiKeyId !== null) todayByKey.set(row.apiKeyId, row);
+      const todayByKey = new Map<string, SharedKeyTokenUsage>();
+      for (const event of todayEvents) {
+        if (event.apiKeyId === null) continue;
+        const bucket = todayByKey.get(event.apiKeyId) ?? tokenUsage(undefined);
+        todayByKey.set(event.apiKeyId, addEventUsage(bucket, event));
       }
       const lifetimeByKey = new Map(lifetimeRows.map((row) => [row.apiKeyId, row]));
       return children.map((child) => {
         const allTime = tokenUsage(lifetimeByKey.get(child.id));
-        const today = tokenUsage(todayByKey.get(child.id));
+        const today = todayByKey.get(child.id) ?? tokenUsage(undefined);
         const issuedClientIp = child.issuedClientIp;
         const lastUsedAt = lifetimeByKey.get(child.id)?.lastUsedAt;
         return {
@@ -164,89 +180,87 @@ export function createShareUsagePort(db: CartethyiaDatabase): ShareActivityPort 
     },
 
     async getSharedKeyDetail(tenantId, childKeyId) {
-      const todayStart = utcDayStart(new Date());
-      const modelScope = and(
-        eq(telemetryEvents.tenantId, tenantId),
-        eq(telemetryEvents.apiKeyId, childKeyId),
-        isNotNull(telemetryEvents.requestedModel),
+      const hideClientIp = await shouldMaskClientIp(preferences, tenantId);
+      return cachedRead<SharedKeyActivityDetail>(
+        redis,
+        shareKeyDetailCacheKey(tenantId, childKeyId, hideClientIp),
+        () => computeSharedKeyDetail(tenantId, childKeyId, hideClientIp),
+        SHARE_STATS_CACHE_TTL_SECONDS,
       );
-      const requestScope = and(
-        eq(telemetryEvents.tenantId, tenantId),
-        eq(telemetryEvents.apiKeyId, childKeyId),
-      );
-      const [models, requests, hideClientIp] = await Promise.all([
-        db
-          .select({
-            providerId: telemetryEvents.providerId,
-            modelId: telemetryEvents.requestedModel,
-            retainedRequests: sql<number>`count(*)`,
-            retainedErrors: sql<number>`count(*) filter (where ${gatewayErrorSql(telemetryEvents.status, telemetryEvents.httpStatus)})`,
-            retainedTokens: sql<number>`coalesce(sum(coalesce(${telemetryEvents.inputTokens}, 0) + coalesce(${telemetryEvents.outputTokens}, 0)), 0)`,
-            todayRequests: sql<number>`count(*) filter (where ${telemetryEvents.createdAt} >= ${todayStart})`,
-            todayErrors: sql<number>`count(*) filter (where ${telemetryEvents.createdAt} >= ${todayStart} and ${gatewayErrorSql(telemetryEvents.status, telemetryEvents.httpStatus)})`,
-            todayTokens: sql<number>`coalesce(sum(coalesce(${telemetryEvents.inputTokens}, 0) + coalesce(${telemetryEvents.outputTokens}, 0)) filter (where ${telemetryEvents.createdAt} >= ${todayStart}), 0)`,
-          })
-          .from(telemetryEvents)
-          .where(modelScope)
-          .groupBy(telemetryEvents.providerId, telemetryEvents.requestedModel)
-          .orderBy(desc(sql`count(*)`))
-          .limit(10),
-        db
-          .select({
-            requestId: telemetryEvents.requestId,
-            startedAt: telemetryEvents.createdAt,
-            providerId: telemetryEvents.providerId,
-            modelId: telemetryEvents.requestedModel,
-            status: telemetryEvents.status,
-            httpStatus: telemetryEvents.httpStatus,
-            errorCategory: telemetryEvents.errorCategory,
-            errorOrigin: telemetryEvents.errorOrigin,
-            clientIp: telemetryEvents.clientIp,
-            inputTokens: telemetryEvents.inputTokens,
-            outputTokens: telemetryEvents.outputTokens,
-          })
-          .from(telemetryEvents)
-          .where(requestScope)
-          .orderBy(desc(telemetryEvents.createdAt), desc(telemetryEvents.id))
-          .limit(20),
-        shouldMaskClientIp(preferences, tenantId),
-      ]);
-      return {
-        models: models.flatMap((row) =>
-          typeof row.modelId !== "string"
-            ? []
-            : [{
-                providerId: row.providerId,
-                modelId: row.modelId,
-                retainedRequests: Number(row.retainedRequests ?? 0),
-                retainedErrors: Number(row.retainedErrors ?? 0),
-                retainedTokens: Number(row.retainedTokens ?? 0),
-                todayRequests: Number(row.todayRequests ?? 0),
-                todayErrors: Number(row.todayErrors ?? 0),
-                todayTokens: Number(row.todayTokens ?? 0),
-              }],
-        ),
-        requests: requests.map((row) => {
-          const inputTokens = row.inputTokens ?? 0;
-          const outputTokens = row.outputTokens ?? 0;
-          return {
-            requestId: row.requestId,
-            startedAt: row.startedAt.toISOString(),
-            ...(row.providerId ? { providerId: row.providerId } : {}),
-            ...(row.modelId ? { modelId: row.modelId } : {}),
-            status: row.status ?? "unknown",
-            ...(row.httpStatus === null ? {} : { httpStatus: row.httpStatus }),
-            ...(row.errorCategory ? { errorCategory: row.errorCategory } : {}),
-            ...(row.errorOrigin ? { errorOrigin: row.errorOrigin } : {}),
-            ...(row.clientIp
-              ? { clientIp: hideClientIp ? maskClientIp(row.clientIp) : row.clientIp }
-              : {}),
-            inputTokens,
-            outputTokens,
-            totalTokens: inputTokens + outputTokens,
-          };
-        }),
-      };
     },
+  };
+}
+
+/**
+ * Telemetry-derived detail for one child key: its model table and its most
+ * recent requests. `hideClientIp` decides whether an address is masked; it is
+ * resolved by the caller so the cache key can separate the two variants.
+ */
+async function computeSharedKeyDetail(
+  tenantId: string,
+  childKeyId: string,
+  hideClientIp: boolean,
+): Promise<SharedKeyActivityDetail> {
+  const todayStart = utcDayStart(new Date()).getTime();
+  const events = await queryTelemetryEvents({ tenantId, apiKeyIds: [childKeyId] });
+  const models = new Map<string, {
+    providerId: string | null;
+    modelId: string;
+    retainedRequests: number;
+    retainedErrors: number;
+    retainedTokens: number;
+    todayRequests: number;
+    todayErrors: number;
+    todayTokens: number;
+  }>();
+  for (const event of events) {
+    if (event.requestedModel === null) continue;
+    const key = `${event.providerId ?? ""}\u0000${event.requestedModel}`;
+    const bucket = models.get(key) ?? {
+      providerId: event.providerId,
+      modelId: event.requestedModel,
+      retainedRequests: 0,
+      retainedErrors: 0,
+      retainedTokens: 0,
+      todayRequests: 0,
+      todayErrors: 0,
+      todayTokens: 0,
+    };
+    const tokens = (event.inputTokens ?? 0) + (event.outputTokens ?? 0);
+    const error = isGatewayError(event.status, event.httpStatus);
+    bucket.retainedRequests += 1;
+    if (error) bucket.retainedErrors += 1;
+    bucket.retainedTokens += tokens;
+    if (new Date(event.createdAt).getTime() >= todayStart) {
+      bucket.todayRequests += 1;
+      if (error) bucket.todayErrors += 1;
+      bucket.todayTokens += tokens;
+    }
+    models.set(key, bucket);
+  }
+  return {
+    models: [...models.values()]
+      .sort((a, b) => b.retainedRequests - a.retainedRequests)
+      .slice(0, 10),
+    requests: events.slice(0, 20).map((event) => {
+      const inputTokens = event.inputTokens ?? 0;
+      const outputTokens = event.outputTokens ?? 0;
+      return {
+        requestId: event.requestId,
+        startedAt: event.createdAt,
+        ...(event.providerId ? { providerId: event.providerId } : {}),
+        ...(event.requestedModel ? { modelId: event.requestedModel } : {}),
+        status: event.status ?? "unknown",
+        ...(event.httpStatus === null ? {} : { httpStatus: event.httpStatus }),
+        ...(event.errorCategory ? { errorCategory: event.errorCategory } : {}),
+        ...(event.errorOrigin ? { errorOrigin: event.errorOrigin } : {}),
+        ...(event.clientIp
+          ? { clientIp: hideClientIp ? maskClientIp(event.clientIp) : event.clientIp }
+          : {}),
+        inputTokens,
+        outputTokens,
+        totalTokens: inputTokens + outputTokens,
+      };
+    }),
   };
 }

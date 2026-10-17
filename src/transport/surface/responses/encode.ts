@@ -1,8 +1,8 @@
-import type { CanonicalEvent, CanonicalStopReason, ContentPart, UsageRecord } from "../../canonical-model";
-import { isRecord } from "../../../protocol/primitives";
-import { usageToResponsesWire } from "../../../providers/usage";
-import { TEXT_ENCODER } from "../stream-frame";
-import { SurfaceStreamEncoder } from "../stream-base";
+import type { CanonicalEvent, CanonicalStopReason, ContentPart, UsageRecord } from "../../../protocol/canonical-model";
+import { isRecord } from "../../../protocol/codecs";
+import { usageToResponsesWire } from "../../../providers/provider-usage";
+import { TEXT_ENCODER } from "../../../protocol/sse-frame";
+import { SurfaceStreamEncoder } from "../stream-frame";
 import { ResponsesLifecycleError, ResponsesSequenceError } from "./errors";
 import type { ResponsesEncodingContext, ResponsesWireEvent } from "./contracts";
 import type { SurfaceOutput } from "../adapters";
@@ -117,9 +117,17 @@ export class ResponsesEventEncoder extends SurfaceStreamEncoder<CanonicalEvent, 
     return kind === "tool" ? `tool:${callId ?? ""}` : kind;
   }
 
-  /** Park the active item without emitting done events; it resumes on return. */
-  private suspendOpen(): void {
-    if (this.open === undefined) return;
+  /**
+   * Parks the active item so a later delta for it resumes the same stream.
+   *
+   * Only tool-call streams park: upstream commonly interleaves `arguments`
+   * deltas for parallel tool calls (A, B, A), and parking is what keeps the
+   * second A delta on the same `output_item` instead of forking a duplicate.
+   *
+   * A text/reasoning switch does NOT park — see `closeActiveNonTool`.
+   */
+  private suspendTool(): void {
+    if (this.open === undefined || this.open.kind !== "tool") return;
     this.parked.set(this.openKey(this.open.kind, this.open.callId), this.open);
     this.open = undefined;
   }
@@ -131,6 +139,28 @@ export class ResponsesEventEncoder extends SurfaceStreamEncoder<CanonicalEvent, 
     this.parked.delete(key);
     this.open = state;
     return true;
+  }
+
+  /**
+   * Closes the active item IF it is a text or reasoning item.
+   *
+   * Text and reasoning items are forward-only in the Responses contract: once
+   * the stream moves on, their `.done` events must fire before the next
+   * `output_item.added` lands. Parking them (as tools do) emitted the second
+   * `output_item.added` while the first item was still "open" on the wire,
+   * which the hy4-preview-f family exposed clearly — the reasoning item's
+   * `reasoning_summary_text.done` and `output_item.done` arrived AFTER the
+   * message item's own `output_item.done`, so a strict client's UI showed the
+   * thinking block still streaming while the answer text was already landing.
+   *
+   * Tool calls are left to {@link suspendTool} because their args genuinely do
+   * interleave across parallel calls, and that is what parking exists for.
+   */
+  private closeActiveNonTool(): ResponsesWireEvent[] {
+    if (this.open === undefined || this.open.kind === "tool") return [];
+    const state = this.open;
+    this.open = undefined;
+    return this.finalizeState(state);
   }
 
   /** Finalize every open item (active first, then parked by output order). */
@@ -259,9 +289,8 @@ export class ResponsesEventEncoder extends SurfaceStreamEncoder<CanonicalEvent, 
 
   private openText(): ResponsesWireEvent[] {
     if (this.open?.kind === "text") return [];
-    this.suspendOpen();
-    if (this.restoreParked("text")) return [];
-    const events: ResponsesWireEvent[] = [];
+    const events: ResponsesWireEvent[] = this.closeActiveNonTool();
+    this.suspendTool();
     const outputIndex = this.outputItems.length;
     const itemId = `item-${outputIndex}`;
     const item: Record<string, unknown> = {
@@ -298,9 +327,8 @@ export class ResponsesEventEncoder extends SurfaceStreamEncoder<CanonicalEvent, 
     content: Extract<ContentPart, { kind: "reasoning" }>,
   ): ResponsesWireEvent[] {
     if (this.open?.kind === "reasoning") return [];
-    this.suspendOpen();
-    if (this.restoreParked("reasoning")) return [];
-    const events: ResponsesWireEvent[] = [];
+    const events: ResponsesWireEvent[] = this.closeActiveNonTool();
+    this.suspendTool();
     // Accept encrypted reasoning declared by route capability profile.
     const outputIndex = this.outputItems.length;
     const itemId = `item-${outputIndex}`;
@@ -378,9 +406,9 @@ export class ResponsesEventEncoder extends SurfaceStreamEncoder<CanonicalEvent, 
 
   private openTool(callId: string, name?: string): ResponsesWireEvent[] {
     if (this.open?.kind === "tool" && this.open.callId === callId) return [];
-    this.suspendOpen();
-    if (this.restoreParked(this.openKey("tool", callId))) return [];
-    const events: ResponsesWireEvent[] = [];
+    const events: ResponsesWireEvent[] = this.closeActiveNonTool();
+    this.suspendTool();
+    if (this.restoreParked(this.openKey("tool", callId))) return events;
     const outputIndex = this.outputItems.length;
     const itemId = callId;
     const isComputer = name === "computer";

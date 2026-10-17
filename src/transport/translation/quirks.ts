@@ -9,7 +9,7 @@
 // Add a row ONLY when a concrete upstream 400/422 proves the quirk; do not
 // speculate. The table is applied on the dispatch path before wire translation.
 
-import type { CanonicalRequest, GenerationControls } from "../canonical-model";
+import type { CanonicalRequest, GenerationControls } from "../../protocol/canonical-model";
 import {
   THINKING_STRIPPED_SAMPLING_CONTROLS,
   isThinkingEnabled,
@@ -46,23 +46,38 @@ export interface WireTokenBound {
 }
 
 /**
- * Output-token bounds per wire family. Values below are the current
- * per-builder behavior, centralized so the three codecs cannot drift:
- * chat clamps to 32k (free-tier backends 400 on unbounded values);
- * messages defaults to 4096 (Anthropic requires the field), floors to 32k
- * with tools, and clamps OAuth to 64k; responses passes through.
+ * The output limit assumed when the caller states none, for wires that need
+ * the field present.
+ *
+ * PROVEN, not assumed: a 3.16M-char prompt to WorkBuddy/CodeBuddy
+ * (`bansos/deepseek-v4.1-flash`) answered `400 model_param_invalid` whenever
+ * `max_tokens` was absent, and answered 200 with the *same* body plus any
+ * explicit value — `1`, `16`, `1000`, `8000`, `64000`, `384000` all passed.
+ * So the upstream rejects the *absence* of the field, not its magnitude, and
+ * the default only has to be a real limit the wire already permits.
+ *
+ * It equals the chat wire's existing ceiling, so it introduces no number the
+ * wire did not already clamp to: "the caller set no limit" now means "the most
+ * this wire allows", which is what an omitted limit is asking for.
+ */
+const DEFAULT_OUTPUT_TOKENS = 32_000;
+
+/**
+ * Output-token bounds per wire family. Chat has no global ceiling: a model's
+ * catalog output limit is the ceiling, and an unknown model passes the
+ * caller's value through. Messages keeps its Anthropic floors and OAuth cap.
  */
 export const WIRE_TOKEN_BOUNDS: Readonly<Record<string, WireTokenBound>> = {
-  chat: { minTokens: 16, ceiling: 32_000 },
+  chat: { minTokens: 16, defaultMaxTokens: DEFAULT_OUTPUT_TOKENS },
   messages: { minTokens: 16, defaultMaxTokens: 4_096, toolCallFloor: 32_000, oauthCeiling: 64_000 },
-  responses: { minTokens: 16 },
+  responses: { minTokens: 16, defaultMaxTokens: DEFAULT_OUTPUT_TOKENS },
 };
 
 /** Resolves the output-token value for one wire from caller controls. */
 export function resolveWireMaxTokens(
   wire: string,
   controls: { max_tokens?: number | undefined },
-  options: { hasTools?: boolean; isOAuth?: boolean } = {},
+  options: { hasTools?: boolean; isOAuth?: boolean; maxOutputTokens?: number } = {},
 ): number | undefined {
   const bound = WIRE_TOKEN_BOUNDS[wire];
   if (bound === undefined) return controls.max_tokens;
@@ -74,7 +89,8 @@ export function resolveWireMaxTokens(
     value = bound.toolCallFloor;
   if (value !== undefined && bound.oauthCeiling !== undefined && options.isOAuth === true && value > bound.oauthCeiling)
     value = bound.oauthCeiling;
-  if (value !== undefined && bound.ceiling !== undefined && value > bound.ceiling) value = bound.ceiling;
+  const ceiling = options.maxOutputTokens ?? bound.ceiling;
+  if (value !== undefined && ceiling !== undefined && value > ceiling) value = ceiling;
   return value;
 }
 /**
@@ -122,6 +138,12 @@ export function rejectsSamplingParams(modelId: string): boolean {
  * credential fact, so it applies to both.
  */
 const PARAM_QUIRKS: readonly ParamQuirk[] = [
+  {
+    provider: "github",
+    // Copilot Auto resolves a concrete model before dispatch; the model's 400
+    // confirms that the selected-model request must not carry temperature.
+    stripControls: ["temperature"],
+  },
   {
     provider: "anthropic",
     matchModel: rejectsSamplingParams,

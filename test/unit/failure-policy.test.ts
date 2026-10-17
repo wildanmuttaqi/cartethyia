@@ -19,8 +19,8 @@
  * slow or busy machine cannot make the suite flake.
  */
 import { describe, expect, test } from "bun:test";
-import type { GatewayErrorCode } from "../../src/transport/gateway-error";
-import { GatewayError } from "../../src/transport/gateway-error";
+import type { GatewayErrorCode } from "../../src/protocol/gateway-error";
+import { GatewayError } from "../../src/protocol/gateway-error";
 import {
   classifyTerminalCategory,
   classifyTerminalOutcome,
@@ -218,10 +218,17 @@ describe("parseRateLimitReset", () => {
   });
 
   test("reads a value below 1e9 as a relative delay in seconds", () => {
-    expect(parseRateLimitReset("2")).toBe(2_000);
-    expect(parseRateLimitReset("60")).toBe(60_000);
-    expect(parseRateLimitReset("3600")).toBe(HOUR_MS);
-    expect(parseRateLimitReset("1.5")).toBe(1_500);
+    // Tolerant, not exact: the impl adds the delay to `Date.now()`, so exact
+    // millisecond equality only holds when the clock does not advance between
+    // the call and the assertion — which is why this flaked.
+    expect(parseRateLimitReset("2")).toBeGreaterThan(1_900);
+    expect(parseRateLimitReset("2")).toBeLessThanOrEqual(2_000);
+    expect(parseRateLimitReset("60")).toBeGreaterThan(59_900);
+    expect(parseRateLimitReset("60")).toBeLessThanOrEqual(60_000);
+    expect(parseRateLimitReset("3600")).toBeGreaterThan(HOUR_MS - 100);
+    expect(parseRateLimitReset("3600")).toBeLessThanOrEqual(HOUR_MS);
+    expect(parseRateLimitReset("1.5")).toBeGreaterThan(1_400);
+    expect(parseRateLimitReset("1.5")).toBeLessThanOrEqual(1_500);
   });
 
   test("reads a value at or above 1e9 as epoch seconds", () => {
@@ -896,6 +903,10 @@ describe("classifyUpstreamFailure", () => {
       "authentication_failed",
       "proxy_auth_required",
       "deadline_exceeded",
+      // An overflow names how big the prompt was against *this* candidate's
+      // window. Another candidate may simply offer more room, and the request
+      // is retried verbatim — nothing here shrinks or rewrites it.
+      "context_length_exceeded",
     ];
     for (const code of retryableCodes) {
       expect(classifyUpstreamFailure(new GatewayError(code, 400, "m")).retryable).toBe(true);
@@ -906,11 +917,15 @@ describe("classifyUpstreamFailure", () => {
     // `platform_unavailable` is the important one: a 502 from a dead upstream
     // route is not worth another candidate for the *same* reason, and the
     // status-based arm below is what makes the 5xx retry decision.
+    //
+    // `context_length_exceeded` is deliberately absent from this list. An
+    // overflow is a property of the window the chosen route offers, not of the
+    // request, so a sibling on a larger window may take the request unchanged —
+    // see the retryable-code test above for the other side of that decision.
     const terminalCodes: readonly GatewayErrorCode[] = [
       "internal_error",
       "invalid_request",
       "upstream_not_found",
-      "context_length_exceeded",
       "policy_rejected",
       "transport_unavailable",
       "shutting_down",
@@ -964,6 +979,39 @@ describe("classifyUpstreamFailure", () => {
   test("ignores a non-string providerCode, so 11140 as a number is not policy evidence", () => {
     const policy = classifyUpstreamFailure(
       new GatewayError("policy_rejected", 403, "m", { providerCode: 11140 }, "upstream"),
+    );
+    expect(policy.scope).toBe("provider");
+    expect(policy.mutatesAccount).toBe(false);
+  });
+
+  test("scopes the buddy 11-128 channel block to the account", () => {
+    // Two live share-page requests to the same model carried byte-identical
+    // bodies and headers and differed only in the pooled account: one answered
+    // 200, the other 400 `11-128` "request illegal … failed channel
+    // verification". The rejection is a verdict on the account's channel, so
+    // the account must be parked and a sibling tried — otherwise the router
+    // keeps re-picking it and the caller sees the same 400 forever.
+    for (const message of [
+      "request illegal",
+      "This call failed channel verification, possibly because it was not sent from an official client.",
+    ]) {
+      const policy = classifyUpstreamFailure(
+        new GatewayError("invalid_request", 400, message, { providerCode: "11-128", providerId: "cb" }, "upstream"),
+      );
+      expect(policy.scope).toBe("account");
+      expect(policy.mutatesAccount).toBe(true);
+      expect(policy.retryable).toBe(true);
+      expect(policy.providerCode).toBe("11-128");
+    }
+  });
+
+  test("does not cool an account for the 11-128 missing-conversation variant", () => {
+    // The same code also means "conversation id missing" — a malformed
+    // outbound request, which is this gateway's fault, not the credential's.
+    // Cooling the account there burns a healthy credential on a body that
+    // fails identically on every sibling.
+    const policy = classifyUpstreamFailure(
+      new GatewayError("invalid_request", 400, "conversation id missing", { providerCode: "11-128", providerId: "cb" }, "upstream"),
     );
     expect(policy.scope).toBe("provider");
     expect(policy.mutatesAccount).toBe(false);
@@ -1417,6 +1465,67 @@ describe("classifyUpstreamError", () => {
       code: "invalid_request",
       status: 600,
       origin: "upstream",
+    });
+  });
+
+  // An upstream frequently pairs an authoritative status with the generic
+  // `invalid_request_error` body type. Letting the body demote the status broke
+  // two machines at once: `invalid_request`/400 is not retryable, so failover
+  // stopped on the first candidate with healthy siblings left; and it carries no
+  // `credentialEvidence`, so the rejected credential was never marked and was
+  // chosen again on the next request. These cases pin the status as authoritative.
+  describe("an authoritative status is not demoted by a generic body type", () => {
+    test("a 401 stays an auth failure and carries credential evidence", () => {
+      expect(classifyUpstreamError(401, "invalid_request_error")).toEqual({
+        code: "authentication_failed",
+        status: 401,
+        origin: "upstream",
+        credentialEvidence: true,
+      });
+    });
+
+    test("a 429 stays a rate limit so failover and the account cooldown both run", () => {
+      expect(classifyUpstreamError(429, "invalid_request_error")).toEqual({
+        code: "quota_exceeded",
+        status: 429,
+        origin: "upstream",
+        rateLimitScope: "provider",
+      });
+    });
+
+    test("a 402 stays a billing failure", () => {
+      // No `rateLimitScope`: that flag is what makes `shouldCooldownPool` cool an
+      // IP-scoped pool, and a billing refusal is not a rate limit.
+      expect(classifyUpstreamError(402, "invalid_request_error")).toEqual({
+        code: "quota_exceeded",
+        status: 402,
+        origin: "upstream",
+      });
+    });
+
+    test("every generic invalid-request identifier is covered", () => {
+      for (const identifier of ["invalid_request_error", "invalid_argument", "invalid_parameter", "bad_request"]) {
+        expect(classifyUpstreamError(401, identifier).code).toBe("authentication_failed");
+        expect(classifyUpstreamError(429, identifier).code).toBe("quota_exceeded");
+      }
+    });
+
+    test("a body identifier still decides when the status says nothing", () => {
+      // A stream error frame carries no HTTP status; its body type is the only
+      // evidence, so the identifier must keep winning there.
+      expect(classifyUpstreamError(undefined, "invalid_request_error")).toEqual({
+        code: "invalid_request",
+        status: 400,
+        origin: "upstream",
+      });
+    });
+
+    test("403 stays ambiguous, so the provider policy rules remain reachable", () => {
+      // The buddy `11140` content-policy block and the Antigravity
+      // single-model entitlement gap both arrive as a 403 and must not be
+      // reclassified as auth or quota.
+      expect(classifyUpstreamError(403, "invalid_request_error").code).toBe("invalid_request");
+      expect(classifyUpstreamError(403, "11140").code).toBe("policy_rejected");
     });
   });
 });

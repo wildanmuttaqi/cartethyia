@@ -24,7 +24,7 @@
  * thing that turns the directive on, and a stored level is not consent.
  */
 import { afterAll, beforeAll, expect, test } from "bun:test";
-import { getDb } from "../../src/persistence/postgres";
+import { getDb } from "../../src/persistence/boot";
 import { consoleSettings } from "../../src/persistence/schema";
 import { DrizzleRuntimeSettingsStore } from "../../src/console/settings/store";
 import { DrizzlePreferencesReader } from "../../src/persistence/tenant-preferences";
@@ -47,8 +47,19 @@ function dataPlaneInjects(
 
 dbDescribe("runtime settings: the two-key ponyTail bag", () => {
   let world: GatewayWorld;
-  const store = new DrizzleRuntimeSettingsStore(getDb(), "redis");
-  const reader = new DrizzlePreferencesReader(getDb());
+  // Built on first use, not at collection: `getDb()` throws when no database is
+  // booted, and `dbDescribe` only skips the *tests* — the factory calls ran
+  // regardless and failed the whole file.
+  let cachedStore: DrizzleRuntimeSettingsStore | undefined;
+  let cachedReader: DrizzlePreferencesReader | undefined;
+  const store = (): DrizzleRuntimeSettingsStore => {
+    cachedStore ??= new DrizzleRuntimeSettingsStore(getDb(), "redis");
+    return cachedStore;
+  };
+  const reader = (): DrizzlePreferencesReader => {
+    cachedReader ??= new DrizzlePreferencesReader(getDb());
+    return cachedReader;
+  };
 
   beforeAll(async () => {
     world = await createWorld();
@@ -70,7 +81,7 @@ dbDescribe("runtime settings: the two-key ponyTail bag", () => {
   }
 
   async function read(): Promise<{ ponyTailEnabled: boolean; ponyTailLevel: string }> {
-    const settings = await store.get(world.tenantId);
+    const settings = await store().get(world.tenantId);
     return { ponyTailEnabled: settings.ponyTailEnabled, ponyTailLevel: settings.ponyTailLevel };
   }
 
@@ -119,7 +130,7 @@ dbDescribe("runtime settings: the two-key ponyTail bag", () => {
     // Why the two surfaces could disagree: this reader does no normalisation at
     // all. Whatever the console wrote is what the dispatch gate sees.
     await writeBag({ ponyTailLevel: "ultra" });
-    const prefs = await reader.readPreferences(world.tenantId);
+    const prefs = await reader().readPreferences(world.tenantId);
     expect(prefs).toEqual({ ponyTailLevel: "ultra" });
     expect(prefs?.ponyTailEnabled).toBeUndefined();
   });
@@ -131,7 +142,7 @@ dbDescribe("runtime settings: the two-key ponyTail bag", () => {
     await writeBag({ ponyTailLevel: "ultra" });
 
     const consoleView = await read();
-    const prefs = await reader.readPreferences(world.tenantId);
+    const prefs = await reader().readPreferences(world.tenantId);
 
     expect(consoleView.ponyTailEnabled).toBe(false);
     expect(dataPlaneInjects(prefs?.ponyTailLevel, prefs?.ponyTailEnabled)).toBe(
@@ -143,7 +154,7 @@ dbDescribe("runtime settings: the two-key ponyTail bag", () => {
     await writeBag({ ponyTailEnabled: true, ponyTailLevel: "ultra" });
 
     const consoleView = await read();
-    const prefs = await reader.readPreferences(world.tenantId);
+    const prefs = await reader().readPreferences(world.tenantId);
 
     expect(consoleView.ponyTailEnabled).toBe(true);
     expect(dataPlaneInjects(prefs?.ponyTailLevel, prefs?.ponyTailEnabled)).toBe(

@@ -12,9 +12,9 @@
  *     backend returns 403 for lesser scopes.
  */
 import { RefreshCw, ScrollText, Search, ShieldCheck, Trash2 } from "lucide-react";
-import { memo, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { memo, useEffect, useMemo, useState, type ReactNode } from "react";
 import { Badge } from "../../components/ui/badge";
-import { formatDuration } from "../../shared/format";
+import { formatDuration } from "../../lib/format/numbers";
 import { Button } from "../../components/ui/button";
 import { Card, CardBody, CardHeader } from "../../components/ui/card";
 import { ConfirmDialog } from "../../components/ConfirmDialog";
@@ -24,9 +24,9 @@ import { Input } from "../../components/ui/input";
 import type { AuditEntry } from "../../data/contracts";
 import { useAuditTrail, useSessionUser } from "../../hooks/system";
 import { useConsoleLogStream, type ConsoleLogEntry, type ConsoleLogLevel } from "../../hooks/logs";
-import { auditActionLabel } from "../../shared/audit-labels";
-import { getErrorMessage } from "../../shared/helpers";
-import { toast } from "../../shared/toast";
+import { auditActionLabel } from "./audit-labels";
+import { getErrorMessage } from "../../data/api";
+import { toast } from "../../lib/toast";
 
 type TabKey = "logs" | "audit";
 const PAGE_SIZE = 50;
@@ -89,42 +89,37 @@ export default function ConsoleLogPage(): ReactNode {
   const sessionQuery = useSessionUser();
   const isPlatformAdmin = sessionQuery.data?.isPlatformAdmin ?? false;
   const activeTab = tab === "audit" && !isPlatformAdmin ? "logs" : tab;
-  return (
-    <div
-      className="console-log-page"
-      style={{
-        display: "flex",
-        flexDirection: "column",
-        gap: "12px",
-        height: "calc(100vh - 160px)",
-        minHeight: "480px",
-      }}
-    >
-      <div style={{ display: "flex", gap: "8px", flexShrink: 0 }}>
+  const tabAction = (
+    <div className="flex gap-4">
+      <Button
+        variant={activeTab === "logs" ? "primary" : "secondary"}
+        size="sm"
+        onClick={() => setTab("logs")}
+        icon={<ScrollText size={13} />}
+        aria-pressed={activeTab === "logs"}
+      >
+        Console Log
+      </Button>
+      {isPlatformAdmin ? (
         <Button
-          variant={activeTab === "logs" ? "primary" : "secondary"}
+          variant={activeTab === "audit" ? "primary" : "secondary"}
           size="sm"
-          onClick={() => setTab("logs")}
-          icon={<ScrollText size={13} />}
-          aria-pressed={activeTab === "logs"}
+          onClick={() => setTab("audit")}
+          icon={<ShieldCheck size={13} />}
+          aria-pressed={activeTab === "audit"}
         >
-          Console Log
+          Admin Audit
         </Button>
-        {isPlatformAdmin ? (
-          <Button
-            variant={activeTab === "audit" ? "primary" : "secondary"}
-            size="sm"
-            onClick={() => setTab("audit")}
-            icon={<ShieldCheck size={13} />}
-            aria-pressed={activeTab === "audit"}
-          >
-            Admin Audit
-          </Button>
-        ) : null}
-      </div>
-      <div style={{ flex: 1, minHeight: 0, display: "flex", flexDirection: "column" }}>
-        {activeTab === "logs" ? <LiveLogsPanel /> : <AuditPanel />}
-      </div>
+      ) : null}
+    </div>
+  );
+  return (
+    <div className="flex flex-col flex-1 min-h-0">
+      {activeTab === "logs" ? (
+        <LiveLogsPanel tabAction={tabAction} />
+      ) : (
+        <AuditPanel tabAction={tabAction} />
+      )}
     </div>
   );
 }
@@ -197,95 +192,129 @@ const LogRow = memo(function LogRow({
   const isRequest = line.event !== undefined;
   const tone = line.level;
   return (
-    <div className={`console-log-row console-log-row--${tone}${isNew ? " is-new" : ""}`}>
-      <span className="console-log-time">{formatClock(line.ts)}</span>
+    <div
+      className={`flex flex-wrap items-baseline gap-4 px-8 py-1.5 font-mono text-caption leading-normal max-medium:gap-3 max-medium:px-5 max-medium:text-badge${tone === "warn" ? " bg-orange-soft" : tone === "error" ? " bg-red-soft" : ""}${isNew ? " bg-surface-muted" : ""} hover:bg-surface-hover`}
+      data-log-tone={tone}
+    >
+      <span className="max-medium:flex-none flex-none tabular-nums text-text-tertiary">{formatClock(line.ts)}</span>
       <span
-        className="console-log-level"
+        className="flex-none w-13 text-left text-micro font-bold tracking-label"
         style={{ color: LEVEL_COLOR[line.level] }}
         title={line.level.toUpperCase()}
       >
         {LEVEL_LABEL[line.level]}
       </span>
-      {isRequest ? <RequestFields line={line} /> : <span className="console-log-msg">{line.msg}</span>}
+      {isRequest ? <RequestFields line={line} /> : <span className="min-w-0 flex-1 whitespace-pre-wrap wrap-anywhere break-words text-text-secondary">{line.msg}</span>}
     </div>
   );
 });
 
-/** The structured half of a request lifecycle row. */
+/**
+ * The structured half of a request lifecycle row. The whole row is a single
+ * flex line; request fields are inline chips inside one wrapping span so a
+ * wrapped message does not push a `>` or `{` onto the next timestamp.
+ */
+/**
+ * One request, read left to right across the full width.
+ *
+ * The line fills the row and wraps onto the next one on its own when it runs
+ * out of room. Nothing is truncated, and a request that has not finished yet
+ * carries `[REQUEST]` instead of a row of dots standing in for a status.
+ */
 function RequestFields({ line }: { readonly line: ConsoleLogEntry }): ReactNode {
-  const isStart = line.event === "request_start";
   const route = eventRoute(line);
   const tokens = readTokenUsage(line);
+  const badge = requestBadge(line);
   return (
-    <>
-      <span className="console-log-method">{line.method ?? "POST"}</span>
-      <span className="console-log-path">{line.endpoint ?? ""}</span>
+    <span className="min-w-0 flex-1 whitespace-pre-wrap wrap-anywhere">
+      <span className={`font-bold tracking-label ${badge.tone}`} data-log-field="badge">[{badge.label}]</span>
+      {"  "}
+      <span className="text-text-tertiary">{line.method ?? "POST"}</span>
+      {"  "}
+      <span className="text-text-primary">{line.endpoint ?? ""}</span>
       {line.status !== undefined ? (
-        <span className={`console-log-status console-log-status--${statusTone(line.status)}`}>
-          {line.status}
-        </span>
-      ) : (
-        <span className="console-log-status console-log-status--pending">···</span>
-      )}
-      {route ? <span className="console-log-route">{route}</span> : null}
-      {line.accountLabel ? (
-        <span className="console-log-account" title={line.accountId ?? undefined}>
-          {line.accountLabel}
-        </span>
-      ) : null}
-      {line.clientIp ? <span className="console-log-ip">{line.clientIp}</span> : null}
-      {line.durationMs !== undefined ? (
-        <span className="console-log-duration">{formatDuration(line.durationMs)}</span>
-      ) : null}
-      {tokens ? <span className="console-log-tokens">{tokens}</span> : null}
-      {line.errorCode ? (
         <>
-          <span className="console-log-errmsg" title={line.msg}>
-            {line.msg}
-          </span>
-          <span className="console-log-error" title={line.msg}>
-            {line.errorCode}
+          {"  "}
+          <span className={`tabular-nums ${statusTone(line.status) === "ok" ? "text-text-tertiary" : statusTone(line.status) === "warn" ? "text-orange font-semibold" : "text-red font-semibold"}`}>
+            {line.status}
           </span>
         </>
       ) : null}
-      {isStart ? null : <span className="console-log-id">{line.requestId?.slice(0, 8) ?? ""}</span>}
-    </>
+      {line.durationMs !== undefined ? (
+        <>
+          {"  "}
+          <span className="tabular-nums text-text-secondary">{formatDuration(line.durationMs)}</span>
+        </>
+      ) : null}
+      {route ? (
+        <>
+          {"  "}
+          <span className="text-status-info" data-log-field="route">{route}</span>
+        </>
+      ) : null}
+      {line.accountLabel ? (
+        <>
+          {"  "}
+          <span className="text-purple" data-log-field="account" title={line.accountId ?? undefined}>{line.accountLabel}</span>
+        </>
+      ) : null}
+      {line.clientIp ? (
+        <>
+          {"  "}
+          <span className="tabular-nums text-text-secondary" data-log-field="ip">{line.clientIp}</span>
+        </>
+      ) : null}
+      {tokens ? (
+        <>
+          {"  "}
+          <span className="tabular-nums text-orange" data-log-field="tokens">{tokens}</span>
+        </>
+      ) : null}
+      {line.errorCode ? (
+        <>
+          {"  "}
+          <span className="text-red" title={line.msg}>{line.msg} ({line.errorCode})</span>
+        </>
+      ) : null}
+      {line.requestId ? (
+        <>
+          {"  "}
+          <span className="text-micro text-text-tertiary" data-log-field="id">{line.requestId.slice(0, 8)}</span>
+        </>
+      ) : null}
+    </span>
   );
 }
 
+/** The badge a request row leads with. A start has no status yet. */
+function requestBadge(line: ConsoleLogEntry): { readonly label: string; readonly tone: string } {
+  if (line.event === "request_start" || line.status === undefined) {
+    return { label: "REQUEST", tone: "text-text-tertiary" };
+  }
+  if (line.event === "request_error" || line.status >= 400) {
+    return { label: "FAILED", tone: "text-red" };
+  }
+  return { label: "SUCCESS", tone: "text-status-info" };
+}
 
-function LiveLogsPanel(): ReactNode {
+
+function LiveLogsPanel({ tabAction }: { tabAction: ReactNode }): ReactNode {
   const { lines, newLineIds, clear } = useConsoleLogStream();
   const [level, setLevel] = useState<"all" | ConsoleLogLevel>("all");
   const [search, setSearch] = useState("");
   const [clearOpen, setClearOpen] = useState(false);
   const [clearError, setClearError] = useState<string | null>(null);
-  const scrollRef = useRef<HTMLDivElement>(null);
-  const stickRef = useRef(true);
 
   const normalizedQuery = search.trim().toLowerCase();
   const visible = useMemo(
-    () => filterLogLines(lines, level, normalizedQuery),
+    () => filterLogLines(lines, level, normalizedQuery).slice().reverse(),
     [lines, level, normalizedQuery],
   );
-  // Counts per level: one pass instead of one `filter` per filter button on
-  // every append.
   const levelCounts = useMemo(() => {
     const counts = new Map<string, number>([["all", lines.length]]);
     for (const line of lines) counts.set(line.level, (counts.get(line.level) ?? 0) + 1);
     return counts;
   }, [lines]);
-  useEffect(() => {
-    if (!stickRef.current) return;
-    const el = scrollRef.current;
-    if (el) el.scrollTop = el.scrollHeight;
-  }, [visible.length, level, normalizedQuery]);
-
-  const onScroll = () => {
-    const el = scrollRef.current;
-    if (!el) return;
-    stickRef.current = el.scrollHeight - el.scrollTop - el.clientHeight < 48;
-  };
 
   const onClear = async () => {
     setClearError(null);
@@ -299,47 +328,49 @@ function LiveLogsPanel(): ReactNode {
   };
 
   return (
-    <Card style={{ flex: 1, minHeight: 0, display: "flex", flexDirection: "column" }}>
+    <Card className="flex-1 min-h-0 flex flex-col">
       <CardHeader
         title="Console Log"
         subtitle={`${visible.length} of ${lines.length} lines`}
         icon={<ScrollText size={16} />}
+        action={tabAction}
       />
-      <CardBody className="console-log-toolbar">
-        <div className="console-log-filters" role="group" aria-label="Log level">
+      <CardBody className="flex flex-row items-center justify-between gap-8 flex-none min-h-0 px-7 py-4 border-b border-inner-border max-medium:flex-col max-medium:items-start max-medium:gap-4">
+        <div className="inline-flex items-center gap-1.5 flex-none max-medium:w-full max-medium:overflow-x-auto" role="group" aria-label="Log level">
           {LEVEL_FILTERS.map((option) => {
             const count = levelCounts.get(option.id) ?? 0;
             return (
               <button
-                className={`console-log-filter${level === option.id ? " is-active" : ""}`}
+                className={`inline-flex items-center appearance-none border-0 rounded-tiny px-5 py-3.5 bg-transparent font-sans text-badge font-semibold leading-none cursor-pointer ${level === option.id ? "bg-surface-muted text-text-primary" : "text-text-tertiary hover:bg-surface-muted hover:text-text-primary"}`}
                 key={option.id}
                 type="button"
                 onClick={() => setLevel(option.id)}
                 aria-pressed={level === option.id}
               >
                 <span>{option.label}</span>
-                <span className="console-log-filter-count">{count}</span>
+                <span className="ml-2.5 text-inherit opacity-65 tabular-nums">{count}</span>
               </button>
             );
           })}
         </div>
-        <div className="console-log-tools">
-          <div className="console-log-search">
-            <Search size={13} aria-hidden="true" />
+        <div className="flex items-center gap-4 ml-auto max-medium:w-full max-medium:ml-0 max-medium:min-w-0">
+          <div className="relative w-140 min-w-0 max-w-full max-medium:flex-auto max-medium:w-auto">
+            <Search size={13} aria-hidden="true" className="absolute left-5 top-1/2 -translate-y-1/2 text-text-tertiary pointer-events-none" />
             <Input
               aria-label="Search console logs"
               value={search}
               onChange={(event) => setSearch(event.target.value)}
               placeholder="Search logs..."
+              className="pl-15 w-full min-w-0"
             />
           </div>
-          <button className="console-log-clear-icon" type="button" onClick={() => setClearOpen(true)} aria-label="Clear console logs" title="Clear logs">
+          <button className="inline-grid place-items-center w-16 h-16 border border-border-subtle rounded-control bg-transparent text-text-secondary cursor-pointer hover:border-red hover:text-red hover:bg-red-soft" type="button" onClick={() => setClearOpen(true)} aria-label="Clear console logs" title="Clear logs">
             <Trash2 size={15} aria-hidden="true" />
           </button>
         </div>
       </CardBody>
-      <CardBody style={{ padding: 0, flex: 1, minHeight: 0, display: "flex", flexDirection: "column" }}>
-        <div ref={scrollRef} onScroll={onScroll} className="console-log-scroll">
+      <CardBody className="p-0 flex-1 min-h-0 flex flex-col">
+        <div className="scroll-region flex-1 min-h-0 flex flex-col p-0 bg-code-surface text-text-primary">
           {visible.length === 0 ? (
             <EmptyState
               title={
@@ -362,8 +393,8 @@ function LiveLogsPanel(): ReactNode {
             ))
           )}
         </div>
-        <div className="console-log-footer" aria-live="polite">
-          <span className="console-log-footer-text">
+        <div className="flex items-center justify-between gap-5 shrink-0 px-8 py-4 border-t border-inner-border bg-surface-2 text-micro text-text-tertiary" aria-live="polite">
+          <span className="min-w-0 overflow-hidden text-ellipsis whitespace-nowrap">
             {visible.length} of {lines.length} lines
             {level !== "all" ? ` · ${level}` : ""}
             {normalizedQuery ? ` · search: "${search.trim()}"` : ""}
@@ -381,14 +412,14 @@ function LiveLogsPanel(): ReactNode {
         danger
       />
       {clearError ? (
-        <span style={{ fontSize: "11px", color: "var(--red)", padding: "0 16px 8px" }}>{clearError}</span>
+        <span className="text-badge text-red pt-0 px-8 pb-4">{clearError}</span>
       ) : null}
     </Card>
   );
 }
 
 
-function AuditPanel(): ReactNode {
+function AuditPanel({ tabAction }: { tabAction: ReactNode }): ReactNode {
   const [actionFilter, setActionFilter] = useState("");
   const [actorFilter, setActorFilter] = useState("");
   const [debouncedAction, setDebouncedAction] = useState("");
@@ -429,33 +460,27 @@ function AuditPanel(): ReactNode {
     setCursorStack([]);
   };
   return (
-    <Card style={{ flex: 1, minHeight: 0, display: "flex", flexDirection: "column" }}>
+    <Card className="flex-1 min-h-0 flex flex-col">
       <CardHeader
         title="Admin Audit Trail"
         subtitle="Every privileged console mutation, retained on its own lifecycle"
         icon={<ShieldCheck size={16} />}
         action={
-          <Button
-            variant="secondary"
-            size="sm"
-            onClick={() => void query.refetch()}
-            disabled={query.isFetching}
-            icon={<RefreshCw size={13} className={query.isFetching ? "animate-spin" : ""} />}
-          >
-            Refresh
-          </Button>
+          <div className="flex gap-4 items-center">
+            {tabAction}
+            <Button
+              variant="secondary"
+              size="sm"
+              onClick={() => void query.refetch()}
+              disabled={query.isFetching}
+              icon={<RefreshCw size={13} className={query.isFetching ? "animate-spin" : ""} />}
+            >
+              Refresh
+            </Button>
+          </div>
         }
       />
-      <CardBody
-        style={{
-          padding: "10px 16px",
-          display: "flex",
-          gap: "12px",
-          alignItems: "flex-end",
-          flexShrink: 0,
-          borderBottom: "1px solid var(--inner-border)",
-        }}
-      >
+      <CardBody className="flex flex-row items-center justify-between gap-6 flex-none min-h-0 px-8 py-5 border-b border-inner-border items-end">
         <Input
           label="Action"
           placeholder="e.g. provider updated"
@@ -474,7 +499,7 @@ function AuditPanel(): ReactNode {
             resetFilters();
           }}
         />
-        <div style={{ marginLeft: "auto", display: "flex", gap: "8px" }}>
+        <div className="ml-auto flex gap-4">
           <Button size="sm" variant="secondary" onClick={back} disabled={cursorStack.length === 0}>
             ← Newer
           </Button>
@@ -483,68 +508,29 @@ function AuditPanel(): ReactNode {
           </Button>
         </div>
       </CardBody>
-      <CardBody
-        style={{
-          padding: 0,
-          flex: 1,
-          minHeight: 0,
-          display: "flex",
-          flexDirection: "column",
-          overflowY: "auto",
-        }}
-      >
-        {query.isPending && entries.length === 0 ? (
-          <div
-            style={{
-              flex: 1,
-              display: "flex",
-              alignItems: "center",
-              justifyContent: "center",
-              padding: "32px",
-            }}
-          >
+      <CardBody className="p-0 flex-1 min-h-0 flex flex-col">
+        <div className="flex-1 min-h-0 flex flex-col overflow-y-auto p-0 bg-transparent text-inherit">
+          {query.isPending && entries.length === 0 ? (
             <LoadingState label="Loading audit trail…" />
-          </div>
-        ) : query.isError && entries.length === 0 ? (
-          <div
-            style={{
-              flex: 1,
-              display: "flex",
-              alignItems: "center",
-              justifyContent: "center",
-              padding: "32px",
-            }}
-          >
+          ) : query.isError && entries.length === 0 ? (
             <ErrorState
               message={getErrorMessage(query.error, "Unable to load audit trail.")}
               onRetry={() => void query.refetch()}
             />
-          </div>
-        ) : entries.length === 0 ? (
-          <div
-            style={{
-              flex: 1,
-              display: "flex",
-              alignItems: "center",
-              justifyContent: "center",
-              padding: "32px",
-            }}
-          >
+          ) : entries.length === 0 ? (
             <EmptyState
               title="No audit entries yet"
               message="Privileged mutations (provider changes, key rotations, backups, bans) will appear here."
               icon={<ShieldCheck size={20} />}
             />
-          </div>
-        ) : (
-          <div style={{ flex: 1, overflowY: "auto" }}>
+          ) : (
             <DataTable headers={["Timestamp", "Actor", "Action", "Target", "Detail"]}>
               {entries.map((entry) => (
                 <AuditRow key={entry.id} entry={entry} />
               ))}
             </DataTable>
-          </div>
-        )}
+          )}
+        </div>
       </CardBody>
     </Card>
   );
@@ -553,17 +539,14 @@ function AuditPanel(): ReactNode {
 function AuditRow({ entry }: { entry: AuditEntry }): ReactNode {
   return (
     <tr>
-      <td style={{ fontSize: "11.5px", color: "var(--text-tertiary)", whiteSpace: "nowrap" }}>
+      <td className="text-badge text-text-tertiary whitespace-nowrap">
         {new Date(entry.createdAt).toLocaleString()}
       </td>
-      <td style={{ maxWidth: "200px" }}>
-        <div style={{ fontSize: "12.5px", fontWeight: 600 }}>{entry.actorName ?? entry.actor}</div>
+      <td className="max-w-100">
+        <div className="text-caption font-semibold">{entry.actorName ?? entry.actor}</div>
         {entry.actorName ? (
-          <div
-            className="truncate"
-            title={entry.actor}
-            style={{ fontFamily: "var(--font-mono)", fontSize: "10.5px", color: "var(--text-tertiary)" }}
-          >
+          <div title={entry.actor}
+           className="truncate font-mono tabular-nums text-micro text-text-tertiary">
             {entry.actor}
           </div>
         ) : null}
@@ -576,21 +559,11 @@ function AuditRow({ entry }: { entry: AuditEntry }): ReactNode {
           {auditActionLabel(entry.action)}
         </Badge>
       </td>
-      <td
-        className="truncate"
-        title={entry.target}
-        style={{ fontFamily: "var(--font-mono)", fontSize: "11.5px", maxWidth: "220px" }}
-      >
+      <td title={entry.target} className="truncate font-mono tabular-nums text-badge max-w-110">
         {entry.target}
       </td>
       <td
-        style={{
-          fontFamily: "var(--font-mono)",
-          fontSize: "11px",
-          maxWidth: "320px",
-          overflow: "hidden",
-          textOverflow: "ellipsis",
-        }}
+        className="font-mono tabular-nums text-badge max-w-160 overflow-hidden truncate"
       >
         {entry.detail ? JSON.stringify(entry.detail) : "—"}
       </td>

@@ -9,8 +9,8 @@ import type {
   UpdateApiKeyResponse,
 } from "../data/contracts";
 import { queryKeys } from "../data/query-keys";
-import { assertApiKeys, querySignal } from "./common";
-import { DASHBOARD_QUERY_OPTIONS } from "../data/query-policy";
+import { assertApiKeys, querySignal } from "../data/assert";
+import { DASHBOARD_QUERY_OPTIONS, POLL } from "../data/query-policy";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 
 
@@ -132,6 +132,17 @@ export function useRegenerateApiKey() {
   });
 }
 
+/** Reads a personal key's stored secret back. The ciphertext is what makes
+ * this possible; a share template has none and the route refuses it. */
+export function useRevealApiKey() {
+  return useMutation<{ secret: string }, ApiErrorShape, { keyId: string }>({
+    mutationFn: ({ keyId }) =>
+      consoleRequest<{ secret: string }>(`/api-keys/${encodeURIComponent(keyId)}/reveal`, {
+        method: "POST",
+      }),
+  });
+}
+
 
 /** Loads tenant API-key metadata; secrets are never returned by this query. */
 export function useApiKeys() {
@@ -153,7 +164,7 @@ export function useSharedKeys(parentKeyId: string | null) {
         { signal: querySignal(context) },
       ),
     enabled: parentKeyId !== null,
-    refetchInterval: 5_000,
+    refetchInterval: POLL.live,
     refetchIntervalInBackground: false,
   });
 }
@@ -168,7 +179,7 @@ export function useSharedKeyActivity(parentKeyId: string | null, childKeyId: str
         { signal: querySignal(context) },
       ),
     enabled: parentKeyId !== null && childKeyId !== null,
-    refetchInterval: 5_000,
+    refetchInterval: POLL.live,
     refetchIntervalInBackground: false,
   });
 }

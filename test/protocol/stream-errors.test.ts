@@ -25,12 +25,19 @@
 import { describe, expect, test } from "bun:test";
 import { gatewayErrorFromStreamError } from "../../src/protocol/stream-error-frames";
 import { mapClaudeHttpError, mapClaudeStreamError } from "../../src/protocol/messages-errors";
-import type { GatewayError } from "../../src/transport/gateway-error";
+import type { GatewayError } from "../../src/protocol/gateway-error";
 
 /** The classifier's view of one input, as a comparable tuple. */
 function classified(error: GatewayError | undefined): string {
   if (error === undefined) return "undefined";
   return `${error.code}/${error.status}/${error.origin}`;
+}
+
+function detailsWithoutRaw(error: GatewayError | undefined): Readonly<Record<string, unknown>> {
+  if (error === undefined) return {};
+  const { raw, ...details } = error.details;
+  expect(raw).toBeString();
+  return details;
 }
 
 describe("gatewayErrorFromStreamError: frames that carry no error", () => {
@@ -100,7 +107,7 @@ describe("gatewayErrorFromStreamError: unclassifiable objects", () => {
     const error = gatewayErrorFromStreamError({}, "openai");
     expect(classified(error)).toBe("platform_unavailable/502/upstream");
     expect(error?.message).toBe("openai");
-    expect(error?.details).toEqual({});
+    expect(detailsWithoutRaw(error)).toEqual({});
   });
 
   test("a frame whose only identifier is the frame type stays unclassified", () => {
@@ -110,7 +117,7 @@ describe("gatewayErrorFromStreamError: unclassifiable objects", () => {
     for (const frameType of ["error", "response.failed", "response.error"]) {
       const error = gatewayErrorFromStreamError({ type: frameType }, "label");
       expect(classified(error)).toBe("platform_unavailable/502/upstream");
-      expect(error?.details).toEqual({});
+      expect(detailsWithoutRaw(error)).toEqual({});
     }
   });
 
@@ -119,7 +126,7 @@ describe("gatewayErrorFromStreamError: unclassifiable objects", () => {
     // `"500"` as a type names the frame's status, not a provider error code, so
     // it must not be reported as `providerCode`.
     const error = gatewayErrorFromStreamError({ type: "500" }, "label");
-    expect(error?.details).toEqual({});
+    expect(detailsWithoutRaw(error)).toEqual({});
   });
 
   test("message prose is never used for classification", () => {
@@ -139,7 +146,7 @@ describe("gatewayErrorFromStreamError: structured status", () => {
   test("a declared 5xx status is used verbatim and recorded", () => {
     const error = gatewayErrorFromStreamError({ status: 500 }, "label");
     expect(classified(error)).toBe("platform_unavailable/500/upstream");
-    expect(error?.details).toEqual({ providerStatus: 500 });
+    expect(detailsWithoutRaw(error)).toEqual({ providerStatus: 500 });
   });
 
   test("the status window is 400..599 inclusive", () => {
@@ -153,7 +160,7 @@ describe("gatewayErrorFromStreamError: structured status", () => {
     for (const status of [302, 399, 600, 999, 200]) {
       const error = gatewayErrorFromStreamError({ status }, "label");
       expect(classified(error)).toBe("platform_unavailable/502/upstream");
-      expect(error?.details).toEqual({});
+      expect(detailsWithoutRaw(error)).toEqual({});
     }
   });
 
@@ -184,19 +191,19 @@ describe("gatewayErrorFromStreamError: structured status", () => {
     // (fix the pool credential) depends on that distinction.
     const error = gatewayErrorFromStreamError({ status: 407 }, "label");
     expect(classified(error)).toBe("proxy_auth_required/407/network");
-    expect(error?.details).toEqual({ providerStatus: 407 });
+    expect(detailsWithoutRaw(error)).toEqual({ providerStatus: 407 });
   });
 
   test("a 529 is capacity, not a generic 5xx, and is provider-scoped", () => {
     const error = gatewayErrorFromStreamError({ status: 529 }, "label");
     expect(classified(error)).toBe("capacity_exhausted/529/upstream");
-    expect(error?.details).toEqual({ providerStatus: 529, rateLimitScope: "provider" });
+    expect(detailsWithoutRaw(error)).toEqual({ providerStatus: 529, rateLimitScope: "provider" });
   });
 
   test("a 429 is quota and provider-scoped even without an identifier", () => {
     const error = gatewayErrorFromStreamError({ status: 429 }, "label");
     expect(classified(error)).toBe("quota_exceeded/429/upstream");
-    expect(error?.details).toEqual({ providerStatus: 429, rateLimitScope: "provider" });
+    expect(detailsWithoutRaw(error)).toEqual({ providerStatus: 429, rateLimitScope: "provider" });
   });
 });
 
@@ -207,7 +214,7 @@ describe("gatewayErrorFromStreamError: structured identifiers", () => {
     // status stays 429 because 500 is not a quota status.
     const error = gatewayErrorFromStreamError({ status: 500, type: "rate_limit_exceeded" }, "label");
     expect(classified(error)).toBe("quota_exceeded/429/upstream");
-    expect(error?.details).toEqual({
+    expect(detailsWithoutRaw(error)).toEqual({
       providerStatus: 500,
       providerCode: "rate_limit_exceeded",
       rateLimitScope: "provider",
@@ -227,7 +234,7 @@ describe("gatewayErrorFromStreamError: structured identifiers", () => {
     // the credential is dead rather than the provider being busy.
     const error = gatewayErrorFromStreamError({ type: "invalid_api_key" }, "label");
     expect(classified(error)).toBe("authentication_failed/401/upstream");
-    expect(error?.details).toEqual({
+    expect(detailsWithoutRaw(error)).toEqual({
       providerCode: "invalid_api_key",
       credentialEvidence: true,
     });
@@ -239,14 +246,14 @@ describe("gatewayErrorFromStreamError: structured identifiers", () => {
     for (const identifier of ["permission_error", "insufficient_scope", "permission_denied"]) {
       const error = gatewayErrorFromStreamError({ code: identifier }, "label");
       expect(classified(error)).toBe("authentication_failed/403/upstream");
-      expect(error?.details).toEqual({ providerCode: identifier, credentialEvidence: true });
+      expect(detailsWithoutRaw(error)).toEqual({ providerCode: identifier, credentialEvidence: true });
     }
   });
 
   test("a context-length identifier is a 413 with its own code", () => {
     const error = gatewayErrorFromStreamError({ code: "context_length_exceeded" }, "label");
     expect(classified(error)).toBe("context_length_exceeded/413/upstream");
-    expect(error?.details).toEqual({ providerCode: "context_length_exceeded" });
+    expect(detailsWithoutRaw(error)).toEqual({ providerCode: "context_length_exceeded" });
   });
 
   test("a capacity identifier is a 529 unless the status already says 503", () => {
@@ -260,14 +267,41 @@ describe("gatewayErrorFromStreamError: structured identifiers", () => {
   test("a platform identifier keeps the upstream's own 5xx status", () => {
     const error = gatewayErrorFromStreamError({ status: 502, type: "server_error" }, "label");
     expect(classified(error)).toBe("platform_unavailable/502/upstream");
-    expect(error?.details).toEqual({ providerStatus: 502, providerCode: "server_error" });
+    expect(detailsWithoutRaw(error)).toEqual({ providerStatus: 502, providerCode: "server_error" });
   });
 
   test("the provider's own numeric code is reported as the provider code", () => {
     // The 11140 family: a policy rejection sent as a bare number.
     const error = gatewayErrorFromStreamError({ code: 11140 }, "label");
     expect(classified(error)).toBe("policy_rejected/403/upstream");
-    expect(error?.details).toEqual({ providerCode: "11140" });
+    expect(detailsWithoutRaw(error)).toEqual({ providerCode: "11140" });
+    expect(error?.details.raw).toBe('{\n  "code": 11140\n}');
+  });
+
+  test("keeps the complete provider error object for account health diagnostics", () => {
+    const providerError = {
+      code: 14003,
+      msg: "too many requests",
+      requestId: "97ed0e04ad984ea984b2c4fa1c8ea1ef",
+      retry_policy: { retry: true },
+      displayMsg: {
+        en: "Too many requests. Please retry later.",
+        zh: "请求过于频繁，请稍后重试。",
+        "zh-hant": "請求過於頻繁，請稍後重試。",
+      },
+      displayTips: {
+        en: "Wait about a minute before retrying, or switch to a less busy model.",
+        zh: "建议等待约 1 分钟后重试，或切换到负载较低的模型。",
+        "zh-hant": "建議等待約 1 分鐘後重試，或切換至負載較低的模型。",
+      },
+      actions: ["SUBMIT_FEEDBACK", "COPY_ERROR", "RETRY"],
+    };
+
+    const error = gatewayErrorFromStreamError(providerError, "provider");
+
+    expect(error?.details.providerCode).toBe("14003");
+    expect(error?.message).toBe("too many requests");
+    expect(error?.details.raw).toBe(JSON.stringify(providerError, null, 2));
   });
 
   test("a bare-numeric code does not become the message when a sibling carries text", () => {
@@ -280,7 +314,7 @@ describe("gatewayErrorFromStreamError: structured identifiers", () => {
       "label",
     );
     expect(error?.message).toBe("your usage will reset at 2026-10-02 12:00 UTC+8");
-    expect(error?.details).toEqual({ providerCode: "6004" });
+    expect(detailsWithoutRaw(error)).toEqual({ providerCode: "6004" });
   });
 
   test("a bare-numeric code with no sibling text is still better than nothing", () => {
@@ -300,7 +334,7 @@ describe("gatewayErrorFromStreamError: structured identifiers", () => {
     // classification survives either calling convention.
     const error = gatewayErrorFromStreamError({ error: { type: "overloaded_error" } }, "label");
     expect(classified(error)).toBe("capacity_exhausted/529/upstream");
-    expect(error?.details).toEqual({ providerCode: "overloaded_error" });
+    expect(detailsWithoutRaw(error)).toEqual({ providerCode: "overloaded_error" });
   });
 
   test("an extError code wins over a nested one", () => {
@@ -310,7 +344,7 @@ describe("gatewayErrorFromStreamError: structured identifiers", () => {
       { code: 11148, extError: { code: "tool_call_sequence_broken" } },
       "label",
     );
-    expect(error?.details).toEqual({ providerCode: "tool_call_sequence_broken" });
+    expect(detailsWithoutRaw(error)).toEqual({ providerCode: "tool_call_sequence_broken" });
   });
 
   test("identifiers are matched case-insensitively", () => {
@@ -318,20 +352,20 @@ describe("gatewayErrorFromStreamError: structured identifiers", () => {
     expect(error?.code).toBe("quota_exceeded");
     // The code is reported as the upstream spelled it, so an operator can
     // search the provider's docs for the exact string.
-    expect(error?.details).toEqual({ providerCode: "RATE_LIMIT_EXCEEDED", rateLimitScope: "provider" });
+    expect(detailsWithoutRaw(error)).toEqual({ providerCode: "RATE_LIMIT_EXCEEDED", rateLimitScope: "provider" });
   });
 
   test("an unrecognized identifier falls back to the status alone", () => {
     const error = gatewayErrorFromStreamError({ status: 503, type: "some_new_provider_code" }, "label");
     expect(classified(error)).toBe("platform_unavailable/503/upstream");
-    expect(error?.details).toEqual({ providerStatus: 503, providerCode: "some_new_provider_code" });
+    expect(detailsWithoutRaw(error)).toEqual({ providerStatus: 503, providerCode: "some_new_provider_code" });
   });
 
   test("an empty-string identifier is treated as absent", () => {
     // A blank `code` is not an identifier; recording it would put an empty
     // string in the operator's search field.
     const error = gatewayErrorFromStreamError({ status: 500, code: "   " }, "label");
-    expect(error?.details).toEqual({ providerStatus: 500 });
+    expect(detailsWithoutRaw(error)).toEqual({ providerStatus: 500 });
   });
 });
 

@@ -23,7 +23,9 @@
 import { afterAll, beforeAll, describe } from "bun:test";
 import { Pool, type PoolClient } from "pg";
 import { randomUUID } from "node:crypto";
-import { applySqlMigrations } from "../../src/persistence/postgres";
+import { readFileSync } from "node:fs";
+import { resolve } from "node:path";
+import { applySqlMigrations } from "../../src/persistence/db-pg";
 
 /** Isolated PostgreSQL URL, or `undefined` when the suite must skip. */
 export const testDatabaseUrl = process.env.CARTETHYIA_TEST_DATABASE_URL?.trim() || undefined;
@@ -135,6 +137,46 @@ export async function withRollback<T>(
 }
 
 /**
+ * Runs `body` against a throwaway database built from the current baseline.
+ *
+ * Schema-evolution suites need DDL, and DDL takes `AccessExclusiveLock`. On the
+ * shared test database that lock queues behind — and then deadlocks against —
+ * the plain reads and writes other test workers are doing on the same tables at
+ * the same time; `withRollback` cannot help, because a rolled-back `ALTER` still
+ * took the lock. The only isolation that removes the contention is a database
+ * nothing else is connected to.
+ *
+ * The baseline is applied so the body starts from the shipped shape and folds
+ * it *backwards* into whatever older shape it wants to migrate from — which is
+ * also the honest direction: an upgrade test proves an old database converges,
+ * and an old database is what it makes, not what the repo ships.
+ *
+ * Cost is ~1 s per use (create + baseline), against a 15 s test budget.
+ */
+export async function withScratchDatabase<T>(body: (db: Pool) => Promise<T>): Promise<T> {
+  if (!testDatabaseUrl) throw new Error("CARTETHYIA_TEST_DATABASE_URL is not configured");
+  const name = `cartethyia_scratch_${randomUUID().replace(/-/g, "")}`;
+  const admin = new Pool({ connectionString: testDatabaseUrl, max: 2 });
+  let scratch: Pool | undefined;
+  try {
+    await admin.query(`CREATE DATABASE ${name}`);
+    const url = new URL(testDatabaseUrl);
+    url.pathname = `/${name}`;
+    scratch = new Pool({ connectionString: url.toString(), max: 2 });
+    const baseline = readFileSync(
+      resolve(process.cwd(), "migrations", "full-postgres", "0000_baseline.sql"),
+      "utf8",
+    );
+    await scratch.query(baseline);
+    return await body(scratch);
+  } finally {
+    await scratch?.end().catch(() => undefined);
+    await admin.query(`DROP DATABASE IF EXISTS ${name}`).catch(() => undefined);
+    await admin.end().catch(() => undefined);
+  }
+}
+
+/**
  * `describe` that runs only when an isolated database is configured.
  *
  * Suites use this instead of a hand-rolled guard so the skip reason is uniform
@@ -161,8 +203,16 @@ afterAll(async () => {
  * Asserts that a service is reachable *before* a suite's tests run, so a
  * connection failure reads as an infrastructure problem instead of a failing
  * assertion inside a test body.
+ *
+ * No-ops — rather than throwing — when no isolated database is configured.
+ * The suites that call this are mixed: they carry pure-unit blocks next to
+ * database blocks, so a throw here failed blocks that never needed a database
+ * at all and left the whole suite red on a machine with no test database. The
+ * blocks that genuinely need it call {@link getTestPool} themselves, which
+ * still throws with the real reason.
  */
 export function requireDatabase(): void {
+  if (!testDatabaseUrl) return;
   beforeAll(async () => {
     await getTestPool();
   });

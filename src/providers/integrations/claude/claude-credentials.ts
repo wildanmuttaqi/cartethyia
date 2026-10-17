@@ -1,7 +1,7 @@
-import { GatewayError } from "../../../transport/gateway-error";
-import type { CredentialKind } from "../../provider-registry";
+import { GatewayError } from "../../../protocol/gateway-error";
+import type { CredentialKind } from "../../provider-contracts";
 import { HEADER_CONTROL as CONTROL_CHARACTERS } from "../../../security/outbound-headers";
-import { filterClaudeCustomHeaders } from "../claude-messages";
+import { filterClaudeCustomHeaders } from "../shared/claude-messages";
 import { CLAUDE_CODE_SDK_VERSION, CLAUDE_CODE_VERSION } from "./claude-fingerprint";
 import { assertAnthropicBetaNegotiation, negotiateAnthropicBetas, parseAnthropicBeta, type AnthropicBetaInput, type AnthropicBetaNegotiation, type AnthropicBetaUnsupportedPolicy } from "./claude-betas";
 import { stainlessArch, stainlessOs } from "../../operations/cli-platform";
@@ -199,6 +199,9 @@ function standardClaudeHeaders(
     "X-Stainless-Lang": "js",
     "X-Stainless-OS": stainlessOs(),
     "X-Stainless-Package-Version": options.sdk_version ?? CLAUDE_CODE_SDK_VERSION,
+    // The reference client stamps every request as the first attempt; a missing
+    // retry count is an observable fingerprint delta.
+    "X-Stainless-Retry-Count": "0",
     "X-Stainless-Runtime": "node",
     "X-Stainless-Runtime-Version": "v26.3.0",
     "X-Stainless-Timeout": "600",

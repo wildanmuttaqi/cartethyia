@@ -11,18 +11,36 @@
  *    configuration — which is the state that makes an operator's day worse than
  *    a plain failure would.
  *
- * Export is plain JSON at the operator's explicit request. That means the file
- * carries provider credentials and API-key hashes, so it is as sensitive as the
- * database: the layer doc and the dashboard copy say so, and export requires
- * password re-authentication.
+ * Export is a JSON object at the operator's explicit request, and it carries
+ * provider credentials and API keys decrypted — the only form in which they can
+ * be restored into an install with a different encryption key (see
+ * {@link sealedColumns}). So the file is as sensitive as the database: the layer
+ * doc and the dashboard copy say so, and export requires password
+ * re-authentication.
  */
-import type { CartethyiaDatabase } from "../../persistence/postgres";
+import type { CartethyiaDatabase } from "../../persistence/db-handle";
+import {
+  models,
+  providerAccounts,
+  providerOauthStates,
+  providerRoutingSettings,
+  providers,
+  tenantDisabledModels,
+} from "../../persistence/schema";
 import { ConsoleDomainError } from "../shared/errors";
-import { tablesForSection } from "./contracts";
-import type { BackupSection } from "./contracts";
-import { deleteAll, exportBackup, applyRestore, type DeleteAllResult, type DeleteAllScope } from "./store";
+import { tablesForSection, tableName } from "./contracts";
+import type { BackupSection, RestoreWarning, ValidatedRestore } from "./contracts";
+import {
+  applyRestore,
+  decompressBackup,
+  deleteAll,
+  exportBackup,
+  type DeleteAllResult,
+  type DeleteAllScope,
+} from "./store";
 import { detectFormat, restoreOrder, validateRestorePayload } from "./validate";
 import { convert9RouterBackup, type ImportReport } from "./nine-router";
+import { isRecord } from "../../protocol/codecs";
 
 export interface BackupServiceOptions {
   readonly db: CartethyiaDatabase;
@@ -35,11 +53,39 @@ export interface ExportOptions {
   readonly password: string;
   /** The tenant whose rows are exported. Never another tenant's. */
   readonly tenantId: string;
+  /** Gzips the file. Changes nothing about what the payload carries. */
+  readonly compressed?: boolean;
+}
+
+/** One table as it appears in a backup file, and whether it can be restored. */
+export interface BackupInspectionRow {
+  readonly section: string;
+  readonly table: string;
+  readonly count: number;
+  /** False when the current schema has no such table: restore will skip it. */
+  readonly supported: boolean;
+}
+
+/**
+ * A backup's cover, read without writing.
+ *
+ * `warnings` carries what a real restore would leave out, so the operator sees
+ * the loss before committing rather than after.
+ */
+export interface BackupInspection {
+  readonly format: "native" | "nine_router";
+  readonly version: number;
+  readonly exportedAt: string;
+  readonly rows: readonly BackupInspectionRow[];
+  readonly total: number;
+  readonly warnings: readonly RestoreWarning[];
 }
 
 export interface ImportResult {
   readonly restored: Record<string, number>;
   readonly skipped: Record<string, number>;
+  /** Parts of the file that could not be restored. Empty means it all applied. */
+  readonly warnings: readonly RestoreWarning[];
   readonly report?: ImportReport;
   readonly format: "native" | "nine_router";
 }
@@ -52,6 +98,119 @@ function sectionsOrDefault(sections: readonly BackupSection[] | undefined): read
     }
   }
   return sections;
+}
+
+/** The bytes of an uploaded backup file, as carried by a string. */
+function toBackupBytes(input: string): Uint8Array {
+  // Base64 is the only way file bytes travel inside a JSON body. A string that
+  // already is JSON is taken as the file's text; anything else is the encoded
+  // file, and a malformed payload still fails at `JSON.parse` rather than here.
+  if (input.trimStart().startsWith("{")) return Buffer.from(input, "utf8");
+  return Buffer.from(input, "base64");
+}
+
+/**
+ * Accepts a backup in any form the operator can hand it over, and parses it.
+ *
+ * The export offers a compressed download and names it `.json.gz`, so the file
+ * on the operator's disk is gzip bytes. The restore path used to read its body
+ * as JSON text, which meant their own backup was the one file it could not
+ * import. The shapes handled here are the ways a file actually arrives: a JSON
+ * object (the dashboard decodes the file in the browser), the export's own
+ * `{ bytes }` envelope, the file's text, and its bytes — base64-encoded for a
+ * JSON body, or raw.
+ *
+ * Whether it is compressed is decided by the bytes' magic, never by the
+ * filename: a `.json` that is really gzip is restored, and a `.gz` that is not
+ * is too.
+ */
+function normalizeBackupInput(input: unknown): unknown {
+  if (input === null || input === undefined) return input;
+  if (input instanceof Uint8Array) return parseBackupText(decompressBackup(input));
+  if (input instanceof ArrayBuffer) return parseBackupText(decompressBackup(new Uint8Array(input)));
+  if (typeof input === "string") return parseBackupText(decompressBackup(toBackupBytes(input)));
+  // The export's own envelope, handed straight back.
+  if (isRecord(input) && typeof input["bytes"] === "string" && Object.keys(input).length <= 3) {
+    return parseBackupText(decompressBackup(toBackupBytes(input["bytes"])));
+  }
+  return input;
+}
+
+function parseBackupText(text: string): unknown {
+  try {
+    return JSON.parse(text) as unknown;
+  } catch {
+    throw new ConsoleDomainError("invalid_request", 400, "that file is not a JSON backup");
+  }
+}
+
+async function omitRowsForUnavailableProviders(
+  db: CartethyiaDatabase,
+  validation: ValidatedRestore,
+  tenantId: string,
+): Promise<ValidatedRestore> {
+  const existingProviders = await db
+    .select({ id: providers.id, tenantId: providers.tenantId })
+    .from(providers);
+  const importedProviders = validation.tables.get(providers)?.rows ?? [];
+  const providerIds = new Set([
+    ...existingProviders
+      .filter((provider) => provider.tenantId === null || provider.tenantId === tenantId)
+      .map((provider) => provider.id),
+    ...importedProviders.map((provider) => String(provider["id"])),
+  ]);
+  const tables = new Map(validation.tables);
+  const warnings = [...validation.warnings];
+  const counts = { ...validation.counts };
+
+  for (const table of [providerAccounts, models, tenantDisabledModels, providerRoutingSettings]) {
+    const entry = tables.get(table);
+    if (entry === undefined) continue;
+    const rows = entry.rows.filter(
+      (row) => typeof row["provider_id"] === "string" && providerIds.has(row["provider_id"]),
+    );
+    if (rows.length === entry.rows.length) continue;
+    tables.set(table, { ...entry, rows });
+    counts[tableName(table)] = rows.length;
+    warnings.push({
+      table: tableName(table),
+      column: "provider_id",
+      reason: "referenced a provider not available in this installation; those rows were skipped",
+    });
+  }
+
+  const accountRows = tables.get(providerAccounts)?.rows ?? [];
+  const replacesTenantAccounts = accountRows.length > 0;
+  const existingAccounts = await db
+    .select({ id: providerAccounts.id, tenantId: providerAccounts.tenantId })
+    .from(providerAccounts);
+  const accountIds = new Set(
+    existingAccounts
+      .filter((account) => !replacesTenantAccounts || account.tenantId !== tenantId)
+      .map((account) => account.id),
+  );
+  for (const account of accountRows) {
+    if (typeof account["id"] === "string") accountIds.add(account["id"]);
+  }
+
+  const oauthEntry = tables.get(providerOauthStates);
+  if (oauthEntry !== undefined) {
+    const rows = oauthEntry.rows.filter(
+      (row) =>
+        typeof row["provider_account_id"] === "string" && accountIds.has(row["provider_account_id"]),
+    );
+    if (rows.length !== oauthEntry.rows.length) {
+      tables.set(providerOauthStates, { ...oauthEntry, rows });
+      counts[tableName(providerOauthStates)] = rows.length;
+      warnings.push({
+        table: tableName(providerOauthStates),
+        column: "provider_account_id",
+        reason: "referenced an account not restored or available in this installation; those rows were skipped",
+      });
+    }
+  }
+
+  return { ...validation, tables, counts, warnings };
 }
 
 export class BackupService {
@@ -92,7 +251,7 @@ export class BackupService {
       throw new ConsoleDomainError("unauthorized", 401, "password is incorrect");
     }
 
-    const detected = detectFormat(payload);
+    const detected = detectFormat(normalizeBackupInput(payload));
     if (detected.kind === "unknown") {
       throw new ConsoleDomainError("invalid_request", 400, detected.reason);
     }
@@ -107,17 +266,97 @@ export class BackupService {
     return { ...result, format: "native" };
   }
 
+  /**
+   * Restores a native backup onto a brand-new tenant during first boot.
+   *
+   * There is no operator to re-authenticate, and no tenant to scope the write
+   * to. The caller has already proven that no console user exists and holds
+   * the setup lock.
+   *
+   * The configuration is restored; the sign-in accounts are not, because a
+   * backup does not carry them (see {@link CONFIG_TABLES}). The caller creates
+   * the administrator for the install it just recovered into.
+   */
+  async restoreFirstBoot(payload: unknown, tenantId: string): Promise<ImportResult> {
+    const detected = detectFormat(normalizeBackupInput(payload));
+    if (detected.kind !== "native") {
+      throw new ConsoleDomainError(
+        "invalid_request",
+        400,
+        detected.kind === "unknown" ? detected.reason : "first-boot restore accepts a Cartethyia backup only",
+      );
+    }
+    const result = await this.apply(detected.payload, tenantId);
+    return { ...result, format: "native" };
+  }
+
+  /**
+   * Describes a backup without writing any of it.
+   *
+   * The dashboard's restore wizard peeks at a file before committing to it, and
+   * "which of these tables does the current build actually have" is a question
+   * only the live schema can answer — a hand-maintained list of table names in
+   * the browser would drift the moment a migration landed. So the answer comes
+   * from the same validation a restore runs, and writes nothing.
+   */
+  inspect(payload: unknown): BackupInspection {
+    const detected = detectFormat(normalizeBackupInput(payload));
+    if (detected.kind === "unknown") {
+      throw new ConsoleDomainError("invalid_request", 400, detected.reason);
+    }
+    const candidate = detected.kind === "native" ? detected.payload : null;
+    if (candidate === null) {
+      // A router export has no sections to list; it is converted at restore
+      // time, so all that can be said here is what it is.
+      return {
+        format: "nine_router",
+        version: 0,
+        exportedAt: "",
+        rows: [],
+        total: 0,
+        warnings: [],
+      };
+    }
+    const validation = validateRestorePayload(candidate, "");
+    const warnings = validation.ok ? validation.value.warnings : [];
+    const supported = new Set(validation.ok ? [...validation.value.tables.keys()].map(tableName) : []);
+
+    const rows: BackupInspectionRow[] = [];
+    let total = 0;
+    const sections = isRecord(candidate.sections) ? candidate.sections : {};
+    for (const [section, value] of Object.entries(sections)) {
+      if (!isRecord(value)) continue;
+      for (const [table, list] of Object.entries(value)) {
+        if (!Array.isArray(list)) continue;
+        rows.push({ section, table, count: list.length, supported: supported.has(table) });
+        total += list.length;
+      }
+    }
+    rows.sort((left, right) => right.count - left.count || left.table.localeCompare(right.table));
+
+    return {
+      format: "native",
+      version: typeof candidate.version === "number" ? candidate.version : 0,
+      exportedAt: typeof candidate.exportedAt === "string" ? candidate.exportedAt : "",
+      rows,
+      total,
+      warnings,
+    };
+  }
+
   /** Validates and applies a native payload. Shared by both formats. */
   private async apply(
     payload: unknown,
     tenantId: string,
-  ): Promise<{ restored: Record<string, number>; skipped: Record<string, number> }> {
+  ): Promise<{ restored: Record<string, number>; skipped: Record<string, number>; warnings: readonly RestoreWarning[] }> {
     const validation = validateRestorePayload(payload, tenantId);
     if (!validation.ok) {
       throw new ConsoleDomainError("invalid_request", 400, validation.error);
     }
     try {
-      return await applyRestore(this.options.db, validation.value, restoreOrder(), tenantId);
+      const compatible = await omitRowsForUnavailableProviders(this.options.db, validation.value, tenantId);
+      const applied = await applyRestore(this.options.db, compatible, restoreOrder(), tenantId);
+      return { ...applied, warnings: compatible.warnings };
     } catch (error) {
       // The message carries table and column names only — the store never
       // interpolates a cell value — so a failed restore cannot leak credentials

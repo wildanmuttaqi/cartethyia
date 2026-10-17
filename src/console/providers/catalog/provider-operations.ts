@@ -10,30 +10,25 @@
  * `routes.ts`.
  */
 import type { ConsoleAccessResolver } from "../../auth/access";
-import type { AuditSink } from "../../domains/audit/contracts";
+import type { AuditSink } from "../../audit/contracts";
 import {
   ConsoleDomainError,
   requireGlobalAdmin,
   requireTenantAnyScope,
 } from "../../shared/errors";
 import type { AccessDecision } from "../../../security/access-control";
-import { isBundledProviderId, type ProviderRegistry } from "../../../providers/provider-registry";
-import { getProviderClientVersion } from "../../../providers/operations/client-versions";
+import { isBundledProviderId } from "../../../providers/provider-contracts";
+import type { ProviderRegistry } from "../../../providers/provider-registry";
+import { getProviderClientVersion, getRouteIdentityVersions } from "../../../providers/operations/client-versions";
 import type { OAuthLoginField } from "../../../providers/authentication/oauth-flow-store";
-import {
-  providerCredentialHint,
-  providerCredentialUrl,
-  providerDisplayName,
-  providerHasAdapterUserAgent,
-  providerServiceKinds,
-  providerSupportsWebSearch,
-  type CompatibilityProfile,
-} from "../../../providers/provider-metadata";
+import { providerCredentialHint, providerCredentialUrl, providerDisplayName, providerHasAdapterUserAgent, providerOperatorNotice, providerServiceKinds, type CompatibilityProfile } from "../../../providers/provider-metadata";
 import type { AccountHealthEventRecord } from "../../../providers/operations/account-health-service";
-import { CREDENTIAL_MODES, PROVIDER_READ_SCOPES, PROVIDER_WRITE_SCOPES } from "./contracts";
+import { CREDENTIAL_MODES, PROVIDER_READ_SCOPES, PROVIDER_WRITE_SCOPES, type BuddyGrowthTaskLedgerEntry } from "./contracts";
+import { enqueueCheckin } from "../../../workers/daily-checkin";
 import {
   isWireFamily,
   validateCompatibilityProfile,
+  type CreateProviderAccountBatchResult,
   type CreateProviderAccountRequest,
   type CreateProviderRequest,
   type ProviderAccountExport,
@@ -46,6 +41,28 @@ import {
   type UpdateProviderAccountRequest,
   type UpdateProviderRequest,
 } from "./contracts";
+/**
+ * Asks the quota sweep to claim the daily check-in credit for a just-created
+ * account on its next pass.
+ *
+ * A no-op for every provider outside the buddy family, and it never touches
+ * upstream: it records an id and returns, so an import of a hundred accounts
+ * still answers as one local write. The sweep that drains this already has the
+ * refreshed credential, the egress rotation, and the once-per-day marker, so
+ * adding a timer here would only duplicate that work — which is the same
+ * reason the check-in has no timer of its own.
+ */
+function queueNewAccountCheckin(
+  providerId: string,
+  account: { readonly id: string; readonly tenantId?: string | null },
+): void {
+  enqueueCheckin({
+    accountId: account.id,
+    providerId,
+    tenantId: account.tenantId ?? null,
+  });
+}
+
 export function sanitizeProviderResponse(
   provider: unknown,
   includeSecrets = false,
@@ -64,6 +81,7 @@ export function sanitizeProviderResponse(
   // always reports the current canonical values.
   const credentialUrl = providerCredentialUrl(p.providerId);
   const credentialHint = providerCredentialHint(p.providerId);
+  const operatorNotice = providerOperatorNotice(p.providerId);
   const clientVersion = getProviderClientVersion(p.providerId);
   const response: ProviderResponse = {
     providerId: p.providerId,
@@ -73,10 +91,13 @@ export function sanitizeProviderResponse(
     isBuiltIn: (p.isBuiltIn as boolean | undefined) ?? false,
     requiresAccount: (p.requiresAccount as boolean | undefined) ?? true,
     hasAdapterUserAgent: providerHasAdapterUserAgent(p.providerId),
-    supportsWebSearch: providerSupportsWebSearch(p.providerId),
+    // No model advertises search; see the note in provider-metadata.ts.
+    supportsWebSearch: false,
     ...(credentialUrl === undefined ? {} : { credentialUrl }),
     ...(credentialHint === undefined ? {} : { credentialHint }),
+    ...(operatorNotice === undefined ? {} : { operatorNotice }),
     ...(clientVersion === undefined ? {} : { clientVersion }),
+    routeIdentityVersions: getRouteIdentityVersions(),
     supportsModelDiscovery: (p.supportsModelDiscovery as boolean | undefined) ?? !p.isBuiltIn,
     ...(typeof p.createdAt === "string" ? { createdAt: p.createdAt } : {}),
     ...(typeof p.updatedAt === "string" ? { updatedAt: p.updatedAt } : {}),
@@ -256,7 +277,8 @@ export function createProviderCatalogOperations(config: ProviderCatalogConfig) {
           providerId: request.providerId,
           displayName: providerDisplayName(request.providerId),
           serviceKinds: ["llm"],
-          supportsWebSearch: providerSupportsWebSearch(request.providerId),
+          // No model advertises search; see the note in provider-metadata.ts.
+          supportsWebSearch: false,
           tenantId: a.tenantId,
           enabled: request.enabled ?? true,
           isBuiltIn: false,
@@ -334,8 +356,9 @@ export function createProviderCatalogOperations(config: ProviderCatalogConfig) {
         providerId: string,
       ): Promise<{ success: boolean }> {
         const a = requireTenantAnyScope(access, PROVIDER_WRITE_SCOPES);
-        const ok = await config.store.delete(a.tenantId, providerId);
-        if (!ok)
+        const owned = await config.store.delete(a.tenantId, providerId);
+        const retired = owned || await config.store.deleteGlobal(providerId);
+        if (!retired)
           throw new ConsoleDomainError("provider_not_found", 404, `Provider ${providerId} not found`);
         await config.auditSink?.record({
           access: a,
@@ -421,6 +444,7 @@ export function createProviderCatalogOperations(config: ProviderCatalogConfig) {
           providerId,
           request,
         );
+        queueNewAccountCheckin(providerId, created);
         await config.auditSink?.record({
           access: a,
           action: "provider_account.created",
@@ -430,6 +454,80 @@ export function createProviderCatalogOperations(config: ProviderCatalogConfig) {
         await config.snapshotInvalidator?.invalidate();
         return created;
       },
+    /**
+     * Creates many accounts in one round-trip.
+     *
+     * The per-item validation is the same `createAccount` path the single route
+     * uses, so a batch cannot accept a shape the single create rejects. The
+     * expensive per-account bookkeeping — the audit row and the routing snapshot
+     * invalidation that forces a 10-table catalog rebuild — is done ONCE for the
+     * whole batch instead of once per account, which is most of why the old
+     * client-side loop scaled linearly with paste size.
+     *
+     * Email/label enrichment is deliberately NOT done here. Persisting the
+     * credential is local work (encrypt + hash + insert) and needs no upstream;
+     * parsing identity out of a JWT or probing the provider is what made an
+     * import feel slow, so it happens in the background sweep instead.
+     */
+    async createAccountBatch(
+      access: AccessDecision | undefined,
+      providerId: string,
+      requests: readonly CreateProviderAccountRequest[],
+    ): Promise<CreateProviderAccountBatchResult> {
+      const a = requireTenantAnyScope(access, PROVIDER_WRITE_SCOPES);
+      if (requests.length === 0) {
+        return { created: 0, failed: 0, results: [] };
+      }
+      for (const request of requests) {
+        if (
+          request.credentialKind !== "api_key" &&
+          request.credentialKind !== "oauth" &&
+          request.credentialKind !== "none"
+        ) {
+          throw new ConsoleDomainError(
+            "invalid_request",
+            400,
+            "credentialKind must be api_key, oauth, or none",
+          );
+        }
+        if (
+          request.credentialMode !== undefined &&
+          !(CREDENTIAL_MODES as readonly string[]).includes(request.credentialMode)
+        ) {
+          throw new ConsoleDomainError(
+            "invalid_request",
+            400,
+            "credentialMode must be auto, jwt, or api_key",
+          );
+        }
+      }
+
+      const result = await config.store.createAccountBatch(a.tenantId, providerId, requests);
+      for (const created of result.results) {
+        if (created.account !== undefined) queueNewAccountCheckin(providerId, created.account);
+      }
+
+      // One audit row per successful account, but written after the batch lands
+      // rather than inside the request path that used to await it per account.
+      if (result.created > 0) {
+        await config.auditSink?.record({
+          access: a,
+          action: "provider_account.batch_created",
+          target: providerId,
+          detail: {
+            providerId,
+            created: result.created,
+            failed: result.failed,
+          },
+        });
+      }
+      // A single invalidation for the whole batch: this drops the cached route
+      // snapshot, so the next dispatch rebuilds the catalog once.
+      if (result.created > 0) {
+        await config.snapshotInvalidator?.invalidate();
+      }
+      return result;
+    },
     async updateAccount(
         access: AccessDecision | undefined,
         providerId: string,
@@ -463,6 +561,15 @@ export function createProviderCatalogOperations(config: ProviderCatalogConfig) {
         const a = requireTenantAnyScope(access, PROVIDER_READ_SCOPES);
         return config.store.listAccountHealthEvents(a.tenantId, providerId, accountId);
       },
+    async listBuddyGrowthTasks(
+      access: AccessDecision | undefined,
+      providerId: string,
+      accountId: string,
+      dayKey: string,
+    ): Promise<readonly BuddyGrowthTaskLedgerEntry[]> {
+      const a = requireTenantAnyScope(access, PROVIDER_READ_SCOPES);
+      return config.store.listBuddyGrowthTasks(a.tenantId, providerId, accountId, dayKey);
+    },
     async recoverAccount(
         access: AccessDecision | undefined,
         providerId: string,

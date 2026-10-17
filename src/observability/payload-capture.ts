@@ -1,8 +1,91 @@
-import type { CartethyiaDatabase } from "../persistence/postgres";
-import { DrizzleTelemetryStore } from "../persistence/telemetry-store";
+import type { CartethyiaDatabase } from "../persistence/db-handle";
+import { DrizzleTelemetryStore } from "../persistence/stores/telemetry-store";
 import { prunePayloadFrames, writePayloadFrame } from "./payload-store";
-import { resolveTelemetryPayloadMaxBytes } from "../config";
+import { resolveTelemetryPayloadMaxBytes } from "../config/telemetry";
+import { preferencesReaderFor } from "../persistence/tenant-preferences";
+import type { TelemetryPayloadDepth, TelemetryPayloadMode } from "../console/settings/contracts";
 export type CaptureScope = "tenant" | "debug_session" | "operator_flag";
+
+/**
+ * Settings-gated payload capture. Request-event metadata is always retained;
+ * tenants opt into drawer capture through Settings → Privacy: `metadata`
+ * keeps only the Proxy→Provider request line, `full` keeps redacted bodies
+ * at the tenant's chosen depth. Fail-closed on error.
+ */
+export async function resolvePayloadCapture(
+  db: CartethyiaDatabase,
+  tenantId: string | null,
+): Promise<
+  | { readonly ok: true; readonly mode: TelemetryPayloadMode; readonly depth: TelemetryPayloadDepth }
+  | { readonly ok: false }
+> {
+  if (!tenantId) return { ok: false };
+  try {
+    const prefs = await preferencesReaderFor(db).readPreferences(tenantId);
+    const mode = prefs?.telemetryPayloads;
+    const depth = prefs?.telemetryPayloadDepth;
+    return {
+      ok: true,
+      mode: mode === "full" || mode === "metadata" || mode === "none" ? mode : "none",
+      depth:
+        depth === "minimum" || depth === "moderate" || depth === "maximum"
+          ? depth
+          : depth === "medium"
+            ? "minimum"
+            : depth === "high"
+              ? "moderate"
+              : depth === "full"
+                ? "maximum"
+                : "minimum",
+    };
+  } catch {
+    // A preference read that fails must not invent capture. Off keeps nothing.
+    // Reported as its own state rather than silently as `none`: an operator
+    // whose capture is off by choice and one whose preference read is failing
+    // need different fixes, and both used to look like "not configured".
+    return { ok: false };
+  }
+}
+
+/**
+ * Whether the tenant's capture mode keeps bodies (`full`). Both the
+ * provider-response tee and the ingress-body release key off this: `none` and
+ * `metadata` store no client request body, so the parsed ingress body can be
+ * dropped once the canonical request exists instead of being held until
+ * finalize — which, for a streaming response, is the whole stream.
+ */
+export async function payloadCaptureKeepsBodies(
+  db: CartethyiaDatabase,
+  tenantId: string | null,
+): Promise<boolean> {
+  const resolved = await resolvePayloadCapture(db, tenantId);
+  return resolved.ok && resolved.mode === "full";
+}
+
+/**
+ * Why one request's drawer payloads are empty.
+ *
+ * Every reason the drawer can read empty is named here, because from the
+ * client the four panels look identical in all of them: an operator who turned
+ * capture off and an operator whose capture is broken both see four blank
+ * panels. Recording the reason is what makes remote diagnosis possible without
+ * access to the server's logs.
+ */
+export type PayloadCaptureState =
+  /** Bodies were captured for this request. */
+  | "captured"
+  /** Only the Proxy→Provider request line was kept (mode `metadata`). */
+  | "captured_metadata"
+  /** The tenant has capture switched off; request metadata is still retained. */
+  | "skipped_mode_none"
+  /** The request had no tenant, so no capture preference could be read. */
+  | "skipped_no_tenant"
+  /** The attempt was not the terminal one; the terminal attempt captures. */
+  | "skipped_not_terminal"
+  /** The preference read failed, and capture fails closed. */
+  | "skipped_preference_read_failed"
+  /** The storage write failed after the decision to capture. */
+  | "failed_write";
 
 export interface PayloadCaptureInput {
   tenantId: string;
@@ -33,6 +116,12 @@ export interface PayloadSignals {
 
 export interface StoredPayload {
   id: string;
+  /**
+   * JSON text of the five body surfaces, in drawer order, built while the
+   * record was measured. Present only on a record that has not been persisted
+   * yet; the frame writer consumes it so the bodies are not serialized twice.
+   */
+  _serialized?: readonly string[];
   request_id: string | null;
   captured_at: Date;
   expires_at: Date;
@@ -114,49 +203,65 @@ export function buildPayloadRecord(
   maxBytes = resolveTelemetryPayloadMaxBytes(),
 ): Omit<StoredPayload, "id"> {
   const expiresAt = new Date(now.getTime() + payloadRetentionMs());
-  const requestBody = input.requestBody;
-  const responseBody = input.responseBody;
-  const clientResponseBody = input.clientResponseBody;
-  const providerRequestBody = input.providerRequestBody;
-  const providerResponseBody = input.providerResponseBody;
-  // Serialize each body exactly once: the text is both measured and stored,
-  // so the hot path pays one JSON.stringify per body instead of five.
-  const bodies = [requestBody, responseBody, clientResponseBody, providerRequestBody, providerResponseBody];
-  const serialized = bodies.map((body) => JSON.stringify(body ?? null));
-  const approxSize = serialized.reduce((total, text) => total + text.length, 0);
-  let storedRequestBody: unknown = requestBody;
-  let storedResponseBody: unknown = responseBody;
-  let storedClientResponseBody: unknown = clientResponseBody;
-  let storedProviderRequestBody: unknown = providerRequestBody;
-  let storedProviderResponseBody: unknown = providerResponseBody;
-  if (approxSize > maxBytes) {
-    const truncated = (): { _truncated: true; _original_bytes: number; _hint: string } => ({
-      _truncated: true,
-      _original_bytes: approxSize,
-      _hint: "Truncated by the capture cap — raise Settings → Telemetry payloads → Capture depth to keep more.",
-    });
-    storedRequestBody = truncated();
-    storedResponseBody = truncated();
-    storedClientResponseBody = truncated();
-    storedProviderRequestBody = truncated();
-    storedProviderResponseBody = truncated();
+  // Each body is serialized once, in drawer order, and only while the running
+  // total still fits the cap. The old path serialized every body up front to
+  // measure them and then serialized the whole record again to store it, so a
+  // capture held two copies of every body at once — measured at 23 MB of heap
+  // for 8 MB of bodies. A body that would cross the cap is never touched: its
+  // text is not built and its object is not walked for signals.
+  const surfaces: ReadonlyArray<readonly [keyof StoredPayload, unknown]> = [
+    ["request_body", input.requestBody],
+    ["response_body", input.responseBody],
+    ["client_response_body", input.clientResponseBody],
+    ["provider_request_body", input.providerRequestBody],
+    ["provider_response_body", input.providerResponseBody],
+  ];
+  const stored: Partial<Record<keyof StoredPayload, unknown>> = {};
+  const serialized: string[] = [];
+  const kept: unknown[] = [];
+  let accounted = 0;
+  let truncated = false;
+  for (const [key, body] of surfaces) {
+    if (truncated || body === undefined || body === null) {
+      stored[key] = null;
+      serialized.push("null");
+      continue;
+    }
+    const text = JSON.stringify(body);
+    if (accounted + text.length > maxBytes) {
+      truncated = true;
+      stored[key] = null;
+      serialized.push("null");
+      continue;
+    }
+    accounted += text.length;
+    stored[key] = body;
+    serialized.push(text);
+    kept.push(body);
+  }
+  const marker = truncated
+    ? {
+        _truncated: true,
+        _original_bytes: accounted,
+        _hint: "Truncated by the capture cap — raise Settings → Telemetry payloads → Capture depth to keep more.",
+      }
+    : undefined;
+  if (marker) {
+    for (const [key] of surfaces) {
+      if (stored[key] === null) stored[key] = marker;
+    }
   }
   return {
     request_id: input.requestId ?? null,
     captured_at: now,
     expires_at: expiresAt,
-    request_body: storedRequestBody,
-    response_body: storedResponseBody,
-    client_response_body: storedClientResponseBody,
-    provider_request_body: storedProviderRequestBody,
-    provider_response_body: storedProviderResponseBody,
-    signals: payloadSignals([
-      requestBody,
-      responseBody,
-      clientResponseBody,
-      providerRequestBody,
-      providerResponseBody,
-    ]),
+    request_body: stored.request_body ?? null,
+    response_body: stored.response_body ?? null,
+    client_response_body: stored.client_response_body ?? null,
+    provider_request_body: stored.provider_request_body ?? null,
+    provider_response_body: stored.provider_response_body ?? null,
+    signals: payloadSignals(kept),
+    _serialized: serialized,
   };
 }
 
@@ -179,7 +284,14 @@ export class TelemetryPayloadCapture {
       });
     }
     const record = buildPayloadRecord(input, new Date(), input.maxBytes ?? resolveTelemetryPayloadMaxBytes());
-    const reference = await writePayloadFrame(record, record.expires_at);
+    const reference = await writePayloadFrame(record, record.expires_at, record._serialized
+      ? {
+          requestId: record.request_id,
+          capturedAt: record.captured_at.toISOString(),
+          signals: record.signals,
+          bodies: record._serialized,
+        }
+      : undefined);
     // Typed columns only — bodies live in the frame file. The schema has no
     // jsonb body column, so a body cannot be written to Postgres here.
     return this.store.insertPayload({

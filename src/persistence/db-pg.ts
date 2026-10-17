@@ -1,7 +1,7 @@
 /** External-PostgreSQL backend: bounded `pg` Pool behind the shared handle. */
 import { drizzle } from "drizzle-orm/node-postgres";
 import { Pool, type PoolClient } from "pg";
-import { DEFAULT_BOUNDS } from "../transport/resources";
+import { DEFAULT_BOUNDS } from "../config/network";
 import { log } from "../observability/logger";
 import {
   encodeConnectionComponent,
@@ -13,6 +13,9 @@ import { fullSchema, type CartethyiaDatabase, type DatabaseHandle } from "./db-h
 import {
   LEDGER_DDL,
   MIGRATION_LEDGER_TABLE,
+  BASELINE_MIGRATION_ID,
+  assertMigrationHistorySupported,
+  baselineSchemaMarker,
   migrationFiles,
   resolveMigrationsFolder,
 } from "./migrate";
@@ -147,21 +150,17 @@ export function getPool(): Pool {
   return pool;
 }
 
-/**
- * Installs a test pool so code paths that only need the pool's *shape* (such as
- * the capacity check) can run without a server. Mirrors `setRedisForTesting`:
- * the test owns the lifetime and must clear it with `closeDb()`.
- */
-export function setPoolForTesting(testPool: Pool): void {
-  globalThis.__cartethyiaPool = testPool;
-}
-
 /** Applies numbered SQL files in order under one cross-process advisory lock. */
 export async function applySqlMigrations(
   pool: Pool,
   folder = resolveMigrationsFolder(),
 ): Promise<void> {
   const files = migrationFiles(folder);
+  const baselineFile = files.find((file) => basename(file) === BASELINE_MIGRATION_ID);
+  const baselineMarker =
+    baselineFile === undefined
+      ? undefined
+      : baselineSchemaMarker(readFileSync(baselineFile, "utf8"));
   const client = await pool.connect();
   try {
     await client.query(`SELECT pg_advisory_lock(hashtext('cartethyia:migrations'))`);
@@ -170,6 +169,18 @@ export async function applySqlMigrations(
       `SELECT migration_id FROM ${MIGRATION_LEDGER_TABLE}`,
     );
     const applied = new Set(appliedRows.rows.map((row) => row.migration_id));
+    const tenants = await client.query<{ present: boolean }>(
+      `SELECT to_regclass('public.tenants') IS NOT NULL AS present`,
+    );
+    assertMigrationHistorySupported(
+      applied,
+      [
+        ...files.map((file) => basename(file)),
+        ...(baselineMarker === undefined ? [] : [baselineMarker]),
+      ],
+      tenants.rows[0]?.present === true,
+      baselineMarker,
+    );
 
     for (const file of files) {
       const migrationId = basename(file);
@@ -182,8 +193,17 @@ export async function applySqlMigrations(
           `INSERT INTO ${MIGRATION_LEDGER_TABLE} (migration_id) VALUES ($1)`,
           [migrationId],
         );
+        if (migrationId === BASELINE_MIGRATION_ID && baselineMarker !== undefined) {
+          await client.query(
+            `INSERT INTO ${MIGRATION_LEDGER_TABLE} (migration_id) VALUES ($1)`,
+            [baselineMarker],
+          );
+        }
         await client.query("COMMIT");
         applied.add(migrationId);
+        if (migrationId === BASELINE_MIGRATION_ID && baselineMarker !== undefined) {
+          applied.add(baselineMarker);
+        }
       } catch (error) {
         // Rollback on migration failure is best-effort before throwing.
         await client.query("ROLLBACK").catch(() => {});

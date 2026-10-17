@@ -1,6 +1,7 @@
-import { ChevronDown, Eye, EyeOff, Plus, Trash2 } from "lucide-react";
+import { ChevronDown, Eye, EyeOff, Plus, Server, Trash2 } from "lucide-react";
 import { memo, useEffect, useMemo, useState, type ReactNode } from "react";
-import { Link } from "react-router-dom";
+import { cn } from "../../lib/classnames";
+import { Link, useSearchParams } from "react-router-dom";
 import {
   HeaderPairsEditor,
   pairsToHeaders,
@@ -11,14 +12,25 @@ import { ProviderIcon } from "../../components/ProviderIcon";
 import { modelCoolingCount } from "../../components/AccountCooldown";
 import { Badge } from "../../components/ui/badge";
 import { Button } from "../../components/ui/button";
-import { Card, CardBody } from "../../components/ui/card";
+import { Card, CardBody, CardHeader } from "../../components/ui/card";
+import { ListRow } from "../../components/ui/list-row";
 import { Dialog } from "../../components/ui/dialog";
+import { DialogActions } from "../../components/ui/dialog-actions";
 import { Input } from "../../components/ui/input";
 import { Select } from "../../components/ui/select";
 import { EmptyState, ErrorState, LoadingState } from "../../components/ui/state";
 import { Switch } from "../../components/ui/switch";
 import { Inline } from "../../components/ui/inline";
 import { Stack } from "../../components/ui/stack";
+const CARD_SHELL = cn(
+  "relative flex flex-col min-w-0 border border-inner-border rounded-card",
+  "transition-[transform,border-color,box-shadow]",
+);
+
+const CARD_LINK = cn("block flex-1 p-6 no-underline text-inherit");
+
+const CARD_NAME = cn("text-body font-semibold overflow-hidden text-ellipsis whitespace-nowrap");
+
 import type {
   CreateProviderRequest,
   ProviderAccountResponse,
@@ -34,17 +46,47 @@ import {
   useSyncProviderModels,
   useTestByokConnection,
 } from "../../hooks/providers";
-import { getErrorMessage } from "../../shared/helpers";
+import { getErrorMessage } from "../../data/api";
 
 const wireFamilies = ["chat", "responses", "messages"] as const;
 type WireFamily = (typeof wireFamilies)[number];
-type DashboardServiceKind = "llm" | "websearch";
+type DashboardServiceKind = "llm" | "websearch" | "imageGeneration" | "videoGeneration";
 
-const SEARCH_PROVIDER_ORDER = ["exa", "gemini", "codex"] as const;
+
 
 function providerServiceKinds(provider: ProviderResponse): readonly string[] {
   const kinds = provider.serviceKinds;
   return Array.isArray(kinds) && kinds.length > 0 ? kinds : ["llm"];
+}
+
+/**
+ * Endpoint tails an operator pastes into the Base URL field instead of a root.
+ * The same shape the server strips in `splitEndpointBaseUrl`; this copy is what
+ * lets the form say so before a request is made.
+ */
+const ENDPOINT_TAIL = /\/(?:v\d+\/)?(?:messages|chat\/completions|responses|completions|embeddings|images\/generations)$/;
+
+/**
+ * The root to use when the typed Base URL ends at a per-request endpoint, or
+ * null when it already looks like a root.
+ *
+ * The suggestion is the bare origin, matching the server's
+ * `splitEndpointBaseUrl`: for `…/anthropic/v1/messages` the whole path belongs
+ * to that endpoint, and offering `…/anthropic` would still derive the model
+ * list at `…/anthropic/models` and fail.
+ */
+function pastedEndpointRoot(value: string): string | null {
+  const trimmed = value.trim().replace(/\/+$/, "");
+  if (trimmed === "") return null;
+  let url: URL;
+  let pathname: string;
+  try {
+    url = new URL(trimmed);
+    pathname = url.pathname.replace(/\/+$/, "");
+  } catch {
+    return null;
+  }
+  return ENDPOINT_TAIL.test(pathname) ? url.origin : null;
 }
 
 
@@ -75,12 +117,16 @@ function AddCompatibleModal({
   const [testResult, setTestResult] = useState<{
     ok: boolean;
     message: string;
+    /** The server corrected a pasted endpoint path; shown beside the outcome. */
+    warning?: string;
   } | null>(null);
   const [testing, setTesting] = useState(false);
 
   const isAnthropic = variant === "anthropic-compatible";
   const defaultWire: WireFamily = isAnthropic ? "messages" : "chat";
   const [wireFamily, setWireFamily] = useState<WireFamily>(defaultWire);
+  // The root the field should hold, when what was typed ends at an endpoint.
+  const pastedEndpoint = useMemo(() => pastedEndpointRoot(baseUrl), [baseUrl]);
 
   useEffect(() => {
     if (!open) return;
@@ -124,11 +170,16 @@ function AddCompatibleModal({
       if (result.ok) {
         const models =
           typeof result.modelCount === "number" ? ` — upstream advertised ${result.modelCount} model(s)` : "";
-        setTestResult({ ok: true, message: `Connected successfully (${result.latencyMs}ms)${models}.` });
+        setTestResult({
+          ok: true,
+          message: `Connected successfully (${result.latencyMs}ms)${models}.`,
+          ...(result.warning === undefined ? {} : { warning: result.warning }),
+        });
       } else {
         setTestResult({
           ok: false,
           message: result.error ?? "Connection failed.",
+          ...(result.warning === undefined ? {} : { warning: result.warning }),
         });
       }
     } catch (err) {
@@ -192,9 +243,17 @@ function AddCompatibleModal({
       open={open}
       onClose={onClose}
       title={isAnthropic ? "Add Custom Anthropic Provider" : "Add Custom OpenAI Provider"}
+      footer={
+        <>
+          <Button variant="secondary" type="button" onClick={onClose}>Cancel</Button>
+          <Button variant="primary" type="submit" form="add-compatible-provider" disabled={submitting}>
+            {submitting ? "Creating..." : "Add Provider"}
+          </Button>
+        </>
+      }
     >
-      <form onSubmit={submit} style={{ display: "flex", flexDirection: "column", gap: "12px" }}>
-        {error ? <div style={{ color: "var(--red)", fontSize: "12px" }}>{error}</div> : null}
+      <form id="add-compatible-provider" onSubmit={submit} className="flex flex-col gap-6">
+        {error ? <div className="text-red text-caption">{error}</div> : null}
         <Input
           label="Display Name"
           hint="Required. A friendly label for this node."
@@ -216,9 +275,13 @@ function AddCompatibleModal({
         <div className="form-group">
           <label className="form-label" htmlFor="compat-url">
             <span>Base URL</span>
+            <span className="form-hint">
+              The root only. Do not paste the full endpoint — leave off
+              {isAnthropic ? " `/v1/messages`." : " `/chat/completions`."}
+            </span>
           </label>
           <Inline gap="8px">
-            <div style={{ flex: 1, minWidth: 0 }}>
+            <div className="flex-1 min-w-0">
               <Input
                 id="compat-url"
                 value={baseUrl}
@@ -233,6 +296,13 @@ function AddCompatibleModal({
               Paste
             </Button>
           </Inline>
+          {pastedEndpoint === null ? null : (
+            <p className="mt-1.5 text-caption text-orange">
+              That looks like a full endpoint. Use{" "}
+              <code className="font-mono">{pastedEndpoint}</code> instead — Cartethyia appends the
+              endpoint path itself.
+            </p>
+          )}
         </div>
         {isAnthropic ? null : (
           <Select
@@ -254,7 +324,7 @@ function AddCompatibleModal({
             </span>
           </label>
           <Inline gap="8px">
-            <div style={{ flex: 1, minWidth: 0 }}>
+            <div className="flex-1 min-w-0">
               <Input
                 id="compat-credential"
                 type="password"
@@ -276,69 +346,49 @@ function AddCompatibleModal({
             </Button>
           </Inline>
           {testResult ? (
-            <div
-              style={{
-                marginTop: "6px",
-                fontSize: "12px",
-                lineHeight: "1.4",
-                color: testResult.ok ? "var(--green, #2f9e44)" : "var(--red)",
-                wordBreak: "break-word",
-              }}
-            >
-              {testResult.ok ? "✓ " : "✗ "}
-              {testResult.message}
-            </div>
+            <>
+              <div
+                className={cn(
+                  "mt-3 text-caption leading-[1.4] break-words",
+                  testResult.ok ? "text-green" : "text-red",
+                )}
+              >
+                {testResult.ok ? "✓ " : "✗ "}
+                {testResult.message}
+              </div>
+              {testResult.warning ? (
+                <div className="mt-2 text-caption leading-snug break-words text-orange">
+                  ⚠ {testResult.warning}
+                </div>
+              ) : null}
+            </>
           ) : null}
         </div>
-        <div
-          style={{
-            display: "flex",
-            alignItems: "center",
-            justifyContent: "space-between",
-            padding: "10px 12px",
-            borderRadius: "10px",
-            border: "1px solid var(--inner-border)",
-          }}
+        <ListRow
+          actions={<Switch checked={autoFetchModels} onChange={setAutoFetchModels} id="compat-autofetch" />}
         >
           <div>
-            <div style={{ fontSize: "13px", fontWeight: 600 }}>Auto-fetch models</div>
-            <div style={{ fontSize: "11px", color: "var(--text-tertiary)" }}>
+            <div className="text-body font-semibold">Auto-fetch models</div>
+            <div className="mt-1 text-badge text-text-tertiary">
               Discover this provider's model list automatically after creation
             </div>
           </div>
-          <Switch checked={autoFetchModels} onChange={setAutoFetchModels} id="compat-autofetch" />
-        </div>
-        <div
-          style={{
-            display: "flex",
-            alignItems: "center",
-            justifyContent: "space-between",
-            padding: "10px 12px",
-            borderRadius: "10px",
-            border: "1px solid var(--inner-border)",
-          }}
+        </ListRow>
+        <ListRow
+          actions={<Switch checked={sendCliIdentity} onChange={setSendCliIdentity} id="compat-cli-identity" />}
         >
           <div>
-            <div style={{ fontSize: "13px", fontWeight: 600 }}>
+            <div className="text-body font-semibold">
               {isAnthropic ? "Send request as Claude CLI" : "Send request as Codex CLI"}
             </div>
-            <div style={{ fontSize: "11px", color: "var(--text-tertiary)" }}>
+            <div className="mt-1 text-badge text-text-tertiary">
               {isAnthropic
                 ? "Emits official Claude CLI User-Agent and Stainless headers to upstream"
                 : "Emits official codex_cli_rs User-Agent and originator headers to upstream"}
             </div>
           </div>
-          <Switch checked={sendCliIdentity} onChange={setSendCliIdentity} id="compat-cli-identity" />
-        </div>
+        </ListRow>
         <HeaderPairsEditor pairs={headerPairs} onChange={setHeaderPairs} />
-        <Inline justify="flex-end" gap="8px" style={{ marginTop: "8px" }}>
-          <Button variant="secondary" type="button" onClick={onClose}>
-            Cancel
-          </Button>
-          <Button variant="primary" type="submit" disabled={submitting}>
-            {submitting ? "Creating..." : "Add Provider"}
-          </Button>
-        </Inline>
       </form>
     </Dialog>
   );
@@ -362,51 +412,29 @@ function CustomProviderCard({ customProvider }: { customProvider: ProviderRespon
   // only shows when every account is active and healthy.
   return (
     <Card
-      className="provider-card provider-card-custom"
-      style={{
-        position: "relative",
-        display: "flex",
-        flexDirection: "column",
-        border: "1px solid var(--inner-border)",
-        borderRadius: "12px",
-        transition:
-          "transform var(--dur-micro) var(--ease-spring), border-color var(--dur-micro) var(--ease-spring), box-shadow var(--dur-micro) var(--ease-spring)",
-      }}
+      className={CARD_SHELL}
     >
       <ProviderVersionBadge clientVersion={customProvider.clientVersion} />
       <Link
         to={`/providers/${encodeURIComponent(customProvider.providerId)}`}
-        style={{
-          textDecoration: "none",
-          color: "inherit",
-          // See the builtin card: `flex: 1` keeps the clickable area as tall as
-          // the stretched card instead of only as tall as the content.
-          display: "block",
-          flex: 1,
-          padding: "12px",
-          paddingRight: "40px",
-          minHeight: "76px",
-        }}
+        // See the builtin card: `flex: 1` keeps the clickable area as tall as
+        // the stretched card instead of only as tall as the content.
+        className={cn(CARD_LINK, "pr-20 min-h-38")}
       >
         <Inline gap="10px">
           <ProviderIcon
             icon={customProvider.wireFamilyDefault === "messages" ? "anthropic" : "openai"}
             name={customProvider.label || customProvider.providerId}
             size={32}
+            imageSize={24}
           />
-          <div style={{ minWidth: 0, flex: 1 }}>
+          <div className="min-w-0 flex-1">
             <div
-              style={{
-                fontSize: "13px",
-                fontWeight: 600,
-                overflow: "hidden",
-                textOverflow: "ellipsis",
-                whiteSpace: "nowrap",
-              }}
+              className={CARD_NAME}
             >
               {customProvider.label || customProvider.providerId}
             </div>
-            <div style={{ marginTop: "3px", display: "flex", flexWrap: "wrap", gap: "4px" }}>
+            <div className="mt-1.5 flex flex-wrap gap-2">
               {accounts === undefined ? (
                 <SecondaryQueryBadge
                   kind="accounts"
@@ -415,7 +443,11 @@ function CustomProviderCard({ customProvider }: { customProvider: ProviderRespon
                   hasData={false}
                 />
               ) : accounts.length === 0 ? (
-                <Badge>No connections</Badge>
+                customProvider.requiresAccount === false ? (
+                  <Badge tone="ok">Free Endpoint</Badge>
+                ) : (
+                  <Badge>No connections</Badge>
+                )
               ) : (
                 <AccountStatusBadges counts={counts} total={accounts.length} />
               )}
@@ -427,24 +459,10 @@ function CustomProviderCard({ customProvider }: { customProvider: ProviderRespon
           </div>
 
           <div
-            style={{
-              display: "flex",
-              flexDirection: "column",
-              alignItems: "flex-end",
-              gap: "3px",
-              flexShrink: 0,
-            }}
+            className="flex flex-col items-end gap-1.5 shrink-0"
           >
             <span
-              style={{
-                fontFamily: "var(--font-mono)",
-                fontSize: "10px",
-                fontWeight: 600,
-                background: "var(--kbd-bg)",
-                padding: "1px 5px",
-                borderRadius: "4px",
-                color: "var(--text-secondary)",
-              }}
+              className="font-mono tabular-nums text-micro font-semibold bg-kbd-bg px-2.5 py-0.5 rounded-chip text-text-secondary"
             >
               {customProvider.providerId}/
             </span>
@@ -477,31 +495,23 @@ function CustomProviderCard({ customProvider }: { customProvider: ProviderRespon
         size="sm"
         icon={<Trash2 size={12} />}
         onClick={() => setDeleteOpen(true)}
-        style={{
-          position: "absolute",
-          top: "4px",
-          right: "4px",
-          color: "var(--text-tertiary)",
-          padding: "4px",
-        }}
+        className="absolute top-2 right-2 p-2 text-text-tertiary"
         title={`Delete ${customProvider.label || customProvider.providerId}`}
       />
       <Dialog open={deleteOpen} onClose={() => setDeleteOpen(false)} title="Delete Custom Provider">
         <Stack gap="12px">
-          <p style={{ fontSize: "13px", color: "var(--text-secondary)" }}>
+          <p className="text-body text-text-secondary">
             Are you sure you want to delete custom provider{" "}
             <strong>{customProvider.label || customProvider.providerId}</strong>? Its models,
             accounts, and routing preferences are deleted together, and requests to this
             provider will no longer route.
           </p>
           {deleteMutation.isError ? (
-            <p style={{ fontSize: "12px", color: "var(--red)" }}>
+            <p className="text-caption text-red">
               {getErrorMessage(deleteMutation.error, "Delete failed")}
             </p>
           ) : null}
-          <div
-            style={{ display: "flex", justifyContent: "flex-end", gap: "8px", marginTop: "8px" }}
-          >
+          <DialogActions>
             <Button variant="secondary" onClick={() => setDeleteOpen(false)}>
               Cancel
             </Button>
@@ -517,7 +527,7 @@ function CustomProviderCard({ customProvider }: { customProvider: ProviderRespon
             >
               {deleteMutation.isPending ? "Deleting..." : "Delete Provider"}
             </Button>
-          </div>
+          </DialogActions>
         </Stack>
       </Dialog>
     </Card>
@@ -554,42 +564,24 @@ function CustomProvidersSection({
   }
 
   return (
-    <section style={{ display: "flex", flexDirection: "column", gap: "10px" }}>
+    <section className="flex flex-col gap-5">
       <div
-        style={{
-          display: "flex",
-          alignItems: "center",
-          justifyContent: "space-between",
-          flexWrap: "wrap",
-          gap: "8px",
-        }}
+        className="flex items-center justify-between flex-wrap gap-4"
       >
         <button
           type="button"
           onClick={toggleHidden}
           aria-expanded={!hidden}
           title={hidden ? "Show custom providers" : "Hide custom providers"}
-          style={{
-            display: "inline-flex",
-            alignItems: "center",
-            gap: "6px",
-            background: "none",
-            border: "none",
-            padding: 0,
-            cursor: "pointer",
-            color: "inherit",
-          }}
+          className="inline-flex items-center gap-3 bg-transparent border-none p-0 cursor-pointer text-inherit"
         >
-          <h2 style={{ fontSize: "14px", fontWeight: 700, letterSpacing: "-0.01em" }}>
+          <h2 className="text-body-lg font-bold tracking-[-0.01em]">
             Custom Providers{customProviders.length > 0 ? ` (${customProviders.length})` : ""}
           </h2>
           <ChevronDown
             size={14}
-            style={{
-              transform: hidden ? "rotate(-90deg)" : undefined,
-              transition: "transform var(--dur-micro) var(--ease-spring)",
-              color: "var(--text-tertiary)",
-            }}
+            className="text-text-tertiary transition-transform"
+            style={{ transform: hidden ? "rotate(-90deg)" : undefined }}
           />
         </button>
         <Inline gap="8px">
@@ -624,17 +616,12 @@ function CustomProvidersSection({
       {hidden ? null : customProviders.length === 0 ? (
         <Card>
           <CardBody
-            style={{
-              textAlign: "center",
-              padding: "20px 14px",
-              border: "1px dashed var(--inner-border)",
-              borderRadius: "12px",
-            }}
+            className="text-center px-7 py-10 border border-dashed border-inner-border rounded-card"
           >
-            <p style={{ fontSize: "13px", fontWeight: 600, color: "var(--text-primary)" }}>
+            <p className="text-body font-semibold text-text-primary">
               No custom providers yet
             </p>
-            <p style={{ fontSize: "11.5px", color: "var(--text-tertiary)", marginTop: "2px" }}>
+            <p className="text-badge text-text-tertiary mt-1">
               Add an OpenAI- or Anthropic-compatible endpoint with the buttons above.
             </p>
           </CardBody>
@@ -667,8 +654,18 @@ const FOUNDING_IDS = new Set(["inferhub"]);
 /** Free tiers with a small daily allowance rather than a standing free tier. */
 const FREE_LIMITED_IDS = new Set([
   "grok",
-  "opencodeft",
+  "opencode",
   "cline",
+  // Nous Research publishes a free allowance alongside its paid catalog, and
+  // its `/v1/models` marks those rows at zero price, so discovery can keep the
+  // list current instead of encoding it by hand.
+  "hermes",
+  "commandcode",
+  // Kilo Code resells the OpenRouter catalog — `/api/openrouter`, the same
+  // upstream Cline fronts — and serves a `kilo-auto/free` routing alias
+  // alongside its paid rows, so its free allowance is metered against that
+  // one reseller rather than a standing free tier.
+  "kilo",
 ]);
 /**
  * The providers an operator reaches for first: household names with a
@@ -677,18 +674,21 @@ const FREE_LIMITED_IDS = new Set([
  * registered as `ollamacloud`.
  */
 const WELL_KNOWN_API_KEY_IDS = new Set([
-  "commandcode",
-  "hermes",
   "anthropic",
   "openai",
   "gemini",
+  "alibabacp",
   "ollamacloud",
-  "opencodezen",
-  "opencodego",
+  "opencode-zen",
+  "opencode-go",
   "mistral",
   "meta",
   "deepseek",
 ]);
+
+function hasInteractiveOAuth(provider: ProviderResponse): boolean {
+  return provider.oauthFlows?.browser === true || provider.oauthFlows?.device === true;
+}
 
 /**
  * Connection counts for one provider's card.
@@ -774,7 +774,7 @@ function ProviderVersionBadge({
   if (!clientVersion) return null;
   return (
     <Badge
-      className="provider-version-badge"
+      className="provider-version-badge absolute -top-4.5 left-5 right-auto z-chip max-w-[calc(100%-var(--spacing)*10)] truncate px-3 py-1 text-micro leading-[1.15] shadow-card max-small:left-4 max-small:max-w-[calc(100%-var(--spacing)*8)]"
       tone={clientVersion.source === "latest" ? "teal" : "default"}
       title={
         clientVersion.source === "latest"
@@ -809,50 +809,21 @@ const ProviderCard = memo(function ProviderCard({
 
   return (
     <Card
-      className="provider-card"
-      style={{
-        position: "relative",
-        display: "flex",
-        flexDirection: "column",
-        border: "1px solid var(--inner-border)",
-        borderRadius: "12px",
-        transition: "transform var(--dur-micro) var(--ease-spring), border-color var(--dur-micro) var(--ease-spring), box-shadow var(--dur-micro) var(--ease-spring)",
-      }}
+      className={CARD_SHELL}
     >
       <ProviderVersionBadge clientVersion={provider.clientVersion} />
       {isFounding ? (
         <span
           aria-label="Friend sponsor"
           title="Friend sponsor"
-          style={{
-            position: "absolute",
-            top: 0,
-            right: 0,
-            zIndex: 2,
-            width: "72px",
-            height: "72px",
-            overflow: "hidden",
-            pointerEvents: "none",
-          }}
+          className="absolute top-0 right-0 z-2 w-36 h-36 overflow-hidden pointer-events-none"
         >
           <span
-            style={{
-              position: "absolute",
-              top: "18px",
-              right: "-22px",
-              width: "76px",
-              padding: "2px 0",
-              transform: "rotate(45deg)",
-              background: "var(--accent-soft)",
-              color: "var(--accent)",
-              fontSize: "9px",
-              fontWeight: 800,
-              letterSpacing: "0.04em",
-              lineHeight: 1.05,
-              textAlign: "center",
-              textTransform: "uppercase",
-              boxShadow: "0 1px 3px rgba(0, 0, 0, 0.12)",
-            }}
+            className={cn(
+              "absolute top-9 -right-11 w-38 py-1 rotate-45 bg-accent-soft",
+              "text-accent text-micro font-extrabold tracking-tight leading-[1.05]",
+              "text-center uppercase shadow-ribbon",
+            )}
           >
             Friend
           </span>
@@ -863,33 +834,21 @@ const ProviderCard = memo(function ProviderCard({
         to={`/providers/${encodeURIComponent(provider.providerId)}${
           serviceKind === undefined ? "" : `?service=${serviceKind}`
         }`}
-        style={{
-          textDecoration: "none",
-          color: "inherit",
-          // `flex: 1` is what makes the whole card clickable. Grid rows stretch
-          // every card to the tallest one, so a card whose content is shorter
-          // than its row left a dead strip below the link — a click there hit
-          // the card, not the link, and did nothing.
-          display: "block",
-          flex: 1,
-          padding: "12px",
-        }}
+        // `flex: 1` is what makes the whole card clickable. Grid rows stretch
+        // every card to the tallest one, so a card whose content is shorter
+        // than its row left a dead strip below the link — a click there hit
+        // the card, not the link, and did nothing.
+        className={CARD_LINK}
       >
         <Inline gap="10px">
-          <ProviderIcon icon={provider.providerId} name={displayName} size={32} />
-          <div style={{ minWidth: 0, flex: 1 }}>
+          <ProviderIcon icon={provider.providerId} name={displayName} size={32} imageSize={24} />
+          <div className="min-w-0 flex-1">
             <div
-              style={{
-                fontSize: "13px",
-                fontWeight: 600,
-                overflow: "hidden",
-                textOverflow: "ellipsis",
-                whiteSpace: "nowrap",
-              }}
+              className={CARD_NAME}
             >
               {displayName}
             </div>
-            <div style={{ marginTop: "3px", display: "flex", flexWrap: "wrap", gap: "4px" }}>
+            <div className="mt-1.5 flex flex-wrap gap-2">
               {accounts === undefined ? (
                 <SecondaryQueryBadge
                   kind="accounts"
@@ -898,7 +857,11 @@ const ProviderCard = memo(function ProviderCard({
                   hasData={false}
                 />
               ) : accounts.length === 0 ? (
-                <Badge>No connections</Badge>
+                provider.requiresAccount === false ? (
+                  <Badge tone="ok">Free Endpoint</Badge>
+                ) : (
+                  <Badge>No connections</Badge>
+                )
               ) : (
                 <AccountStatusBadges counts={counts} total={accounts.length} />
               )}
@@ -909,24 +872,10 @@ const ProviderCard = memo(function ProviderCard({
           </div>
 
           <div
-            style={{
-              display: "flex",
-              flexDirection: "column",
-              alignItems: "flex-end",
-              gap: "3px",
-              flexShrink: 0,
-            }}
+            className="flex flex-col items-end gap-1.5 shrink-0"
           >
             <span
-              style={{
-                fontFamily: "var(--font-mono)",
-                fontSize: "10px",
-                fontWeight: 600,
-                background: "var(--kbd-bg)",
-                padding: "1px 5px",
-                borderRadius: "4px",
-                color: "var(--text-secondary)",
-              }}
+              className="font-mono tabular-nums text-micro font-semibold bg-kbd-bg px-2.5 py-0.5 rounded-chip text-text-secondary"
             >
               {provider.providerId}/
             </span>
@@ -963,8 +912,17 @@ function compareConfiguredProviders(a: ProviderResponse, b: ProviderResponse): n
   if (configuredRank !== 0) return configuredRank;
   return (a.label || a.displayName).localeCompare(b.label || b.displayName);
 }
+const COLLAPSED_SECTIONS_KEY = "cartethyia.providerSectionsCollapsed";
 
-// ── Sections Definition ───────────────────────────────────────────────────────
+function readCollapsedSections(): ReadonlySet<string> {
+  try {
+    const raw = window.localStorage.getItem(COLLAPSED_SECTIONS_KEY);
+    const parsed: unknown = raw ? JSON.parse(raw) : [];
+    return new Set(Array.isArray(parsed) ? parsed.filter((item): item is string => typeof item === "string") : []);
+  } catch {
+    return new Set();
+  }
+}
 
 const SECTIONS = [
   {
@@ -978,12 +936,10 @@ const SECTIONS = [
   },
   {
     title: "OAuth & Agent Providers",
-    // Membership follows the backend registry rather than a hand-kept id list:
-    // `oauthFlows` is present on a provider response exactly when the registry
-    // resolves a login client for it, so this section cannot drift from the
-    // providers that really support a login flow.
+    // Import-only clients validate and store API keys; only browser/device
+    // authorization belongs in this section.
     filter: (p: ProviderResponse) =>
-      p.oauthFlows !== undefined && !FREE_LIMITED_IDS.has(p.providerId.toLowerCase()),
+      hasInteractiveOAuth(p) && !FREE_LIMITED_IDS.has(p.providerId.toLowerCase()),
   },
   {
     title: "Well Known API Key Providers",
@@ -993,7 +949,7 @@ const SECTIONS = [
       WELL_KNOWN_API_KEY_IDS.has(p.providerId.toLowerCase()) &&
       !FOUNDING_IDS.has(p.providerId.toLowerCase()) &&
       !FREE_LIMITED_IDS.has(p.providerId.toLowerCase()) &&
-      p.oauthFlows === undefined,
+      !hasInteractiveOAuth(p),
   },
   {
     title: "Other API Key Providers",
@@ -1003,13 +959,14 @@ const SECTIONS = [
       !WELL_KNOWN_API_KEY_IDS.has(p.providerId.toLowerCase()) &&
       !FOUNDING_IDS.has(p.providerId.toLowerCase()) &&
       !FREE_LIMITED_IDS.has(p.providerId.toLowerCase()) &&
-      p.oauthFlows === undefined,
+      !hasInteractiveOAuth(p),
   },
 ];
 
 // ── Main Page ─────────────────────────────────────────────────────────────────
 
 export default function Providers(): ReactNode {
+  const [collapsedSections, setCollapsedSections] = useState<ReadonlySet<string>>(readCollapsedSections);
   const q = useProviders();
   const allProviders = useMemo(() => q.data ?? [], [q.data]);
   const customProviders = useMemo(
@@ -1024,28 +981,51 @@ export default function Providers(): ReactNode {
     () => allProviders.filter((p) => providerServiceKinds(p).includes("llm")),
     [allProviders],
   );
-  const [tab, setTab] = useState<"llm" | "search">("llm");
-  const orderedSearch = useMemo(() => {
-    const rank = new Map<string, number>(SEARCH_PROVIDER_ORDER.map((id, index) => [id, index]));
-    return [...searchProviders].sort((a, b) => {
-      const rankDiff =
-        (rank.get(a.providerId.toLowerCase()) ?? SEARCH_PROVIDER_ORDER.length) -
-        (rank.get(b.providerId.toLowerCase()) ?? SEARCH_PROVIDER_ORDER.length);
-      if (rankDiff !== 0) return rankDiff;
-      return (a.label || a.displayName).localeCompare(b.label || b.displayName);
+  const [searchParams, setSearchParams] = useSearchParams();
+  const requestedTab = searchParams.get("tab");
+  const tab: "llm" | "search" | "media" =
+    requestedTab === "search" || requestedTab === "media" ? requestedTab : "llm";
+  const setTab = (next: "llm" | "search" | "media") => {
+    setSearchParams((current) => {
+      const params = new URLSearchParams(current);
+      if (next === "llm") params.delete("tab");
+      else params.set("tab", next);
+      return params;
     });
-  }, [searchProviders]);
+  };
+  const mediaProviders = useMemo(
+    () =>
+      allProviders.filter(
+        (p) =>
+          providerServiceKinds(p).includes("imageGeneration") ||
+          providerServiceKinds(p).includes("videoGeneration"),
+      ),
+    [allProviders],
+  );
+  const orderedSearch = useMemo(
+    () => [...searchProviders].sort((a, b) => (a.label || a.displayName).localeCompare(b.label || b.displayName)),
+    [searchProviders],
+  );
   const sortFn = (a: ProviderResponse, b: ProviderResponse) => {
     const configuredDiff = Number(Boolean(b.configured)) - Number(Boolean(a.configured));
     if (configuredDiff !== 0) return configuredDiff;
     return (a.label || a.displayName).localeCompare(b.label || b.displayName);
   };
   const sections = useMemo(() => {
+    if (tab === "media") {
+      return [
+        {
+          title: "Media Generation",
+          subtitle: "Providers that can return an image or a video",
+          providers: mediaProviders,
+        },
+      ].filter((s) => s.providers.length > 0);
+    }
     if (tab === "search") {
       return [
         {
           title: "Search Providers",
-          subtitle: "Automatic web search order: Exa → Gemini → Codex",
+          subtitle: "Providers that can answer a web search request",
           providers: orderedSearch,
         },
       ].filter((s) => s.providers.length > 0);
@@ -1055,49 +1035,60 @@ export default function Providers(): ReactNode {
       ...section,
       providers: source.filter(section.filter).sort(sortFn),
     })).filter((section) => section.providers.length > 0);
-  }, [llmProviders, orderedSearch, tab]);
+  }, [llmProviders, orderedSearch, mediaProviders, tab]);
 
-  if (q.isPending && !q.data) return <LoadingState label="Loading providers..." />;
-  if (q.isError)
+  const state = q.isPending && !q.data
+    ? <LoadingState label="Loading providers..." />
+    : q.isError
+      ? (
+        <ErrorState
+          message={getErrorMessage(q.error, "Failed to load providers")}
+          onRetry={() => q.refetch()}
+        />
+      )
+      : null;
+  if (state) {
     return (
-      <ErrorState
-        message={getErrorMessage(q.error, "Failed to load providers")}
-        onRetry={() => q.refetch()}
-      />
+      <Card>
+        <CardHeader title="Providers" icon={<Server size={16} />} />
+        <CardBody className="flex flex-1">{state}</CardBody>
+      </Card>
     );
+  }
 
   return (
     <Stack gap="24px">
-      <div style={{ display: "flex", alignItems: "center", gap: "8px", flexWrap: "wrap" }}>
-        <div style={{ display: "flex", gap: "4px" }}>
-          {(["llm", "search"] as const).map((t) => (
+      <Card>
+        <CardHeader title="Providers" subtitle="Connected pinned first · A–Z" icon={<Server size={16} />} />
+        <CardBody className="flex flex-col gap-8">
+      <div className="flex items-center gap-4 flex-wrap">
+        <div className="flex gap-2">
+          {(["llm", "search", "media"] as const).map((t) => (
             <button
               key={t}
               onClick={() => setTab(t)}
-              style={{
-                padding: "6px 12px",
-                borderRadius: "8px",
-                fontSize: "12px",
-                fontWeight: 600,
-                border: tab === t ? "1px solid var(--accent)" : "1px solid var(--inner-border)",
-                background: tab === t ? "var(--accent-soft)" : "var(--surface-1)",
-                color: tab === t ? "var(--accent)" : "var(--text-secondary)",
-                cursor: "pointer",
-              }}
+              className={cn(
+                "px-6 py-3 rounded-inset text-caption font-semibold border cursor-pointer",
+                tab === t
+                  ? "border-accent bg-accent-soft text-accent"
+                  : "border-inner-border bg-surface-1 text-text-secondary",
+              )}
             >
-              {t === "llm" ? "LLM" : "Search"}
-              {t === "search" ? ` (${searchProviders.length})` : ` (${llmProviders.length})`}
+              {t === "llm" ? "LLM" : t === "search" ? "Search" : "Media"}
+              {t === "search"
+                ? ` (${searchProviders.length})`
+                : t === "media"
+                  ? ` (${mediaProviders.length})`
+                  : ` (${llmProviders.length})`}
             </button>
           ))}
         </div>
-        <span
-          style={{
-            marginLeft: "auto",
-            fontSize: "10.5px",
-            color: "var(--text-tertiary)",
-          }}
-        >
-          {tab === "search" ? "Automatic order: Exa → Gemini → Codex" : "Connected pinned first · A–Z"}
+        <span className="ml-auto text-micro text-text-tertiary">
+          {tab === "search"
+            ? "Fallback runs only when the model invokes Websearch"
+            : tab === "media"
+              ? "Image and video generation"
+              : "Connected pinned first · A–Z"}
         </span>
       </div>
       
@@ -1112,34 +1103,63 @@ export default function Providers(): ReactNode {
           </CardBody>
         </Card>
       ) : (
-        sections.map((section) => (
+        sections.map((section) => {
+          const collapsed = collapsedSections.has(section.title);
+          return (
           <section
             key={section.title}
-            style={{ display: "flex", flexDirection: "column", gap: "12px" }}
+            className="flex flex-col gap-6"
           >
-            <Stack gap="1px">
-              <h2 style={{ fontSize: "13.5px", fontWeight: 700, letterSpacing: "-0.01em" }}>
-                {section.title} ({section.providers.length})
-              </h2>
-              {section.subtitle ? (
-                <p style={{ fontSize: "11px", color: "var(--text-tertiary)" }}>
-                  {section.subtitle}
-                </p>
-              ) : null}
-            </Stack>
+            <button
+              type="button"
+              className="flex items-start gap-4 border-0 bg-transparent p-0 text-left text-inherit"
+              aria-expanded={!collapsed}
+              onClick={() => setCollapsedSections((current) => {
+                const next = new Set(current);
+                if (next.has(section.title)) next.delete(section.title);
+                else next.add(section.title);
+                try { window.localStorage.setItem(COLLAPSED_SECTIONS_KEY, JSON.stringify([...next])); } catch {}
+                return next;
+              })}
+            >
+              <ChevronDown size={15} className={cn("mt-1 shrink-0 transition-transform", collapsed && "-rotate-90")} />
+              <Stack gap="1px">
+                <h2 className="text-body font-bold tracking-[-0.01em]">
+                  {section.title} ({section.providers.length}){collapsed ? " (Hidden)" : ""}
+                </h2>
+                {!collapsed && section.subtitle ? (
+                  <p className="mt-1 text-badge text-text-tertiary">
+                    {section.subtitle}
+                  </p>
+                ) : null}
+              </Stack>
+            </button>
 
+            {collapsed ? null : (
             <ProviderCardGrid>
               {section.providers.map((p) => (
                 <ProviderCard
                   key={p.providerId}
                   provider={p}
-                  serviceKind={tab === "search" ? "websearch" : "llm"}
+                  serviceKind={
+                    tab === "search"
+                      ? "websearch"
+                      : tab === "media"
+                        ? providerServiceKinds(p).includes("imageGeneration")
+                          ? "imageGeneration"
+                          : "videoGeneration"
+                        : "llm"
+                  }
                 />
               ))}
             </ProviderCardGrid>
+            )}
           </section>
-        ))
+          );
+        })
       )}
+        </CardBody>
+      </Card>
     </Stack>
   );
 }

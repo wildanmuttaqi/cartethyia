@@ -1,9 +1,9 @@
-import type { ReasoningIntent, ResponseFormat, ToolChoice } from "../canonical-model";
-import { REASONING_EFFORTS } from "../canonical-model";
-import { readString, readBoolean, readNumber } from "../../protocol/primitives";
-import { isRecord } from "../../protocol/primitives";
-import { completeRequiredSchema } from "../../protocol/primitives";
-import type { ToolDefinition } from "../canonical-model";
+import type { ReasoningIntent, ResponseFormat, ToolChoice } from "../../protocol/canonical-model";
+import { REASONING_EFFORTS } from "../../protocol/canonical-model";
+import { readString, readBoolean, readNumber } from "../../protocol/codecs";
+import { isRecord } from "../../protocol/codecs";
+import { completeRequiredSchema } from "../../protocol/codecs";
+import type { ToolDefinition } from "../../protocol/canonical-model";
 
 /** Tool-definition dialects preserve each surface's distinct wire fields. */
 export type ToolDialect = "chat" | "responses" | "messages";
@@ -34,19 +34,20 @@ function parseToolObject(item: Record<string, unknown>, dialect: ToolDialect): T
     const type = readString(item, "type");
     if (type !== undefined) name = type;
   }
-  const chatWrapper =
-    dialect === "chat"
-      ? isRecord(item["function"])
-        ? item["function"]
-        : isRecord(item["custom"])
-          ? item["custom"]
-          : undefined
+  // Both dialects accept a `function`/`custom` envelope. Reading it only on
+  // Chat meant a Chat-shaped tool on the Responses surface took its name from
+  // `type` ("function") instead of the tool's real name, and its schema from
+  // the whole tool object.
+  const chatWrapper = isRecord(item["function"])
+    ? item["function"]
+    : isRecord(item["custom"])
+      ? item["custom"]
       : undefined;
   if (chatWrapper !== undefined) {
     const wrapperName = readString(chatWrapper, "name");
     if (wrapperName !== undefined) name = wrapperName;
   }
-  // A hosted tool on an [OI]-compatible wire is declared as a bare
+  // A hosted tool on an OpenAI-compatible wire is declared as a bare
   // `{"type": "web_search"}` with no `name` and no `function` envelope. It is
   // still a real tool, and dropping it here silently turned a search request
   // into a search-less one, so the type supplies the name.
@@ -71,10 +72,26 @@ function parseToolObject(item: Record<string, unknown>, dialect: ToolDialect): T
       const functionValue = item["function"];
       schema = isRecord(functionValue)
         ? functionValue["parameters"] ?? functionValue["jsonSchema"] ?? {}
-        : {};
+        : // The Responses flat spelling (`{type:"function", parameters:…}`) is
+          // common here too; without this a tool arrived with an empty schema
+          // and the upstream rejected it.
+          item["parameters"] ?? item["input_schema"] ?? {};
     }
   } else if (dialect === "responses") {
-    schema = item["input_schema"] ?? item["parameters"] ?? item;
+    // A Responses caller may still send the Chat-shaped envelope — the two
+    // spellings are interchangeable in the wild, and a client that posts
+    // `{"type":"function","function":{"parameters":…}}` here previously fell
+    // through to `schema = item`, which shipped the whole tool object upstream
+    // as the parameter schema and came back as
+    // `invalid_function_parameters` (CodeBuddy 11129). Unwrap it the way the
+    // Chat dialect does before falling back to the flat Responses spelling.
+    const wrapped = isRecord(item["function"]) ? item["function"] : undefined;
+    schema =
+      item["input_schema"] ??
+      item["parameters"] ??
+      (wrapped !== undefined
+        ? wrapped["parameters"] ?? wrapped["input_schema"] ?? wrapped["jsonSchema"] ?? {}
+        : item);
   } else {
     schema = item["input_schema"] ?? item["inputSchema"] ?? {};
   }

@@ -10,8 +10,9 @@
  * `hasMeaningfulOutput`) and the provider-row → wire-context mapping live here
  * too; the mapping is shared with `syncModels`.
  */
-import { and, eq, isNull, or } from "drizzle-orm";
-import type { CartethyiaDatabase } from "../../persistence/postgres";
+import { and, eq } from "drizzle-orm";
+import { globalOrOwnedBy } from "../../persistence/tenant-scope";
+import type { CartethyiaDatabase } from "../../persistence/db-handle";
 import { consoleSettings, models, providerAccounts } from "../../persistence/schema";
 import type {
   CanonicalEvent,
@@ -20,7 +21,7 @@ import type {
   SourceSurface,
   UsageRecord,
   WireFamily,
-} from "../../transport/canonical-model";
+} from "../../protocol/canonical-model";
 import type { CompatibilityProfile } from "../provider-metadata";
 import type { ProbeModelRequest } from "./discovery-types";
 import {
@@ -31,18 +32,15 @@ import {
   supportedWireFamiliesForProvider,
   type ProviderWireContext,
 } from "./probe-wire";
-import { OpenAICompatibleAdapter } from "../compatible-adapter";
-import { resolveByokWireProfile, stripEndpointBasePath } from "../operations/byok-wire-profile";
+import { OpenAICompatibleAdapter } from "../adapters/compatible-adapter";
+import { resolveByokWireProfile } from "../operations/byok-wire-profile";
 import { recordAccountFailure, recordAccountSuccess } from "../operations/account-health-service";
 import { buildCapabilityProfile } from "../../transport/routing/route-catalog";
 import { classifyUpstreamFailure } from "../../transport/failure-policy";
-import { GatewayError } from "../../transport/gateway-error";
-import type {
-  ModelDefinition,
-  ProviderAdapter,
-  ProviderId,
-  ProviderRegistry,
-} from "../provider-registry";
+import { GatewayError } from "../../protocol/gateway-error";
+import type { ModelDefinition } from "../provider-model-definition";
+import type { ProviderAdapter, ProviderId } from "../provider-contracts";
+import type { ProviderRegistry } from "../provider-registry";
 
 /**
  * The provider row columns `loadProviderWireRow` selects, shared by the phases
@@ -203,17 +201,9 @@ export async function resolveProbeTarget(args: {
     const profile = providerWireRow?.compatibilityProfile as CompatibilityProfile | null;
     const ep =
       profile?.endpoint_paths_by_wire_family?.[family] ??
-      staticEndpointForWire(
-        bundledModelCatalog,
-        providerId,
-        family,
-        requestedServiceKind,
-      ) ??
+      staticEndpointForWire(bundledModelCatalog, providerId, family) ??
       discoveryPathsFor(providerId)?.[family];
-    return stripEndpointBasePath(
-      ep ?? defaultEndpoints[family] ?? "/v1/chat/completions",
-      providerWireRow?.baseUrl ?? undefined,
-    );
+    return ep ?? defaultEndpoints[family] ?? "/v1/chat/completions";
   };
 
   let wireFamily: WireFamily;
@@ -324,7 +314,13 @@ export async function resolveProbeTarget(args: {
       endpointPath = endpointForFamily(wireFamily);
     }
   }
-  const sourceSurface: SourceSurface = wireFamily;
+  // Wire family and source surface were the same vocabulary until `gemini`
+  // landed, so this used to be a plain assignment. They are not the same thing:
+  // `gemini` names a wire (native generateContent) but has no canonical request
+  // surface of its own, while `completion` is a surface with no matching wire.
+  // Probing a Gemini wire therefore has to name the surface whose codec builds
+  // the request, rather than pretending the wire is a surface.
+  const sourceSurface: SourceSurface = wireFamily === "gemini" ? "chat" : wireFamily;
   // Built from the row the probe resolves to, so the adapter's capability gate
   // sees the same profile live traffic would. `providerId` is part of the
   // profile because a bespoke-wire provider has no canonical codec and must not
@@ -378,7 +374,7 @@ export async function selectProbeAccount(args: {
         .where(
           and(
             eq(providerAccounts.providerId, providerId),
-            or(isNull(providerAccounts.tenantId), eq(providerAccounts.tenantId, tenantId)),
+            globalOrOwnedBy(providerAccounts.tenantId, tenantId),
             ...(requestedAccountId ? [eq(providerAccounts.id, requestedAccountId)] : []),
           ),
         )
@@ -486,6 +482,7 @@ export async function loadProbePreferences(args: {
     const raw = preferences?.responsesReasoningSummary;
     const mode: "auto" | "concise" | "detailed" =
       raw === "auto" || raw === "concise" || raw === "detailed" ? raw : "detailed";
+    // Unset matches the settings default: off. Only an explicit choice captures.
     payloadCaptureEnabled =
       preferences?.telemetryPayloads === "full" ||
       preferences?.telemetryPayloads === "metadata";
@@ -536,9 +533,25 @@ export function buildProbeCanonicalRequest(args: {
       },
     ],
     generation_controls: {
-      max_tokens: request.maxOutputTokens ?? 1024,
-      max_output_tokens: request.maxOutputTokens ?? 1024,
-      temperature: 0.2,
+      // The probe asks for a sentence, not a page. A 1024-token allowance is
+      // the shape a *batch* request takes, and several providers treat an
+      // oversized allowance on a trivial prompt as a non-client request — the
+      // class of refusal that answers `400 request illegal`. Matching the
+      // caller's own small budget keeps the probe the same shape as the traffic
+      // it is meant to predict.
+      max_tokens: request.maxOutputTokens ?? 256,
+      max_output_tokens: request.maxOutputTokens ?? 256,
+      // No temperature. A real dispatch forwards whatever the client sent, and
+      // the client rarely sends one; pinning 0.2 here made the probe a
+      // different request from the traffic it is supposed to predict. The
+      // prompt below is deterministic enough that sampling temperature buys
+      // nothing.
+      //
+      // `include_usage` mirrors what the router attaches to a streamed
+      // dispatch. Without it the probe's upstream body is missing a field the
+      // real one carries, which is exactly the class of difference that made a
+      // provider reject the share page and accept the probe.
+      ...(request.stream === false ? {} : { "extension:include_usage": true }),
     },
     ...(probeReasoning ? { reasoning: probeReasoning as never } : {}),
     // Streaming by default. Every probe funnels through here, so one default
@@ -615,12 +628,9 @@ export interface ProbeVerdict {
 export function computeProbeVerdict(args: {
   readonly events: readonly CanonicalEvent[];
   readonly dispatchError: unknown;
-  readonly providerId: string;
-  readonly modelId: string;
   readonly wireFamily: WireFamily;
-  readonly endpointPath: string;
 }): ProbeVerdict {
-  const { events, dispatchError, providerId, modelId, wireFamily, endpointPath } = args;
+  const { events, dispatchError, wireFamily } = args;
   const terminal = events.find((event) => event.type === "terminal");
   const producedReasoning = events.some(
     (event) => event.type === "content_delta" && event.content.kind === "reasoning",
@@ -677,7 +687,6 @@ export function computeProbeVerdict(args: {
       typeof details?.upstreamRequestId === "string"
         ? String(details.upstreamRequestId)
         : undefined;
-    const wireLabel = `${wireFamily} ${endpointPath}`;
     const statusTag =
       providerCode !== undefined && providerStatus !== undefined
         ? `${providerCode} (upstream ${status ?? providerStatus})`
@@ -686,12 +695,12 @@ export function computeProbeVerdict(args: {
           : status !== undefined
             ? `upstream ${status}`
             : undefined;
-    errorMessage =
-      statusTag !== undefined
-        ? `${providerId}/${modelId} via ${wireLabel} — ${pretty} (${statusTag})${upstreamReq ? ` [req ${upstreamReq}]` : ""}`
-        : upstreamReq !== undefined
-          ? `${providerId}/${modelId} via ${wireLabel} — ${pretty} [req ${upstreamReq}]`
-          : `${providerId}/${modelId} via ${wireLabel} — ${pretty}`;
+    // The toast title already names the model. Repeating `provider/model via
+    // wire path` in the body made the operator read the same identity twice
+    // and buried the upstream sentence. The wire family stays, because that is
+    // the one fact the title does not carry; the path is noise next to it.
+    const tagged = statusTag !== undefined ? `${pretty} (${statusTag})` : pretty;
+    errorMessage = `${wireFamily} — ${tagged}${upstreamReq ? ` [req ${upstreamReq}]` : ""}`;
 
   } else if (terminal?.type === "terminal" && terminal.state !== "complete") {
     errorMessage = terminal.stop_reason ?? "Model probe failed";

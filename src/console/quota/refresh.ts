@@ -7,13 +7,14 @@
 // A drift between them would mean the page and the worker disagree about what
 // "refreshed" means.
 import { and, eq, inArray, isNull, ne, or, sql } from "drizzle-orm";
-import type { CartethyiaDatabase } from "../../persistence/postgres";
+import type { CartethyiaDatabase } from "../../persistence/db-handle";
 import { providerAccounts } from "../../persistence/schema";
 import type { RedisClient } from "../../persistence/redis";
 import { log } from "../../observability/logger";
 import { fetchProviderQuota } from "../../providers/quota/quota-support";
-import { totalRemainingCredit, totalRemainingPercent, type FetchLike, type ProviderQuotaResult } from "../../providers/quota/quota-contracts";
-import type { ProviderId, ProviderRegistry } from "../../providers/provider-registry";
+import { type FetchLike, type ProviderQuotaResult } from "../../providers/quota/quota-contracts";
+import type { ProviderId } from "../../providers/provider-contracts";
+import type { ProviderRegistry } from "../../providers/provider-registry";
 import { GLOBAL_QUOTA_LENS, setCachedQuota } from "./cache";
 import { record } from "../../providers/authentication/oauth-flow-store";
 
@@ -29,6 +30,15 @@ export interface QuotaRefreshOutcome {
 
 /** Abort budget for one upstream quota fetch. */
 export const QUOTA_REFRESH_TIMEOUT_MS = 15_000;
+
+/**
+ * Consecutive quota refusals before an account is parked. One refusal can be
+ * the provider's own hiccup; three in a row is the quota surface not coming
+ * back, and the account should stop being dialed until the cooldown elapses.
+ */
+export const QUOTA_FAILURE_PARK_THRESHOLD = 3;
+/** How long a quota-parked account stays out of rotation. */
+export const QUOTA_FAILURE_COOLDOWN_MS = 6 * 60 * 60 * 1000;
 
 export interface QuotaRefreshDeps {
   readonly db: CartethyiaDatabase;
@@ -46,6 +56,9 @@ export interface QuotaRefreshDeps {
   /** Invalidates the route snapshot when a stamped figure may exclude an account. */
   readonly snapshotInvalidator?: { invalidate(): unknown } | undefined;
 }
+
+/** Bound on concurrently tracked single-flight quota refreshes; keys are account ids, so the real bound is the account count. */
+const MAX_INFLIGHT = 1_000;
 
 /**
  * In-flight promise deduplication map for account quota refreshes. Keyed by
@@ -75,12 +88,17 @@ export function timeoutSignal(requestSignal: AbortSignal, ms: number): AbortSign
 }
 
 /**
- * Records a manual account-test outcome on the account row so the dashboard's
- * "Last check" reflects what the test actually found. Success stamps
+ * Records one quota-refresh outcome on the account row so the dashboard's
+ * "Last check" reflects what the fetch actually found. Success stamps
  * `lastSuccessAt` and clears the error fields; failure stamps the error
- * fields and keeps the last success. Never touches `status` or
- * `consecutiveFailures` — the dispatch health state machine owns those, a
- * manual check only reports.
+ * fields and keeps the last success.
+ *
+ * A *counted* failure also advances `consecutiveFailures`, and once an account
+ * has `QUOTA_FAILURE_PARK_THRESHOLD` of them in a row it is parked — this is
+ * the one place a quota result may move `status`, because a quota surface that
+ * refuses three times is an account problem rather than a transient one. A
+ * transient timeout is annotated but never counted, so it cannot park
+ * (see `isTransientTimeout`).
  *
  * The error fields are written only while the account is `active`, because for
  * a parked account (cooldown/disabled) those fields carry the reason
@@ -91,6 +109,29 @@ export function timeoutSignal(requestSignal: AbortSignal, ms: number): AbortSign
  * dashboard blamed the wrong thing. A check cannot reclassify a parked account;
  * its own failure is still visible through the quota cache the page renders.
  */
+/**
+ * A failure that says nothing about the account.
+ *
+ * A quota fetch that ran out of its own abort budget timed out against *our*
+ * egress, not against the credential: the upstream may never have seen the
+ * request. Counting it like a refusal meant three slow passes parked a healthy
+ * account for six hours — and the buddy family is the worst case, because its
+ * quota and check-in legs share one pass and rotate egress per account, so a
+ * single slow pool produced three timeouts in a row.
+ *
+ * Matched on the message the timeout paths produce. Deliberately narrow: a
+ * refusal that merely mentions a timeout is still a refusal.
+ */
+function isTransientTimeout(error: string | null | undefined): boolean {
+  if (!error) return false;
+  const lower = error.toLowerCase();
+  return (
+    lower.includes("the operation timed out") ||
+    lower.includes("operation timed out") ||
+    lower.includes("timeout") && lower.includes("abort")
+  );
+}
+
 export async function recordAccountCheck(
   db: CartethyiaDatabase,
   accountId: string,
@@ -103,18 +144,52 @@ export async function recordAccountCheck(
   if (outcome.ok) {
     await db
       .update(providerAccounts)
-      .set({ lastSuccessAt: new Date(), lastError: null, lastErrorCategory: null, lastErrorAt: null })
+      .set({
+        lastSuccessAt: new Date(),
+        lastError: null,
+        lastErrorCategory: null,
+        lastErrorAt: null,
+        consecutiveFailures: 0,
+      })
       .where(activeOnly);
     return;
   }
-  await db
+  const transient = isTransientTimeout(outcome.error);
+  // Count the failure in the same statement — unless it is a transient
+  // timeout (see below). A quota endpoint that keeps refusing is an account
+  // problem, and the row has to say so: the dashboard reads
+  // `consecutiveFailures` for the pill, and a check that only wrote the error
+  // text left the account looking healthy while every refresh failed.
+  //
+  // A timeout is annotated but NOT counted: it is evidence about the network,
+  // not the credential, and letting it advance the streak is what parked
+  // healthy accounts for six hours over three slow passes.
+  const failing = await db
     .update(providerAccounts)
     .set({
       lastError: (outcome.error ?? "Account check failed").slice(0, 500),
       lastErrorCategory: outcome.category ?? "check_failed",
       lastErrorAt: new Date(),
+      ...(transient ? {} : { consecutiveFailures: sql`${providerAccounts.consecutiveFailures} + 1` }),
     })
-    .where(activeOnly);
+    .where(activeOnly)
+    .returning({ consecutiveFailures: providerAccounts.consecutiveFailures });
+  if (transient) return;
+  const failures = failing[0]?.consecutiveFailures ?? 0;
+  // Past the threshold the account is parked, not just annotated. Three
+  // consecutive refusals is a quota surface that is not coming back on its
+  // own, and leaving the account in rotation only repeats the failure every
+  // pass. The cooldown clears itself; a success before it elapses resets the
+  // count above.
+  if (failures >= QUOTA_FAILURE_PARK_THRESHOLD) {
+    await db
+      .update(providerAccounts)
+      .set({
+        status: "cooldown",
+        cooldownUntil: new Date(Date.now() + QUOTA_FAILURE_COOLDOWN_MS),
+      })
+      .where(activeOnly);
+  }
 }
 
 /** One account that a quota refresh can be attempted for. */
@@ -145,72 +220,6 @@ export interface QuotaRefreshTarget {
 /** Cache lens an account's quota belongs under. */
 export function targetLens(target: QuotaRefreshTarget): string {
   return target.tenantId ?? GLOBAL_QUOTA_LENS;
-}
-
-/**
- * Stamps the fresh remaining credit onto the account row so the request path
- * can enforce the per-account floor from the last cached read — no live
- * provider round trip per request. Writes only when the fetch reported a
- * figure; a credit-less read leaves the previous stamp untouched. Returns
- * `true` when the row changed so the caller can invalidate the route snapshot.
- */
-export async function stampRemainingCredit(
-  db: CartethyiaDatabase,
-  accountId: string,
-  remaining: number | null,
-): Promise<boolean> {
-  if (remaining === null || !Number.isFinite(remaining)) return false;
-  try {
-    const updated = await db
-      .update(providerAccounts)
-      .set({ lastRemainingCredit: String(Math.max(0, remaining)) })
-      .where(
-        and(
-          eq(providerAccounts.id, accountId),
-          or(
-            isNull(providerAccounts.lastRemainingCredit),
-            ne(providerAccounts.lastRemainingCredit, String(Math.max(0, remaining))),
-          ),
-        ),
-      )
-      .returning({ id: providerAccounts.id });
-    return updated.length > 0;
-  } catch {
-    return false;
-  }
-}
-
-/**
- * Percent twin of `stampRemainingCredit`: the lowest remaining quota percent
- * across the account's percent windows (Codex weekly, Muse rolling/weekly).
- * A percent-only read leaves the credit stamp alone and vice versa, so an
- * account that reports both keeps both figures fresh independently.
- */
-export async function stampRemainingPercent(
-  db: CartethyiaDatabase,
-  accountId: string,
-  remainingPercent: number | null,
-): Promise<boolean> {
-  if (remainingPercent === null || !Number.isFinite(remainingPercent)) return false;
-  const clamped = String(Math.min(100, Math.max(0, remainingPercent)));
-  try {
-    const updated = await db
-      .update(providerAccounts)
-      .set({ lastRemainingPercent: clamped })
-      .where(
-        and(
-          eq(providerAccounts.id, accountId),
-          or(
-            isNull(providerAccounts.lastRemainingPercent),
-            ne(providerAccounts.lastRemainingPercent, clamped),
-          ),
-        ),
-      )
-      .returning({ id: providerAccounts.id });
-    return updated.length > 0;
-  } catch {
-    return false;
-  }
 }
 
 const TARGET_COLUMNS = {
@@ -296,6 +305,15 @@ export async function refreshAccountQuota(
 ): Promise<QuotaRefreshOutcome> {
   const existing = inFlightAccountQuotaRefreshes.get(target.accountId);
   if (existing) return existing;
+  // Eviction guard: keys are account ids (bounded by the accounts table), but a
+  // runaway caller could still fan out unique keys; drop the oldest in-flight
+  // task rather than grow without bound. An evicted task's `.finally` delete is
+  // a no-op for a key no longer present, and the caller still awaits its own
+  // promise — eviction only costs it deduplication, never its result.
+  if (inFlightAccountQuotaRefreshes.size >= MAX_INFLIGHT) {
+    const oldestKey = inFlightAccountQuotaRefreshes.keys().next().value;
+    if (oldestKey !== undefined) inFlightAccountQuotaRefreshes.delete(oldestKey);
+  }
   const task = runQuotaRefresh(deps, target, fetcher).finally(() => {
     inFlightAccountQuotaRefreshes.delete(target.accountId);
   });
@@ -383,28 +401,6 @@ async function runQuotaRefresh(
   } catch (error) {
     // A stamp failure must not lose the freshly fetched quota.
     log.warn(`[quota] failed to stamp check outcome for account=${target.accountId}`, error as Error);
-  }
-  // Stamp the last fetched remaining balances: only a *successful* fetch that
-  // actually reports a figure carries one — a failed or figure-less read must
-  // never overwrite a real stamp. The request path enforces the per-account
-  // floor from these stamps, and the route snapshot is invalidated when either
-  // changes so the next plan sees the fresh figures.
-  if (quota.error === null) {
-    try {
-      const remaining = totalRemainingCredit(quota.windows);
-      const remainingPercent = totalRemainingPercent(quota.windows);
-      const creditChanged = await stampRemainingCredit(deps.db, target.accountId, remaining);
-      const percentChanged = await stampRemainingPercent(deps.db, target.accountId, remainingPercent);
-      if (creditChanged || percentChanged) {
-        await deps.snapshotInvalidator?.invalidate();
-        log.info(
-          `[quota] remaining stamped account=${target.accountId} provider=${target.providerId} remaining=${remaining} remainingPercent=${remainingPercent}`,
-        );
-      }
-    } catch (error) {
-      // The stamp is advisory: a failure here must not lose the fetched quota.
-      log.warn(`[quota] remaining stamp failed for account=${target.accountId}`, error as Error);
-    }
   }
   return {
     quota,

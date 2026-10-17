@@ -1,14 +1,30 @@
 import { consoleRequest } from "../data/api";
 import type { ApiErrorShape } from "../data/api";
 // Console-owned device-poll DTO; token material remains provider-internal.
-import type { AccountHealthEventRecord, ByokConnectionTestRequest, ByokConnectionTestResult, CreateProviderAccountRequest, CreateProviderRequest, OAuthDevicePollResponse as OAuthDevicePollResult, ProbeAllAccountsResult, ProbeModelRequest, ProbeModelResult, ProviderAccountResponse, ProviderAccountsExportResponse, ProviderResponse, SetModelEnabledRequest, UpdateProviderAccountRequest, UpdateProviderRequest } from "../data/contracts";
+import type { AccountHealthEventRecord, ByokConnectionTestRequest, ByokConnectionTestResult, CreateProviderAccountBatchResult, CreateProviderAccountRequest, CreateProviderRequest, OAuthDevicePollResponse as OAuthDevicePollResult, ProbeAllAccountsResult, ProbeModelRequest, ProbeModelResult, ProviderAccountResponse, ProviderAccountsExportResponse, ProviderResponse, SetModelEnabledRequest, UpdateProviderAccountRequest, UpdateProviderRequest } from "../data/contracts";
 import { queryKeys } from "../data/query-keys";
-import { assertModels, assertProviders, querySignal } from "./common";
-import { DASHBOARD_QUERY_OPTIONS } from "../data/query-policy";
-import { getErrorMessage } from "../shared/helpers";
-import { toast } from "../shared/toast";
+import { assertModels, assertProviders, querySignal } from "../data/assert";
+import { DASHBOARD_QUERY_OPTIONS, POLL } from "../data/query-policy";
+import { getErrorMessage } from "../data/api";
+import { toast } from "../lib/toast";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import type { QueryClient } from "@tanstack/react-query";
+
+/**
+ * Operator-supplied limits/capabilities sent with a register or metadata update.
+ *
+ * `null` means "unknown" and is distinct from an absent field, which means
+ * "leave the stored value alone" — an edit that only sets the context ceiling
+ * must not reset the capability flags.
+ */
+export interface ModelMetadataPayload {
+  readonly contextLimit?: number | null;
+  readonly outputLimit?: number | null;
+  readonly passthrough?: boolean;
+  readonly image?: boolean;
+  readonly reasoning?: boolean;
+  readonly toolCall?: boolean;
+}
 
 
 /**
@@ -26,7 +42,7 @@ export function useProviders() {
     ...DASHBOARD_QUERY_OPTIONS,
     staleTime: 60_000,
     gcTime: 600_000,
-    refetchInterval: 60_000,
+    refetchInterval: POLL.catalog,
   });
 }
 
@@ -59,14 +75,23 @@ export function useRegisterProviderModels() {
   return useMutation<
     { registered: number },
     ApiErrorShape,
-    { providerId: string; modelIds: readonly string[]; wireFamily?: string }
+    {
+      providerId: string;
+      modelIds: readonly string[];
+      wireFamily?: string;
+      metadata?: ModelMetadataPayload;
+    }
   >({
-    mutationFn: ({ providerId, modelIds, wireFamily }) =>
+    mutationFn: ({ providerId, modelIds, wireFamily, metadata }) =>
       consoleRequest<{ registered: number }>(
         `/providers/${encodeURIComponent(providerId)}/models`,
         {
           method: "POST",
-          body: JSON.stringify({ modelIds, ...(wireFamily ? { wireFamily } : {}) }),
+          body: JSON.stringify({
+            modelIds,
+            ...(wireFamily ? { wireFamily } : {}),
+            ...(metadata ? { metadata } : {}),
+          }),
         },
       ),
     onSuccess: async (_result, variables) => {
@@ -163,6 +188,37 @@ export function useSetModelEnabled() {
     },
   });
 }
+/**
+ * Edits one model's limits and capability flags.
+ *
+ * Rides the same PATCH as the enable toggle: a payload carrying `metadata` is an
+ * edit, one without is the toggle. The caller must therefore always send
+ * `metadata` here — an accidental omission would toggle the model's enabled
+ * flag instead of editing it.
+ */
+export function useUpdateModelMetadata() {
+  const queryClient = useQueryClient();
+  return useMutation<
+    { success: boolean },
+    ApiErrorShape,
+    { providerId: string; modelId: string; route: string; metadata: ModelMetadataPayload }
+  >({
+    mutationFn: ({ providerId, modelId, route, metadata }) =>
+      consoleRequest<{ success: boolean }>(`/providers/${encodeURIComponent(providerId)}/models`, {
+        method: "PATCH",
+        body: JSON.stringify({ modelId, route, enabled: true, metadata }),
+      }),
+    onSuccess: async (_result, variables) => {
+      await queryClient.invalidateQueries({
+        queryKey: queryKeys.providers.models(variables.providerId),
+      });
+      toast.success("Model updated", `${variables.modelId} limits and capabilities saved`);
+    },
+    onError: (error) => {
+      toast.error("Failed to update model", getErrorMessage(error));
+    },
+  });
+}
 /** Deletes one registered model from a provider catalog. */
 export function useDeleteProviderModel() {
   const queryClient = useQueryClient();
@@ -228,6 +284,35 @@ export function useCreateProviderAccount() {
   });
 }
 
+/**
+ * Creates many accounts in one request.
+ *
+ * The server returns a per-item outcome, so a partial paste still lands the
+ * accounts that were fine. Invalidation happens once, after the whole batch —
+ * the old client-side loop invalidated per account, which is what made a large
+ * paste re-fetch the account list dozens of times.
+ */
+export function useCreateProviderAccountsBatch() {
+  const queryClient = useQueryClient();
+  return useMutation<
+    CreateProviderAccountBatchResult,
+    ApiErrorShape,
+    { providerId: string; accounts: readonly CreateProviderAccountRequest[] }
+  >({
+    mutationFn: ({ providerId, accounts }) =>
+      consoleRequest<CreateProviderAccountBatchResult>(
+        `/providers/${encodeURIComponent(providerId)}/accounts/batch`,
+        { method: "POST", body: JSON.stringify({ accounts }) },
+      ),
+    onSuccess: async (_result, variables) => {
+      await Promise.all([
+        queryClient.invalidateQueries({ queryKey: queryKeys.providers.accounts(variables.providerId) }),
+        queryClient.invalidateQueries({ queryKey: queryKeys.providers.all }),
+      ]);
+    },
+  });
+}
+
 /** Updates a provider account. */
 export function useUpdateProviderAccount() {
   const queryClient = useQueryClient();
@@ -264,7 +349,7 @@ export function useAccountHealthEvents(
       ),
     enabled: Boolean(providerId) && Boolean(accountId),
     ...DASHBOARD_QUERY_OPTIONS,
-    refetchInterval: 10_000,
+    refetchInterval: POLL.status,
   });
 }
 

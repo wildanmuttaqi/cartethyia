@@ -11,7 +11,7 @@
  *
  * There is no refresh grant: the start response advertises no token lifetime
  * and the approved payload carries no refresh token, so this client
- * deliberately declares no `refresher` capability — the same shape as Devin's.
+ * deliberately declares no `refresher` capability.
  * The organization id the gateway scopes requests by is folded into the stored
  * credential secret, because the console stores one opaque string per account.
  */
@@ -49,41 +49,13 @@ const DEVICE_INTERVAL_SECONDS = 3;
  */
 const NO_EXPIRY_FALLBACK_MS = 365 * 24 * 60 * 60 * 1000;
 
-/** Persisted access secret shape for a Kilo Code OAuth account. */
-interface KiloCredential {
-  readonly accessToken: string;
-  /** Organization the gateway scopes requests to; absent when the profile omits one. */
-  readonly orgId?: string;
-}
-
-/** Encodes the access secret. The adapter is the only reader. */
+/**
+ * Encodes the access secret. Decoding lives in `src/security/credential-codec.ts`
+ * (`decodeKiloCredential`) so the adapter and the discovery flow share one
+ * envelope implementation.
+ */
 export function encodeKiloCredential(accessToken: string, orgId: string | undefined): string {
   return JSON.stringify({ accessToken, ...(orgId === undefined ? {} : { orgId }) });
-}
-
-/**
- * Parses a stored Kilo Code credential.
- *
- * Fails closed: only this module writes the secret, so a value that is not the
- * JSON envelope means the row was corrupted or written by another tool, and
- * dispatching with a guessed token would send an unusable request upstream.
- */
-export function parseKiloCredential(value: string): KiloCredential {
-  const trimmed = value.trim();
-  if (!trimmed) throw new Error("Kilo Code credential is empty");
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(trimmed) as unknown;
-  } catch {
-    throw new Error("Kilo Code credential is not a JSON envelope");
-  }
-  const root = record(parsed);
-  const accessToken = root === undefined ? undefined : nonEmptyTrimmedString(root.accessToken);
-  if (root === undefined || accessToken === undefined) {
-    throw new Error("Kilo Code credential is missing accessToken");
-  }
-  const orgId = nonEmptyTrimmedString(root.orgId);
-  return { accessToken, ...(orgId === undefined ? {} : { orgId }) };
 }
 
 /** The account label shown for a login, when the approved payload names the user. */

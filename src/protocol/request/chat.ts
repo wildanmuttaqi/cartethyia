@@ -1,18 +1,21 @@
 /**
  * [OpenAI]-compatible /chat/completions request encoder: canonical → wire body.
  */
-import type { CanonicalRequest, ResponseFormat } from "../../transport/canonical-model";
-import { isRecord } from "../primitives";
+import type { CanonicalRequest, ResponseFormat } from "../canonical-model";
+import { isRecord } from "../codecs";
 import { markLatestBreakpoint } from "../../transport/translation/cache-controls";
-import { isWebSearchTool, normalizeWireMaxTokens, pickWireSupportedControls } from "../../transport/translation/capabilities";
+import { isWebSearchTool } from "../../transport/translation/search";
+import { pickWireSupportedControls } from "../../transport/translation/capabilities";
+import { normalizeWireMaxTokens } from "../../transport/translation/normalize";
 import { resolveWireMaxTokens } from "../../transport/translation/quirks";
 import {
   clampReasoningEffort,
   resolveSupportedReasoningEfforts,
 } from "../../transport/translation/thinking";
-import { isClaudeBillingHeaderText, resolveImageSource } from "../primitives";
+import { isClaudeBillingHeaderText, resolveImageSource } from "../codecs";
 import { resolvePromptCacheKey } from "../../providers/operations/session-resolution";
-import { reasoningEffortFromIntent } from "../../providers/reasoning";
+import { reasoningEffortFromIntent } from "../../providers/provider-reasoning";
+import { parseChatResponseToEvents, decodeChatSseStream } from "../response/chat";
 
 /**
  * OpenAI `input_audio.format` accepts only the discrete ids `wav`/`mp3`, never a
@@ -174,8 +177,15 @@ function markLatestChatCacheBreakpoint(messages: Array<Record<string, unknown>>)
 
 export function canonicalToChatPayload(
   request: CanonicalRequest,
-  supportsPromptCaching = true,
+  options: {
+    readonly supportsPromptCaching?: boolean;
+    readonly tokenLimitField?: "max_tokens" | "max_completion_tokens";
+    readonly maxOutputTokens?: number;
+    readonly promptCacheKey?: string;
+  } = {},
 ): Record<string, unknown> {
+  const supportsPromptCaching = options.supportsPromptCaching ?? true;
+  const tokenLimitField = options.tokenLimitField ?? "max_tokens";
   const messages: Array<Record<string, unknown>> = [];
   if (request.system?.length) {
     for (const p of request.system) {
@@ -200,6 +210,7 @@ export function canonicalToChatPayload(
             name: tc.name,
             arguments:
               typeof tc.arguments === "string" ? tc.arguments : JSON.stringify(tc.arguments),
+            ...(tc.namespace === undefined ? {} : { namespace: tc.namespace }),
           },
         }));
       const textParts = m.content.filter(
@@ -390,7 +401,7 @@ export function canonicalToChatPayload(
     messages,
     stream: request.stream,
   };
-  const chatCacheKey = resolvePromptCacheKey(request);
+  const chatCacheKey = options.promptCacheKey ?? resolvePromptCacheKey(request);
   if (supportsPromptCaching && chatCacheKey !== undefined)
     payload.prompt_cache_key = chatCacheKey;
   if (request.tools?.length) {
@@ -407,7 +418,7 @@ export function canonicalToChatPayload(
           },
         };
       }
-      // Hosted web search is not a `function` tool on any [OI]-compatible
+      // Hosted web search is not a `function` tool on any OpenAI-compatible
       // upstream; sending it as one (or emitting `{"type": null}`) is rejected.
       // The wire's own name for the capability is `web_search_preview`.
       if (isWebSearchTool(t)) return { type: "web_search_preview" };
@@ -494,6 +505,7 @@ export function canonicalToChatPayload(
     ["extension:prompt_cache_key", "prompt_cache_key"],
   ];
   for (const [extension, field] of passthrough) {
+    if (!supportsPromptCaching && field.startsWith("prompt_cache_")) continue;
     const value =
       request.generation_controls[extension as `extension:${string}`] ??
       request.generation_controls[`extension:responses.${field}` as `extension:${string}`];
@@ -504,10 +516,33 @@ export function canonicalToChatPayload(
   // pick forwards the caller's max_tokens verbatim, so clamping before it
   // would be overwritten. Free-tier Chat backends reject unbounded values
   // (e.g. 128000) with a generic invalid-argument 400.
-  const requestedMaxTokens = payload["max_tokens"];
-  if (typeof requestedMaxTokens === "number" && Number.isFinite(requestedMaxTokens)) {
-    const bounded = resolveWireMaxTokens("chat", { max_tokens: requestedMaxTokens });
-    if (bounded !== undefined) payload["max_tokens"] = bounded;
-  }
+  const requestedMaxTokens =
+    typeof payload["max_tokens"] === "number" && Number.isFinite(payload["max_tokens"])
+      ? (payload["max_tokens"] as number)
+      : undefined;
+  // Resolved unconditionally, not only when the caller sent a value: the bound
+  // table now carries a `defaultMaxTokens` for this wire, and an omitted limit
+  // must reach the upstream as a real number. Upstreams that require the field
+  // reject a large prompt whose `max_tokens` is absent outright (WorkBuddy
+  // `400 model_param_invalid`, reproduced through the gateway).
+  const bounded = resolveWireMaxTokens("chat", { max_tokens: requestedMaxTokens }, {
+    ...(options.maxOutputTokens === undefined ? {} : { maxOutputTokens: options.maxOutputTokens }),
+  });
+  delete payload["max_tokens"];
+  if (bounded !== undefined) payload[tokenLimitField] = bounded;
   return payload;
 }
+
+/**
+ * The chat wire codec, as a single importable unit.
+ *
+ * Exported so `protocol/registry.ts` can load one wire family on demand instead
+ * of statically importing all three; each family's codec is otherwise only
+ * reachable through the individual functions above.
+ */
+export const chatCodecModule = {
+  family: "chat" as const,
+  encodeWireRequest: canonicalToChatPayload,
+  decodeWireResponse: parseChatResponseToEvents,
+  decodeWireStream: decodeChatSseStream,
+} as const;

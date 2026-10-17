@@ -27,9 +27,9 @@ import {
   isJsonProxyRoutePath,
   isProxyDispatchRoute,
   readIngressBody,
-} from "../../src/transport/middleware/body-policy";
-import { NATIVE_SERVICE_PATHS } from "../../src/transport/dispatch/native-services";
-import { GatewayError } from "../../src/transport/gateway-error";
+} from "../../src/transport/guards/body-policy";
+import { isOpaqueBodyRoute, NATIVE_SERVICE_PATHS, TOKEN_COUNT_PATH } from "../../src/transport/contracts";
+import { GatewayError } from "../../src/protocol/gateway-error";
 
 /** A request to `path` with the given body and headers. */
 function request(
@@ -66,10 +66,51 @@ describe("the route table", () => {
       "/v1/completions",
       "/v1/responses/compact",
       "/v1/messages",
+      TOKEN_COUNT_PATH,
     ]) {
       expect(isJsonProxyRoutePath(path)).toBe(true);
       expect(isProxyDispatchRoute(path)).toBe(true);
     }
+  });
+
+  test("the token counter reads a JSON body but skips the canonical chat stage", () => {
+    // Both halves are load-bearing, and the second is the one that is easy to
+    // get wrong.
+    //
+    // In the JSON table, because `app.ts` mounts it: without the entry the body
+    // would be treated as an unrouted path and never read, so the handler would
+    // find `ingressBody` null and reject every count.
+    //
+    // Opaque, because Anthropic's count body carries `messages` and no
+    // `max_tokens`, while `MessagesAdapter.matchesBodyShape` requires
+    // `max_tokens`. Letting it reach surface detection finds no adapter, so the
+    // request fails for a field this endpoint does not use — and the strike
+    // stage would then plan and reserve admission a second time on the chat path
+    // for a call that generates nothing and is not billed.
+    expect(isJsonProxyRoutePath(TOKEN_COUNT_PATH)).toBe(true);
+    expect(isOpaqueBodyRoute(TOKEN_COUNT_PATH)).toBe(true);
+  });
+
+  test("the native service paths are opaque too", () => {
+    // Guards the predicate's widening: `isOpaqueBodyRoute` had to cover the
+    // native services as well as the counter, and dropping one would silently
+    // route a generation body through the chat codecs.
+    for (const path of NATIVE_SERVICE_PATHS) {
+      expect(isOpaqueBodyRoute(path)).toBe(true);
+    }
+  });
+
+  test("an ordinary chat route is NOT opaque", () => {
+    // The converse: a chat body must still be canonically parsed, or the surface
+    // codecs never run and the gateway forwards an untranslated client body to
+    // whatever provider it picked.
+    for (const path of ["/v1/messages", "/v1/chat/completions", "/v1/responses"]) {
+      expect(isOpaqueBodyRoute(path)).toBe(false);
+    }
+  });
+
+  test("an undefined path is not an opaque route", () => {
+    expect(isOpaqueBodyRoute(undefined)).toBe(false);
   });
 
   test("every native service path is recognised", () => {
@@ -84,15 +125,23 @@ describe("the route table", () => {
     // must not be reported as a proxy request lifecycle event or enqueue a
     // telemetry row — a row for it would inflate the Usage page with requests no
     // provider saw.
-    for (const path of ["/v1/models", "/v1/models/claude-sonnet-4-6", "/v1/embeddings", "/v1/images/generations", "/v1/audio/speech"]) {
+    //
+    // `/v1/images/generations` is deliberately NOT in this list any more: it
+    // dispatches to a provider, so keeping it here would have made the gateway
+    // skip the request lifecycle for a route that really does call upstream.
+    // `/v1/embeddings` and `/v1/audio/speech` remain — still no handler behind
+    // them, which is the defect the comment warns about.
+    for (const path of ["/v1/models", "/v1/models/claude-sonnet-4-6", "/v1/embeddings", "/v1/audio/speech"]) {
       expect(isProxyDispatchRoute(path)).toBe(false);
     }
+    expect(isProxyDispatchRoute("/v1/images/generations")).toBe(true);
   });
 
-  test("the three removed entries are genuinely absent", () => {
-    // The comment names them specifically: they advertised a surface that 404s.
-    // Asserted so re-adding one is a deliberate act.
-    for (const path of ["/v1/embeddings", "/v1/images/generations", "/v1/audio/speech"]) {
+  test("the remaining removed entries are genuinely absent", () => {
+    // The comment names three that advertised a surface with no handler behind
+    // it. `/v1/images/generations` has since gained one, so only the two that
+    // are still unrouted stay asserted absent.
+    for (const path of ["/v1/embeddings", "/v1/audio/speech"]) {
       expect(isJsonProxyRoutePath(path)).toBe(false);
     }
   });
@@ -197,7 +246,11 @@ describe("readIngressBody — content type", () => {
     );
     expect(failure.status).toBe(415);
     expect(failure.code).toBe("unsupported_media_type");
-    expect(failure.message).toBe("content-type must be application/json");
+    // Asserted on the contract, not the wording: the message is operator-facing
+    // prose and is free to be reworded. What must hold is that it names the
+    // content type the client sent, so the fix is obvious.
+    expect(failure.message).toContain("text/plain");
+    expect(failure.message).toContain("application/json");
   });
 
   test("a content-type with parameters is accepted", () => {
@@ -297,7 +350,33 @@ describe("readIngressBody — size limits", () => {
     );
     expect(failure.status).toBe(413);
     expect(failure.code).toBe("invalid_request");
-    expect(failure.message).toContain("exceeds configured limit");
+    // The message must name the real limit, not a vague "too large" — the
+    // client needs the number to size its requests.
+    expect(failure.message).toContain("1048576");
+  });
+
+  test("the configured ceiling is enforced without a content-length", async () => {
+    // What the ingress middleware actually passes: the operator-configured
+    // ceiling. A body past it is refused whether or not the client declared its
+    // size — a chunked request has no content-length, so the read-time counter
+    // is the only bound that holds.
+    const { resolveMaxBodyBytes } = await import("../../src/config/runtime");
+    const limit = resolveMaxBodyBytes();
+    const oversized = JSON.stringify({ t: "x".repeat(limit + 1) });
+    const streamed = new Request("https://gateway.test/v1/chat/completions", {
+      method: "POST",
+      body: oversized,
+      headers: { "content-type": "application/json" },
+    });
+    // The Request constructor sets content-length; strip it to model a chunked
+    // client, so only the read-time check can refuse the body.
+    streamed.headers.delete("content-length");
+    await expect(readIngressBody(streamed, { maxBodyBytes: limit })).rejects.toBeInstanceOf(GatewayError);
+
+    const declared = request("/v1/chat/completions", "{}", {
+      headers: { "content-length": String(limit + 1) },
+    });
+    await expect(readIngressBody(declared, { maxBodyBytes: limit })).rejects.toBeInstanceOf(GatewayError);
   });
 
   test("the default limit is one mebibyte", () => {
@@ -329,7 +408,8 @@ describe("readIngressBody — parsing", () => {
     const failure = await rejection(request("/v1/chat/completions", "{not json"));
     expect(failure.status).toBe(400);
     expect(failure.code).toBe("invalid_request");
-    expect(failure.message).toBe("malformed JSON request body");
+    // Asserted on the contract, not the wording.
+    expect(failure.message.length).toBeGreaterThan(0);
   });
 
   test("an empty body is a 400, not an undefined value", () => {
@@ -380,7 +460,8 @@ describe("readIngressBody — the nesting depth bound", () => {
     // This is the assertion that the bound exists.
     const failure = await rejection(request("/v1/chat/completions", nested(200)));
     expect(failure.status).toBe(400);
-    expect(failure.message).toContain("nesting exceeds the allowed depth");
+    // The message must name the depth limit, or the client cannot size its payload.
+    expect(failure.message).toContain("64");
   });
 
   test("the depth bound applies to objects as well as arrays", () => {
@@ -429,7 +510,11 @@ describe("readIngressBody — the reader lock", () => {
     );
     expect(fromRead.code).toBe(fromHeader.code);
     expect(fromRead.status).toBe(fromHeader.status);
-    expect(fromRead.message).toBe(fromHeader.message);
+    // Same *shape*, not the same string: each branch quotes the limit it
+    // enforced (100 here, the default there). Comparing the full text would
+    // demand the read path lie about the limit it actually applied.
+    expect(fromRead.message).toContain("100 bytes");
+    expect(fromHeader.message).toContain("1048576 bytes");
   });
 
   test("a request with no body at all is a 400, not a hang", () => {

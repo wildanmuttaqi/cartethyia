@@ -22,13 +22,14 @@
  * Cross-brand model catalog: Antigravity serves Google Gemini SKUs,
  * Anthropic Claude SKUs, and one GPT-OSS SKU behind the same wire.
  */
-import type { CanonicalEvent, CanonicalRequest, CanonicalStopReason } from "../../../transport/canonical-model";
-import { GatewayError } from "../../../transport/gateway-error";
-import { firstUserText } from "../../../transport/canonical-model";
-import { decodeSseEvents } from "../../../transport/streaming";
+import type { CanonicalEvent, CanonicalRequest, CanonicalStopReason } from "../../../protocol/canonical-model";
+import { GatewayError } from "../../../protocol/gateway-error";
+import { firstUserText } from "../../../protocol/canonical-model";
+import { decodeSseEvents } from "../../../protocol/sse-decoder";
+import { geminiInlineImages, imageAspectRatio, imageCreatedSeconds, imagePrompt } from "../../../protocol/image-generation";
 import { mapUpstreamHttpError } from "../../../transport/failure-policy";
-import { usageFromProvider } from "../../usage";
-import { isRecord } from "../../../protocol/primitives";
+import { usageFromProvider } from "../../provider-usage";
+import { isRecord } from "../../../protocol/codecs";
 import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { buildGeminiPayload } from "../../../protocol/request/gemini";
 import {
@@ -44,26 +45,29 @@ import {
   getAntigravityUserAgent,
   loadAntigravityProject,
 } from "./antigravity-protocol";
-import type {
-  ProviderDispatchTarget,
-  ProviderAdapter,
-  ProviderDispatchContext,
-} from "../../provider-registry";
+import type { ImageGenerationOutcome, ProviderDispatchTarget, ProviderAdapter, ProviderDispatchContext, WebSearchOutcome, WebSearchResult } from "../../provider-contracts";
 import { providerBaseUrl } from "../../provider-metadata";
 import { abortGatewayError, createUpstreamDeadlineLifecycle } from "../../operations/upstream-deadline";
+import { log } from "../../../observability/logger";
+import {
+  fetchWithEmptyStreamRecovery,
+  isEmptyStream,
+  type StreamTally,
+} from "../../../transport/dispatch/empty-stream";
 
 export const ANTIGRAVITY_PROVIDER_ID = "antigravity" as const;
 export const ANTIGRAVITY_BASE_URL = providerBaseUrl("antigravity");
 /** Cloud Code Assist accepts `/v1internal:generateContent` for the same body Gemini's v1beta accepts. */
 const GENERATE_PATH = "/v1internal:generateContent" as const;
-import { defineModel } from "../../model-definition";
-import type { ModelDefinition } from "../../provider-registry";
+import { defineModel } from "../../provider-model-definition";
+import type { ModelDefinition } from "../../provider-model-definition";
 
 const antigravityModel = (
   modelId: string,
   contextLimit: number,
   outputLimit: number,
   reasoning: boolean,
+  image = false,
 ): ModelDefinition =>
   defineModel({
     id: modelId,
@@ -73,16 +77,34 @@ const antigravityModel = (
     out: outputLimit,
     vision: true,
     reasoning,
-    toolCall: true,
+    ...(image
+      ? { serviceKind: "imageGeneration" as const, output: ["image"] as const, toolCall: false }
+      : { toolCall: true }),
   });
 
 export const ANTIGRAVITY_MODELS: readonly ModelDefinition[] = [
   // Claude via Antigravity (Anthropic-branded SKUs, Gemini wire)
   antigravityModel("claude-sonnet-4-6", 250_000, 64_000, true),
   antigravityModel("claude-opus-4-6", 250_000, 64_000, true),
+  // The 5.5 generation. Anthropic's own model pages publish 1M context and
+  // 128k output for both, which is the same figure the Claude integration
+  // carries; Antigravity has no base-catalog rows of its own, so the numbers
+  // are stated here rather than resolved from a source that does not exist.
+  //
+  // `out` is published metadata, not a request field: the `maxOutputTokens` the
+  // envelope carries comes from `ANTIGRAVITY_MODEL_WIRE_PROFILES`, and an id
+  // absent from that table passes the caller's own value through. The 4.6 rows
+  // are pinned at 64000 because Antigravity was observed rejecting anything
+  // higher on `daily-cloudcode-pa`. The 5.5 cap is UNVERIFIED — no 5.5 request
+  // has been captured against that host — so if it turns out to carry the same
+  // 64000 ceiling, it needs its own profile entry; a catalog row cannot express
+  // it.
+  antigravityModel("claude-sonnet-5-5", 1_000_000, 128_000, true),
+  antigravityModel("claude-opus-5-5", 1_000_000, 128_000, true),
   // Gemini
+  antigravityModel("gemini-2.5-flash", 1_048_576, 65_536, true),
   antigravityModel("gemini-3-flash", 1_048_576, 65_536, true),
-  antigravityModel("gemini-3.1-flash-image", 200_000, 64_000, false),
+  antigravityModel("gemini-3.1-flash-image", 200_000, 64_000, false, true),
   antigravityModel("gemini-3.1-pro", 1_048_576, 65_535, true),
   antigravityModel("gemini-3.6-flash", 1_048_576, 65_536, true),
   antigravityModel("gemini-3.7-flash", 1_048_576, 65_536, true),
@@ -91,6 +113,27 @@ export const ANTIGRAVITY_MODELS: readonly ModelDefinition[] = [
   antigravityModel("gpt-oss-120b", 131_072, 32_768, true),
 ];
 
+function normalizeAntigravityGrounding(data: unknown, maxResults: number): readonly WebSearchResult[] {
+  if (!isRecord(data)) return [];
+  const chunks = Array.isArray(data.groundingChunks) ? data.groundingChunks : [];
+  const results: WebSearchResult[] = [];
+  const seen = new Set<string>();
+  for (const chunk of chunks) {
+    if (!isRecord(chunk) || !isRecord(chunk.web)) continue;
+    const url = typeof chunk.web.uri === "string" ? chunk.web.uri : "";
+    if (!url || seen.has(url)) continue;
+    seen.add(url);
+    results.push({
+      title: typeof chunk.web.title === "string" ? chunk.web.title : "",
+      url,
+      snippet: "",
+      published_at: null,
+      score: null,
+    });
+    if (results.length >= maxResults) break;
+  }
+  return results;
+}
 
 const STREAM_GENERATE_PATH = "/v1internal:streamGenerateContent?alt=sse" as const;
 
@@ -296,6 +339,9 @@ class AntigravityAdapter implements ProviderAdapter {
           typeof cand["finishReason"] === "string"
             ? (cand["finishReason"] as string)
             : undefined;
+        const providerStopReason = isRecord(cand["groundingMetadata"])
+          ? `grounding:${JSON.stringify(cand["groundingMetadata"])}`
+          : finishReason;
         if (typeof decoded["responseId"] === "string") {
           sessionState.lastExecutionId = decoded["responseId"] as string;
         }
@@ -306,7 +352,7 @@ class AntigravityAdapter implements ProviderAdapter {
           // truncated: never complete.
           state: finishReason === undefined ? "failed" : "complete",
           stop_reason: toCanonicalStop(finishReason, output.calls.length),
-          ...(finishReason ? { provider_stop_reason: finishReason } : {}),
+          ...(providerStopReason ? { provider_stop_reason: providerStopReason } : {}),
           usage: usageRec,
         } as CanonicalEvent;
         return;
@@ -320,6 +366,40 @@ class AntigravityAdapter implements ProviderAdapter {
           {},
           "upstream",
         );
+      }
+      // Empty-stream recovery: a 200 whose first burst carries nothing is a
+      // routable request the backend answered with silence. Peek on a *clone*
+      // (the original reader stays untouched and fully readable) and stop at
+      // the first meaningful event, so a healthy stream costs one bounded read
+      // of its opening burst and no extra request. Only a silent first burst
+      // triggers the byte-identical replay across prod → sandbox.
+      {
+        const firstBurst = await peekAntigravityTally(response.clone(), lifecycle.signal);
+        if (isEmptyStream(firstBurst)) {
+          const frozenBody = JSON.stringify(payload);
+          const sandbox = failoverAntigravityUrl(url, this.baseUrl);
+          const recovery = await fetchWithEmptyStreamRecovery(
+            sandbox === undefined ? [url] : [url, sandbox],
+            { headers, body: frozenBody },
+            {
+              fetch: (target, init) =>
+                outboundFetch(target, {
+                  method: "POST",
+                  headers: init.headers,
+                  body: init.body,
+                  signal: init.signal,
+                }),
+              drain: (res, signal) => peekAntigravityTally(res.clone(), signal),
+              signal: lifecycle.signal,
+              deadlineMs: context.deadline,
+            },
+          );
+          log.warn("antigravity: empty stream, replayed", {
+            endpoint: recovery.endpoint,
+            replays: recovery.replaysUsed,
+          });
+          response = recovery.response;
+        }
       }
       let seq = 1;
       yield {
@@ -422,6 +502,160 @@ class AntigravityAdapter implements ProviderAdapter {
     } finally {
       lifecycle.release();
     }
+  }
+
+  async websearch(
+    body: Record<string, unknown>,
+    candidate: ProviderDispatchTarget,
+    context: ProviderDispatchContext,
+  ): Promise<WebSearchOutcome> {
+    const query = typeof body.query === "string" ? body.query.trim() : "";
+    if (!query) throw new GatewayError("invalid_request", 400, "search query is required");
+    const rawMax = body.max_results;
+    const maxResults =
+      typeof rawMax === "number" && Number.isFinite(rawMax)
+        ? Math.min(Math.max(1, Math.floor(rawMax)), 50)
+        : 10;
+    const requested = typeof body.model === "string" ? body.model.trim() : "";
+    const model = requested.length > 0 && requested !== "antigravity" ? requested : "gemini-2.5-flash";
+    const request: CanonicalRequest = {
+      model,
+      messages: [{ role: "user", content: [{ kind: "text", text: query }] }],
+      tools: [{ name: "web_search", tool_type: "web_search", jsonSchema: {} }],
+      generation_controls: {},
+      stream: false,
+      source_surface: "chat",
+    };
+    let grounded: unknown;
+    for await (const event of this.dispatch(request, { ...candidate, model_id: model }, context)) {
+      const reason = event.type === "terminal" ? event.provider_stop_reason : undefined;
+      if (reason?.startsWith("grounding:")) grounded = JSON.parse(reason.slice("grounding:".length));
+    }
+    const results = normalizeAntigravityGrounding(grounded, maxResults);
+    if (results.length === 0)
+      throw new GatewayError("platform_unavailable", 502, "Antigravity search returned no grounded results");
+    return { results, total_results: results.length };
+  }
+
+  async generateImage(
+    body: Record<string, unknown>,
+    candidate: ProviderDispatchTarget,
+    context: ProviderDispatchContext,
+  ): Promise<ImageGenerationOutcome> {
+    if (context.credential.credential_kind !== "oauth") {
+      throw new GatewayError(
+        "invalid_request",
+        400,
+        `antigravity: Google OAuth credential required (got credential_kind=${context.credential.credential_kind})`,
+      );
+    }
+    const accessToken = context.credential.secret
+      ? new TextDecoder().decode(context.credential.secret).trim()
+      : "";
+    if (!accessToken) {
+      throw new GatewayError("authentication_failed", 401, "antigravity: OAuth access token is required");
+    }
+    const prompt = imagePrompt(body);
+    const model = candidate.model_id.length > 0 ? candidate.model_id : typeof body.model === "string" ? body.model : "";
+    if (model.length === 0) throw new GatewayError("invalid_request", 400, "model is required");
+    const outboundFetch: typeof fetch = (context.outbound_fetch as unknown as typeof fetch) ?? this.fetchFn;
+    const projectId = await loadAntigravityProject(accessToken, {
+      baseUrl: this.baseUrl,
+      fetcher: outboundFetch,
+      signal: context.abort_signal,
+    });
+    const aspectRatio = imageAspectRatio(body.size);
+    const count = typeof body.n === "number" && Number.isFinite(body.n) ? Math.max(1, Math.floor(body.n)) : 1;
+    // the reference client's Antigravity image client streams the agent envelope and asks
+    // for IMAGE only. The chat envelope (tools, thinking, identity turn) makes
+    // Cloud Code answer as an agent instead of returning inline image bytes.
+    const payload: Record<string, unknown> = {
+      model: antigravityWireModelId(model),
+      request: {
+        contents: [{ role: "user", parts: [{ text: prompt }] }],
+        systemInstruction: {
+          parts: [
+            {
+              text: "You are an AI image generator. Generate images based on user descriptions. Focus on creating high-quality, visually appealing images that match the user's request.",
+            },
+          ],
+        },
+        generationConfig: {
+          responseModalities: ["IMAGE"],
+          candidateCount: count,
+          ...(aspectRatio === undefined ? {} : { imageConfig: { aspectRatio } }),
+        },
+        safetySettings: [
+          { category: "HARM_CATEGORY_HARASSMENT", threshold: "BLOCK_ONLY_HIGH" },
+          { category: "HARM_CATEGORY_HATE_SPEECH", threshold: "BLOCK_ONLY_HIGH" },
+          { category: "HARM_CATEGORY_SEXUALLY_EXPLICIT", threshold: "BLOCK_ONLY_HIGH" },
+          { category: "HARM_CATEGORY_DANGEROUS_CONTENT", threshold: "BLOCK_ONLY_HIGH" },
+          { category: "HARM_CATEGORY_CIVIC_INTEGRITY", threshold: "BLOCK_ONLY_HIGH" },
+        ],
+      },
+      requestType: "agent",
+      requestId: `agent-${Date.now()}-${randomUUID().slice(0, 9)}`,
+      userAgent: "antigravity",
+      ...(projectId === undefined ? {} : { project: projectId }),
+    };
+    const headers: Record<string, string> = {
+      "content-type": "application/json",
+      accept: "text/event-stream",
+      authorization: `Bearer ${accessToken}`,
+      "user-agent": getAntigravityUserAgent(),
+    };
+    const lifecycle = createUpstreamDeadlineLifecycle(context);
+    const url = `${this.baseUrl}${STREAM_GENERATE_PATH}`;
+    let response: Response;
+    try {
+      const attempt = (target: string): Promise<Response> =>
+        outboundFetch(target, {
+          method: "POST",
+          headers,
+          body: JSON.stringify(payload),
+          signal: lifecycle.signal,
+        });
+      response = await attempt(url);
+      if (!response.ok && isFailoverStatus(response.status)) {
+        const sandboxUrl = failoverAntigravityUrl(url, this.baseUrl);
+        if (sandboxUrl !== undefined) response = await attempt(sandboxUrl);
+      }
+    } catch (error: unknown) {
+      const abortError = abortGatewayError(lifecycle, error, context.abort_signal);
+      if (abortError) throw abortError;
+      throw new GatewayError(
+        "platform_unavailable",
+        502,
+        `Antigravity image generation unreachable: ${error instanceof Error ? error.message : String(error)}`,
+        {},
+        "upstream",
+      );
+    }
+    if (!response.ok) {
+      lifecycle.release();
+      throw await mapUpstreamHttpError(response, "antigravity");
+    }
+    lifecycle.release();
+    const images: Record<string, unknown>[] = [];
+    // One generated image is already several megabytes of base64, so the
+    // shared 4 MiB SSE cap would reject a successful generation.
+    for await (const event of decodeSseEvents(response.body, {
+      signal: context.abort_signal,
+      maxEventBytes: 32 * 1024 * 1024,
+    })) {
+      if (event.data.trim().length === 0 || event.data.trim() === "[DONE]") continue;
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(event.data);
+      } catch {
+        throw new GatewayError("platform_unavailable", 502, "Antigravity image stream returned malformed JSON", {}, "upstream");
+      }
+      images.push(...geminiInlineImages(parsed));
+    }
+    if (images.length === 0) {
+      throw new GatewayError("platform_unavailable", 502, "Antigravity image generation returned no image", {}, "upstream");
+    }
+    return { created: imageCreatedSeconds(), data: images };
   }
 }
 
@@ -559,6 +793,21 @@ export function antigravityThinkingBudget(modelId: string): number | undefined {
 const ANTIGRAVITY_SYSTEM_INSTRUCTION =
   "You are Antigravity, a powerful agentic AI coding assistant designed by the Google Deepmind team working on Advanced Agentic Coding.You are pair programming with a USER to solve their coding task. The task may require creating a new codebase, modifying or debugging an existing codebase, or simply answering a question.**Absolute paths only****Proactiveness**";
 
+/**
+ * Restatement appended as a trailing user turn when a Gemini route carries a
+ * forced tool choice. The backend drops `toolConfig` on Gemini routes (answers
+ * in text under `mode: "ANY"`, still emits calls under `"NONE"`), so without
+ * the restatement `tool_choice=required` silently degrades to free text.
+ *
+ * UNCONFIRMED: the reference ships its directive text from an external file
+ * (`google-antigravity-forced-tool.md`, a 1-line "TOOL-ONLY TURN" stub at the
+ * compared commit) — no captured body shows the real wording. This constant is
+ * the explicit seam to confirm from live replay; the log line in
+ * `buildAntigravityEnvelope` marks every send for that comparison.
+ */
+const ANTIGRAVITY_FORCED_TOOL_DIRECTIVE =
+  "TOOL-ONLY TURN. Call exactly one available tool now. Do not emit any text before or after the call.";
+
 function sessionStateKey(routeIdentity: string, wireModelId: string): string {
   return `${sessionIdentityDigest(routeIdentity)}:antigravity:${wireModelId}`;
 }
@@ -566,6 +815,46 @@ function sessionStateKey(routeIdentity: string, wireModelId: string): string {
 /** Statuses worth one bounded sandbox failover (throttled or server-side). */
 function isFailoverStatus(status: number): boolean {
   return status === 429 || (status >= 500 && status <= 599);
+}
+
+/**
+ * Drains just enough of an Antigravity SSE body to know whether it carries
+ * anything, then stops.
+ *
+ * The caller passes a *clone*, so the original body reader is never consumed
+ * and the real stream still flows untouched. Reading stops at the first
+ * meaningful event or after `maxChunks` data events, whichever comes first —
+ * a healthy stream therefore costs one bounded read of its opening burst
+ * rather than a full drain, which is what makes the pre-commit peek cheap
+ * enough to sit on the hot path.
+ */
+async function peekAntigravityTally(
+  response: Response,
+  signal: AbortSignal,
+  maxChunks = 8,
+): Promise<StreamTally> {
+  const body = response.body;
+  if (body === null) return { dataEvents: 0, meaningful: false, thoughtOnly: false };
+  let dataEvents = 0;
+  let thought = false;
+  for await (const sse of decodeSseEvents(body, { signal })) {
+    const data = sse.data.trim();
+    if (data.length === 0 || data === "[DONE]") continue;
+    dataEvents++;
+    const parsed = decodeGeminiStreamEvent(data, "antigravity stream error");
+    if (parsed === undefined) continue;
+    const { parts } = geminiCandidate(parsed);
+    const output = responseParts(parts);
+    if (output.thought) thought = true;
+    if (output.text || output.calls.length > 0) {
+      return { dataEvents, meaningful: true, thoughtOnly: false };
+    }
+    if (dataEvents >= maxChunks) break;
+  }
+  // A stream that ended with reasoning but no final output is a complete
+  // provider response (the donor's thought-only carve-out): replaying it
+  // burns a full reasoning pass for nothing, so it is never treated as empty.
+  return { dataEvents, meaningful: false, thoughtOnly: thought };
 }
 
 /**
@@ -621,8 +910,8 @@ function buildAntigravityEnvelope(
     ...(state.lastExecutionId ? { last_execution_id: state.lastExecutionId } : {}),
     trajectory_id: state.trajectoryId,
     last_step_index: String(step - 1),
-    used_claude: String(logicalModelId.includes("claude")),
-    used_claude_conservative: String(logicalModelId.includes("claude")),
+    used_claude: profile?.usageLabel ?? String(logicalModelId.includes("claude")),
+    used_claude_conservative: profile?.usageLabel ?? String(logicalModelId.includes("claude")),
   };
   if (profile?.modelEnum) {
     labels["model_enum"] = profile.modelEnum;
@@ -631,6 +920,27 @@ function buildAntigravityEnvelope(
   const existingContents = Array.isArray(geminiPayload["contents"])
     ? (geminiPayload["contents"] as Record<string, unknown>[])
     : [];
+  const isClaudeRoute = logicalModelId.toLowerCase().includes("claude");
+  // Forced choice on Gemini routes: the backend drops `toolConfig` here, so a
+  // canonical `tool_choice=required` with no declared change is restated as a
+  // trailing user directive (reference behavior). Claude routes implement
+  // VALIDATED natively and are left untouched.
+  if (
+    !isClaudeRoute &&
+    (request.tool_choice === "required" ||
+      (typeof request.tool_choice === "object" &&
+        request.tool_choice !== null &&
+        request.tool_choice.type !== undefined)) &&
+    existingContents.length > 0
+  ) {
+    existingContents.push({
+      role: "user",
+      parts: [{ text: ANTIGRAVITY_FORCED_TOOL_DIRECTIVE }],
+    });
+    log.info("antigravity: forced tool choice restated for Gemini route", {
+      model: wireModelId,
+    });
+  }
   const injectIdentity =
     logicalModelId.toLowerCase().includes("claude") || logicalModelId.toLowerCase().includes("gemini-3");
   // Identity rides the dedicated systemInstruction field (captured shape),
@@ -663,16 +973,19 @@ function buildAntigravityEnvelope(
       ? { generationConfig }
       : {}),
   };
-  if ((request.tools ?? []).some((tool) => tool.name === "web_search" || tool.name === "web_search_preview")) {
-    const tools = Array.isArray(requestPayload["tools"])
-      ? [...(requestPayload["tools"] as Record<string, unknown>[])]
-      : [];
-    tools.push({ googleSearch: {} });
-    requestPayload["tools"] = tools;
-  }
+  // No built-in tools on this route. A `googleSearch` entry alongside
+  // `functionDeclarations` is refused with
+  // `400 ... enable tool_config.include_server_side_tool_invocations to use
+  // Built-in tools with Function calling`, and the reference client never
+  // sends one: web search reaches Antigravity as an ordinary function tool.
+  // Injecting it was the only reason that refusal ever appeared here.
   if (logicalModelId.includes("claude") && !isRecord(requestPayload["toolConfig"])) {
     requestPayload["toolConfig"] = { functionCallingConfig: { mode: "VALIDATED" } };
   }
+  // Gemini default is left unset: the shared Gemini builder owns toolConfig
+  // on this path, and stamping VALIDATED here would overwrite a caller choice
+  // the envelope cannot see. Only the forced-choice restatement above runs on
+  // the Gemini path.
   applySkipThoughtSignatureBypass(requestPayload, logicalModelId);
 
   const envelope: Record<string, unknown> = {

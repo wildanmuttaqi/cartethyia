@@ -44,6 +44,9 @@ export const MAX_SERIES = 100;
 export const MAX_LABELS = 8;
 export const MAX_LABEL_VALUE_LENGTH = 64;
 
+/** Shared frozen empty label set for the label-free fast path. */
+const EMPTY_LABELS: MetricLabels = Object.freeze({});
+
 /** Sanitize and truncate labels to guard cardinality and memory. */
 export function normalizeLabels(
   labels: MetricLabels | undefined,
@@ -100,6 +103,15 @@ abstract class ScalarMetric {
   }
 
   inc(value = 1, labels?: MetricLabels): void {
+    // Label-free fast path: skips normalize (alloc) + join per inc.
+    if (this.labelNames.length === 0) {
+      const previous = this.samples.get("");
+      this.samples.set("", {
+        labels: EMPTY_LABELS,
+        value: (previous?.value ?? 0) + value,
+      });
+      return;
+    }
     const normalized = normalizeLabels(labels, this.labelNames);
     const key = serializeLabels(this.labelNames, normalized);
     if (!canAddSeries(this.samples, key)) return;
@@ -259,7 +271,6 @@ export class PrometheusRegistry {
   readonly cartethyia_routing_roundrobin_entries: GaugeMetric;
   readonly cartethyia_ip_abuse_keys: GaugeMetric;
   readonly cartethyia_quota_cache_entries: GaugeMetric;
-  readonly cartethyia_pool_agent_entries: GaugeMetric;
   readonly cartethyia_proxy_dial_dns_fallback_total: CounterMetric;
   readonly proxy_provider_adapter_load_ms: HistogramMetric;
   readonly pool_cooldown_record_failed: CounterMetric;
@@ -336,10 +347,6 @@ export class PrometheusRegistry {
     this.cartethyia_quota_cache_entries = this.gauge(
       "cartethyia_quota_cache_entries",
       "Entries in the in-process provider quota cache",
-    );
-    this.cartethyia_pool_agent_entries = this.gauge(
-      "cartethyia_pool_agent_entries",
-      "Cached per-pool egress agents",
     );
     this.cartethyia_proxy_dial_dns_fallback_total = this.counter(
       "cartethyia_proxy_dial_dns_fallback_total",

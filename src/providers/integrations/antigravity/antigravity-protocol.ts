@@ -17,9 +17,10 @@
  */
 import { createHash } from "node:crypto";
 import { providerBaseUrl } from "../../provider-metadata";
-import type { ModelDefinition } from "../../provider-registry";
-import { isRecord } from "../../../protocol/primitives";
+import type { ModelDefinition } from "../../provider-model-definition";
+import { isRecord } from "../../../protocol/codecs";
 import { modelsDevCatalog } from "../../discovery/models-dev-catalog";
+import type { CanonicalRequest, ReasoningIntent } from "../../../protocol/canonical-model";
 import type { FetchLike } from "../../authentication/oauth-client";
 import { getAntigravityVersion } from "../../operations/client-versions";
 export { getAntigravityVersion };
@@ -31,6 +32,36 @@ const ANTIGRAVITY_ARCH = "arm64";
 const ANTIGRAVITY_CL = "963137146";
 
 /**
+ * Env overrides for the three fingerprint fields, read per call so a test (or an
+ * operator editing `.env` and reloading) sees the current value rather than a
+ * process-start snapshot.
+ *
+ * These are the provider-local knobs the reference client exposes
+ * (`CARTETHYIA_ANTIGRAVITY_UA_OS_TYPE` / `_ARCH` / `_CL`); they exist so a
+ * Linux/x64 deployment stops claiming `darwin`/`arm64` on the wire. The
+ * defaults stay pinned to the captured desktop client because the backend
+ * gates on the version, not on these fields.
+ */
+const UA_OS_TYPE_ENV = "CARTETHYIA_ANTIGRAVITY_UA_OS_TYPE";
+const UA_ARCH_ENV = "CARTETHYIA_ANTIGRAVITY_UA_ARCH";
+const UA_CL_ENV = "CARTETHYIA_ANTIGRAVITY_UA_CL";
+
+/**
+ * `os_type`/`arch`/`cl` are opaque to the backend but they are still header
+ * bytes on a shared transport, so an override is sanitized to the characters
+ * the captured client ever emits. A value containing anything else (a quoted
+ * or delimited injection) is dropped in favor of the default rather than
+ * forwarded, which keeps one env var from corrupting the whole UA string.
+ */
+const UA_FIELD_PATTERN = /^[A-Za-z0-9._-]{1,64}$/;
+
+function uaField(name: string, fallback: string): string {
+  const raw = process.env[name]?.trim();
+  if (raw === undefined || raw.length === 0) return fallback;
+  return UA_FIELD_PATTERN.test(raw) ? raw : fallback;
+}
+
+/**
  * Antigravity `User-Agent` header value; rebuilt when the discovered version
  * changes. Format captured from the real `antigravity/hub` desktop client:
  * `antigravity/hub/2.8.0 (aidev_client; os_type=darwin; arch=arm64; cl=963137146)`.
@@ -38,10 +69,14 @@ const ANTIGRAVITY_CL = "963137146";
  * The backend does not validate `cl` (verified live: stale, zero, and absent
  * `cl` all pass model gating on `daily-cloudcode-pa`; only the version
  * gates). The `cl`/`os_type`/`arch` fields are desktop-client fingerprints,
- * not operator policy, so they are pinned rather than configurable.
+ * not operator policy — they default to the captured desktop values but are
+ * env-overridable so a deployment need not claim `darwin`/`arm64`.
  */
 export function getAntigravityUserAgent(): string {
-  return `antigravity/hub/${getAntigravityVersion()} (aidev_client; os_type=${ANTIGRAVITY_OS_TYPE}; arch=${ANTIGRAVITY_ARCH}; cl=${ANTIGRAVITY_CL})`;
+  const osType = uaField(UA_OS_TYPE_ENV, ANTIGRAVITY_OS_TYPE);
+  const arch = uaField(UA_ARCH_ENV, ANTIGRAVITY_ARCH);
+  const cl = uaField(UA_CL_ENV, ANTIGRAVITY_CL);
+  return `antigravity/hub/${getAntigravityVersion()} (aidev_client; os_type=${osType}; arch=${arch}; cl=${cl})`;
 }
 
 // Per-wire-id request constants
@@ -49,6 +84,14 @@ export function getAntigravityUserAgent(): string {
 interface AntigravityModelWireProfile {
   readonly modelEnum?: string;
   readonly maxOutputTokens: number;
+  /**
+   * Telemetry label for the `used_claude` / `used_claude_conservative` request
+   * labels. The reference client honors a per-model compat value and falls back
+   * to the model-class test; a model whose billing identity differs from its
+   * id substring (a Claude-route Gemini id, or vice versa) declares it here
+   * instead of relying on `id.includes("claude")`.
+   */
+  readonly usageLabel?: string;
 }
 
 /**
@@ -104,6 +147,170 @@ export function antigravityWireModelId(modelId: string): string {
   if (modelId === "gemini-3.8-flash") return "gemini-3.8-flash-low";
   if (modelId === "gpt-oss-120b") return "gpt-oss-120b-medium";
   return modelId;
+}
+
+// Claude-route `anthropic-beta` passthrough (`interleaved-thinking`).
+
+/**
+ * The one beta the reference client adds on Claude reasoning routes
+ * (`google-gemini-cli.ts:601-603`). Named to match the vocabulary in
+ * `claude-betas.ts` (`ANTHROPIC_BETA_CAPABILITIES`) rather than re-spelled
+ * here; that module is the single owner of beta names, so this is a literal
+ * of an entry it already declares.
+ *
+ * UNCONFIRMED: that `daily-cloudcode-pa` gates Claude thinking on this header.
+ * The reference sends it, and a thinking request that omits it is untested
+ * against the live backend. It is only sent when the turn actually carries a
+ * thinking intent, so a non-thinking Claude route is byte-identical to before.
+ */
+export const ANTIGRAVITY_CLAUDE_THINKING_BETA = "interleaved-thinking-2025-05-14";
+
+/**
+ * Whether a Claude-via-Antigravity turn should advertise interleaved thinking.
+ *
+ * Thinking is "requested" in either of the two ways the canonical request can
+ * express it: an explicit enabled/adaptive `thinking_type`, or a thinking
+ * budget. `disabled` is excluded — it is an affirmative request for no
+ * thinking, not a thinking request.
+ */
+export function antigravityClaudeThinkingBeta(
+  request: { readonly reasoning?: ReasoningIntent | undefined },
+  isClaudeRoute: boolean,
+): string | undefined {
+  if (!isClaudeRoute) return undefined;
+  const reasoning = request.reasoning;
+  if (reasoning === undefined || reasoning === null) return undefined;
+  if (reasoning.thinking_type === "disabled") return undefined;
+  const wantsThinking =
+    reasoning.thinking_type === "enabled" ||
+    reasoning.thinking_type === "adaptive" ||
+    reasoning.budget_tokens !== undefined;
+  return wantsThinking ? ANTIGRAVITY_CLAUDE_THINKING_BETA : undefined;
+}
+
+// Tool schema normalization (`parametersJsonSchema` → `parameters`).
+
+/**
+ * Rewrites a tool schema that nests its real object schema under
+ * `parametersJsonSchema` into the bare schema Gemini expects.
+ *
+ * The reference client rewrites this spelling before the request goes out
+ * (`google-gemini-cli.ts:1196-1213`); without it the shared Gemini builder
+ * strips the unknown key and ships `{"type":"object"}`, so every declared
+ * property is dropped and the tool arrives unusable. Only a value under
+ * `parametersJsonSchema` (or `parameters`) that is itself a record is
+ * adopted — a stray non-object there must not replace a real schema.
+ *
+ * Returns the *same reference* when there is nothing to rewrite, so the
+ * request-level helper can detect "no change" without a deep compare.
+ */
+export function normalizeAntigravityToolSchema(schema: unknown): unknown {
+  if (!isRecord(schema)) return schema;
+  for (const key of ["parametersJsonSchema", "parameters"]) {
+    const nested = schema[key];
+    if (isRecord(nested)) return nested;
+  }
+  return schema;
+}
+
+/**
+ * Normalizes every declared tool's schema on a canonical request, returning a
+ * shallow copy of the request when anything changed and the original object
+ * otherwise.
+ *
+ * This has to run *before* `buildGeminiPayload`, not after: that builder
+ * passes `jsonSchema` through `sanitizeGeminiSchema`, whose key allowlist has
+ * no `parametersJsonSchema` entry, so the wrapper and the real schema inside it
+ * are both dropped and the declaration ships as `{"type":"object"}`. By the
+ * time the payload exists there is nothing left to recover.
+ *
+ * Only the `tools` array is copied; messages and controls are shared with the
+ * original request by reference.
+ */
+export function normalizeAntigravityToolSchemas(request: CanonicalRequest): CanonicalRequest {
+  const tools = request.tools;
+  if (tools === undefined || tools.length === 0) return request;
+  let changed = false;
+  const normalized = tools.map((tool) => {
+    const schema = normalizeAntigravityToolSchema(tool.jsonSchema);
+    if (schema === tool.jsonSchema) return tool;
+    changed = true;
+    return { ...tool, jsonSchema: schema };
+  });
+  return changed ? { ...request, tools: normalized } : request;
+}
+
+// Last-good-endpoint stickiness
+
+/**
+ * Endpoint that answered successfully most recently, per base URL.
+ *
+ * The reference client probes endpoints in a fixed order and remembers the one
+ * that last worked (`google-gemini-cli.ts:556-571,:1076-1081`), so a dead
+ * production host is not re-probed on every turn — only the first request after
+ * a failover pays the extra round trip.
+ *
+ * Keyed by base URL (not by account) because reachability is a property of the
+ * host the deployment talks to, and the value is only ever an endpoint this
+ * process has already resolved from that base.
+ */
+const lastGoodEndpoints = new Map<string, string>();
+const LAST_GOOD_ENDPOINT_MAX = 256;
+
+const DEFAULT_ORDER_INDEX = Number.MAX_SAFE_INTEGER;
+
+/**
+ * Records the endpoint that just served a successful turn. Call this with the
+ * `endpoint` reported by empty-stream recovery (or the URL that produced a
+ * non-empty stream) so the next turn can start there.
+ */
+export function rememberAntigravityEndpoint(baseUrl: string, endpoint: string): void {
+  if (typeof endpoint !== "string" || endpoint.length === 0) return;
+  lastGoodEndpoints.set(baseUrl, endpoint);
+  while (lastGoodEndpoints.size > LAST_GOOD_ENDPOINT_MAX) {
+    const oldest = lastGoodEndpoints.keys().next().value;
+    if (oldest === undefined) break;
+    lastGoodEndpoints.delete(oldest);
+  }
+}
+
+/** Clears the sticky endpoint for one base, or for every base when omitted. */
+export function resetAntigravityEndpointMemory(baseUrl?: string): void {
+  if (baseUrl === undefined) lastGoodEndpoints.clear();
+  else lastGoodEndpoints.delete(baseUrl);
+}
+
+/**
+ * Orders `endpoints` so the last one known to have worked is tried first.
+ *
+ * Pure with respect to the caller's list: every entry is preserved exactly
+ * once, only the order changes, and an endpoint no longer in the list (a base
+ * URL whose sandbox twin disappeared) is ignored rather than injected. A
+ * sticky entry equal to the first endpoint is a no-op, so the steady state is
+ * the caller's own order.
+ */
+export function orderAntigravityEndpoints(
+  baseUrl: string,
+  endpoints: readonly string[],
+): readonly string[] {
+  if (endpoints.length <= 1) return endpoints;
+  const sticky = lastGoodEndpoints.get(baseUrl);
+  if (sticky === undefined) return endpoints;
+  const index = endpoints.indexOf(sticky);
+  if (index <= 0) return endpoints;
+  return [sticky, ...endpoints.slice(0, index), ...endpoints.slice(index + 1)];
+}
+
+/**
+ * Position of `endpoint` in the caller's own endpoint order, used to log a
+ * failover without the caller re-deriving the list.
+ */
+export function antigravityEndpointOrderIndex(
+  endpoints: readonly string[],
+  endpoint: string,
+): number {
+  const index = endpoints.indexOf(endpoint);
+  return index < 0 ? DEFAULT_ORDER_INDEX : index;
 }
 
 // Model discovery (`v1internal:fetchAvailableModels`) — live catalog.

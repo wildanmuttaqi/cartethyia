@@ -1,10 +1,11 @@
 // Telemetry buffer: coalesces per-request telemetry into batched multi-row inserts.
-import { DrizzleTelemetryStore } from "../persistence/telemetry-store";
-import type { CartethyiaDatabase } from "../persistence/postgres";
+import { DrizzleTelemetryStore } from "../persistence/stores/telemetry-store";
+import type { CartethyiaDatabase } from "../persistence/db-handle";
 import { metrics } from "./metrics";
-import { DEFAULT_BOUNDS } from "../transport/resources";
-import { type SourceSurface, type UsageRecord } from "../transport/canonical-model";
+import { DEFAULT_BOUNDS } from "../config/network";
+import { type SourceSurface, type UsageRecord } from "../protocol/canonical-model";
 import { log } from "./logger";
+import { scrubSecrets } from "./redaction";
 
 /**
  * Buffered durable telemetry writer. Coalesces per-request telemetry into
@@ -24,6 +25,9 @@ export interface TelemetryEventInput {
   readonly requestId: string;
   readonly sourceSurface: SourceSurface;
   readonly requestedModel: string;
+  /** The model the upstream named in its own response, verbatim; absent when
+   * the response carried none. Never backfilled from `requestedModel`. */
+  readonly reportedModel?: string;
   /** Canonical reasoning effort the client asked for, when it asked for one. */
   readonly requestedEffort?: string;
   readonly endpoint?: string;
@@ -53,6 +57,12 @@ export interface TelemetryEventInput {
   readonly resolveMs?: number;
   readonly firstContentDeltaAtMs?: number;
   readonly lastEventAtMs?: number;
+  /**
+   * Why this request's drawer payloads are empty, or `captured`. Carried onto
+   * the telemetry row so a remote operator can read the reason from the request
+   * list instead of needing the server's logs.
+   */
+  readonly payloadCaptureState?: string;
 }
 
 function tokenCountToInt(value: number | "unavailable" | undefined): number | undefined {
@@ -95,8 +105,12 @@ function telemetryEventRow(event: TelemetryEventInput) {
   return {
     tenantId: event.tenantId,
     requestId: event.requestId,
+    // Stamped here, not by the reader. A row without it has no real time, and a
+    // reader that invented one made every such row look like it happened just now.
+    createdAt: new Date(),
     sourceSurface: event.sourceSurface,
     requestedModel: event.requestedModel,
+    reportedModel: event.reportedModel ?? null,
     requestedEffort: event.requestedEffort ?? null,
     endpoint: event.endpoint ?? null,
     apiKeyId: event.apiKeyId ?? null,
@@ -130,6 +144,7 @@ function telemetryEventRow(event: TelemetryEventInput) {
     tokensPerSec: event.tokensPerSec != null ? String(event.tokensPerSec) : null,
     firstContentDeltaAtMs: event.firstContentDeltaAtMs ?? null,
     lastEventAtMs: event.lastEventAtMs ?? null,
+    payloadCaptureState: event.payloadCaptureState ?? null,
   };
 }
 
@@ -148,7 +163,7 @@ const DRAIN_MAX_ATTEMPTS = 5;
 const DRAIN_RETRY_BASE_MS = 25;
 const DRAIN_RETRY_MAX_MS = 1_000;
 
-import { exponentialBackoff, type BackoffOptions } from "../runtime/backoff";
+import { exponentialBackoff, type BackoffOptions } from "../network/backoff";
 
 /** Exponential retry delay for the `attempt`-th retry, clamped to the ceiling. */
 function drainRetryDelayMs(attempt: number): number {
@@ -317,10 +332,13 @@ export class TelemetryBatchBuffer {
     for (let attempt = 0; attempt < DRAIN_MAX_ATTEMPTS; attempt += 1) {
       if (attempt > 0) {
         // Backoff compounds with the outage streak so consecutive failed
-        // drains probe the database less and less often.
+        // drains probe the database less and less often. Unref'd so a
+        // mid-shutdown backoff cannot hold the event loop open.
         const { promise, resolve } = Promise.withResolvers<void>();
-        setTimeout(resolve, drainRetryDelayMs(this.drainFailureStreak + attempt - 1));
+        const backoff = setTimeout(resolve, drainRetryDelayMs(this.drainFailureStreak + attempt - 1));
+        if (typeof backoff.unref === "function") backoff.unref();
         await promise;
+        if (this.stopped) return;
       }
       try {
         await this.store.insertEvents(rows);
@@ -357,9 +375,11 @@ export class TelemetryBatchBuffer {
     this.lastDrainOutageAt = now;
     this.suppressedDrainOutages = 0;
     log.error(
-      `[telemetry] failed to record batched events${suppressed > 0 ? ` (${suppressed} similar suppressed)` : ""}`,
-      retryError as Error,
-      firstError,
+      scrubSecrets(
+        `[telemetry] failed to record batched events${suppressed > 0 ? ` (${suppressed} similar suppressed)` : ""}`,
+      ),
+      retryError instanceof Error ? new Error(scrubSecrets(retryError.message)) : undefined,
+      typeof firstError === "string" ? scrubSecrets(firstError) : undefined,
     );
   }
 }

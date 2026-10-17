@@ -1,5 +1,5 @@
-import type { CredentialKind } from "../../provider-registry";
-import { GatewayError, capabilityUnsupported } from "../../../transport/gateway-error";
+import type { CredentialKind } from "../../provider-contracts";
+import { GatewayError, capabilityUnsupported } from "../../../protocol/gateway-error";
 
 export type AnthropicBetaInput = string | readonly string[] | undefined;
 
@@ -166,6 +166,22 @@ function targetSupports(
   options: AnthropicBetaNegotiationOptions,
   capabilities: Map<string, boolean>,
 ): boolean {
+  // Subscription credentials carry no long-context credit balance: Anthropic
+  // hard-429s any beta-gated 1M request, so the reference client never
+  // advertises it. A catalog that explicitly declares the capability opts
+  // back in.
+  if (beta.toLowerCase() === "context-1m-2025-08-07") {
+    // Subscription credentials carry no long-context credit balance: Anthropic
+    // hard-429s any beta-gated 1M request, so the reference client never
+    // advertises it. A catalog that explicitly declares the capability opts
+    // back in for OAuth only.
+    if (!credentialSupportsOauth(options.credential_kind)) return false;
+    const keys = [beta, `anthropic-beta:${beta}`, ...aliasesFor(beta)];
+    const declaredKey = keys.find((key) => capabilities.has(canonicalCapabilityName(key)));
+    if (declaredKey === undefined)
+      return false;
+    return capabilities.get(canonicalCapabilityName(declaredKey)) === true;
+  }
   const keys = [beta, `anthropic-beta:${beta}`, ...aliasesFor(beta)];
   const declaredKey = keys.find((key) => capabilities.has(canonicalCapabilityName(key)));
   if (declaredKey !== undefined) return capabilities.get(canonicalCapabilityName(declaredKey)) === true;

@@ -1,6 +1,6 @@
-import type { ServiceKind, WireFamily } from "../transport/canonical-model";
+import type { ServiceKind, WireFamily } from "../protocol/canonical-model";
 
-/** [OI]-compatible wire overrides persisted for bundled and BYOK providers. */
+/** OpenAI-compatible wire overrides persisted for bundled and BYOK providers. */
 export interface CompatibilityProfile {
   readonly extra_headers?: Readonly<Record<string, string>>;
   readonly extra_query_params?: Readonly<Record<string, string>>;
@@ -11,7 +11,7 @@ export interface CompatibilityProfile {
     readonly pattern: string;
     readonly wire_family: WireFamily;
   }>;
-  /** Whether requests to [OI]/Anthropic-compatible upstream should send official CLI headers. Defaults to true. */
+  /** Whether requests to OpenAI/Anthropic-compatible upstream should send official CLI headers. Defaults to true. */
   readonly cli_identity?: boolean;
   /**
    * Opts this provider into the gateway identity (`user-agent:
@@ -40,7 +40,7 @@ const RAW_BUNDLED_PROVIDER_METADATA = [
     id: "codex",
     displayName: "Codex ChatGPT",
     baseUrl: "https://chatgpt.com",
-    serviceKinds: ["llm", "websearch"],
+    serviceKinds: ["llm", "websearch", "imageGeneration"],
     wireFamilyDefault: "responses",
     hasAdapterUserAgent: true,
     credentialUrl: "https://chatgpt.com",
@@ -77,20 +77,11 @@ const RAW_BUNDLED_PROVIDER_METADATA = [
     },
   },
   {
-    // Devin frames its own gRPC chat protocol over a bespoke wire.
-    id: "devin",
-    displayName: "Devin",
-    baseUrl: "https://server.codeium.com",
-    bespokeWire: true,
-    hasAdapterUserAgent: true,
-    credentialUrl: "https://devin.ai",
-    credentialHint: "Signed in with a Devin account; there is no key to paste.",
-  },
-  {
     id: "antigravity",
     displayName: "Antigravity",
     baseUrl: "https://daily-cloudcode-pa.googleapis.com",
     hasAdapterUserAgent: true,
+    serviceKinds: ["llm", "websearch", "imageGeneration"],
     credentialUrl: "https://antigravity.google",
     credentialHint: "Signed in with a Google account through the Antigravity login flow.",
   },
@@ -117,19 +108,133 @@ const RAW_BUNDLED_PROVIDER_METADATA = [
     bespokeWire: true,
     hasAdapterUserAgent: true,
     credentialUrl: "https://kiro.dev",
-    credentialHint: "Sign in with AWS Builder ID, an Identity Center organization, Google/GitHub, or paste a Kiro API key.",
+    credentialHint: "Sign in with Google or GitHub in the browser, or use the device-code login with an Identity Center organization, then paste a Kiro API key if you prefer. Prompt caching is not reliably working for Kiro: the upstream recomputes the prompt on every turn, so cached-token savings should not be expected.",
   },
   { id: "kimi", displayName: "Kimi Code", baseUrl: "https://api.kimi.com/coding", credentialUrl: "https://platform.moonshot.ai/console/api-keys" },
-  { id: "opencodeft", displayName: "OpenCode Free", baseUrl: "https://opencode.ai", requiresAccount: false, ipScopedRateLimit: true, hasAdapterUserAgent: true },
-  { id: "opencodezen", displayName: "OpenCode Zen", baseUrl: "https://opencode.ai", hasAdapterUserAgent: true, credentialUrl: "https://opencode.ai/auth" },
-  { id: "opencodego", displayName: "OpenCode Go", baseUrl: "https://opencode.ai", credentialUrl: "https://opencode.ai/auth" },
+  { id: "opencode", displayName: "OpenCode Free", baseUrl: "https://opencode.ai", requiresAccount: false, ipScopedRateLimit: true, hasAdapterUserAgent: true },
+  { id: "opencode-zen", displayName: "OpenCode Zen", baseUrl: "https://opencode.ai", hasAdapterUserAgent: true, credentialUrl: "https://opencode.ai/auth" },
+  { id: "opencode-go", displayName: "OpenCode Go", baseUrl: "https://opencode.ai", credentialUrl: "https://opencode.ai/auth" },
   { id: "cerebras", displayName: "Cerebras", baseUrl: "https://api.cerebras.ai/v1", credentialUrl: "https://cloud.cerebras.ai/platform" },
   { id: "openrouter", displayName: "OpenRouter", baseUrl: "https://openrouter.ai/api/v1", credentialUrl: "https://openrouter.ai/settings/keys" },
   { id: "mistral", displayName: "Mistral AI", baseUrl: "https://api.mistral.ai/v1", credentialUrl: "https://console.mistral.ai/api-keys" },
   { id: "fireworks", displayName: "Fireworks AI", baseUrl: "https://api.fireworks.ai/inference/v1", credentialUrl: "https://fireworks.ai/account/api-keys" },
   { id: "nvidia", displayName: "NVIDIA NIM", baseUrl: "https://integrate.api.nvidia.com/v1", credentialUrl: "https://build.nvidia.com/settings/api-keys" },
-  { id: "deepseek", displayName: "DeepSeek", baseUrl: "https://api.deepseek.com", credentialUrl: "https://platform.deepseek.com/api_keys" },
+  // DeepSeek serves the Anthropic Messages wire at its own `/anthropic` root;
+  // the base URL stays the OpenAI-compatible host for `/v1/models` discovery,
+  // and the registry pins the Messages endpoint separately.
+  { id: "deepseek", displayName: "DeepSeek", baseUrl: "https://api.deepseek.com", wireFamilyDefault: "messages", credentialUrl: "https://platform.deepseek.com/api_keys" },
   { id: "gmi", displayName: "GMI Cloud", baseUrl: "https://api.gmi-serving.com/v1", credentialUrl: "https://console.gmicloud.ai" },
+
+  // OpenAI-compatible bearer aggregators. Each is a bare host already rooted at
+  // its own version prefix, so the `/v1`-prefixed wire paths stay pinned by the
+  // shared generic spec. Every one of these carries live `/v1/models` discovery
+  // instead of a hand-maintained catalog — see `default-registry.ts` — so the
+  // model list tracks upstream rather than this file.
+  { id: "groq", displayName: "Groq", baseUrl: "https://api.groq.com/openai/v1", credentialUrl: "https://console.groq.com/keys" },
+  { id: "together", displayName: "Together AI", baseUrl: "https://api.together.xyz/v1", credentialUrl: "https://api.together.ai/settings/api-keys" },
+  { id: "deepinfra", displayName: "DeepInfra", baseUrl: "https://api.deepinfra.com/v1/openai", credentialUrl: "https://deepinfra.com/api_keys" },
+  { id: "siliconflow", displayName: "SiliconFlow", baseUrl: "https://api.siliconflow.com/v1", credentialUrl: "https://cloud.siliconflow.cn/account/ak" },
+  { id: "siliconflowcn", displayName: "SiliconFlow CN", baseUrl: "https://api.siliconflow.cn/v1", credentialUrl: "https://cloud.siliconflow.cn/account/ak" },
+  { id: "novita", displayName: "Novita AI", baseUrl: "https://api.novita.ai/v3/openai", credentialUrl: "https://novita.ai/dashboard/key" },
+  { id: "venice", displayName: "Venice AI", baseUrl: "https://api.venice.ai/api/v1", credentialUrl: "https://venice.ai/api-keys" },
+  { id: "nanogpt", displayName: "NanoGPT", baseUrl: "https://api.nano-gpt.com/v1", credentialUrl: "https://nanogpt.com/api-keys" },
+  { id: "baseten", displayName: "Baseten", baseUrl: "https://inference.baseten.co/v1", credentialUrl: "https://app.baseten.co/settings/api_keys" },
+  { id: "synthetic", displayName: "Synthetic", baseUrl: "https://api.synthetic.new/v1", credentialUrl: "https://app.synthetic.new/api-keys" },
+  { id: "stepfun", displayName: "StepFun", baseUrl: "https://api.stepfun.com/v1", credentialUrl: "https://platform.stepfun.com/console/keys" },
+  { id: "sakana", displayName: "Sakana AI", baseUrl: "https://api.sakana.ai/v1", credentialUrl: "https://console.sakana.ai/api-keys" },
+  { id: "helmcode", displayName: "HelmCode", baseUrl: "https://api.helmcode.com/v1", credentialUrl: "https://helmcode.com/dashboard" },
+  { id: "coralbricks", displayName: "CoralBricks", baseUrl: "https://api.coralbricks.com/v1", credentialUrl: "https://coralbricks.com/api-keys" },
+  { id: "aiand", displayName: "ai&", baseUrl: "https://api.aiand.com/v1", credentialUrl: "https://console.aiand.com/api-keys" },
+  { id: "wafer", displayName: "Wafer Serverless", baseUrl: "https://pass.wafer.ai/v1", credentialUrl: "https://app.wafer.ai/usage" },
+
+  // Providers that are plain bearers on the wire but need one thing the shared
+  // spec cannot express.
+  {
+    // CoreWeave rejects every request that omits `OpenAI-Project: <team>/<project>`,
+    // so a bearer key alone is never sufficient. The value is per-account, so it
+    // is persisted in the account's `auth_state` and injected per dispatch
+    // rather than declared as a static header — one deployment may hold
+    // accounts on different teams. See the registry row.
+    id: "coreweave",
+    displayName: "CoreWeave Serverless",
+    baseUrl: "https://api.inference.wandb.ai/v1",
+    credentialUrl: "https://wandb.ai/settings",
+    credentialHint:
+      "Also set your CoreWeave project as <team>/<project> on the account; every request without the OpenAI-Project header is refused.",
+  },
+  {
+    // Routes at Zhipu's dedicated coding-plan surface rather than the general
+    // BigModel endpoint, so calls bill against plan quota and not account
+    // balance. Same base URL as the general product, different path prefix.
+    id: "zhipucoding",
+    displayName: "Zhipu Coding Plan",
+    baseUrl: "https://open.bigmodel.cn/api/coding/paas/v4",
+    credentialUrl: "https://bigmodel.cn/coding-plan/personal/overview",
+  },
+  {
+    // Fireworks' Fire Pass subscription tier: the same host and wire as
+    // `fireworks`, reached with a Fire Pass key. Registered separately so the
+    // two tiers can hold different accounts and different model rosters.
+    id: "firepass",
+    displayName: "Fireworks Fire Pass",
+    baseUrl: "https://api.fireworks.ai/inference/v1",
+    credentialUrl: "https://fireworks.ai/account/api-keys",
+    credentialHint: "Requires a Fire Pass subscription key, not a pay-as-you-go key.",
+  },
+  {
+    // Qwen Portal rejects a request carrying more than one system message with a
+    // 500 from its default chat template, so the registry coalesces them.
+    id: "qwen-portal",
+    displayName: "Qwen Portal",
+    baseUrl: "https://portal.qwen.ai/v1",
+    credentialUrl: "https://chat.qwen.ai",
+  },
+  {
+    // MiniMax serves its models over the Anthropic Messages wire at an
+    // `/anthropic` root, not the OpenAI chat wire. The token plans are the same
+    // surface with a subscription key rather than a pay-as-you-go one, so they
+    // are separate ids rather than one provider with two key kinds — their
+    // quotas and their rosters are reported separately.
+    id: "minimax",
+    displayName: "MiniMax",
+    baseUrl: "https://api.minimax.io/anthropic",
+    wireFamilyDefault: "messages",
+    credentialUrl: "https://platform.minimax.io/user-center/basic-information/interface-key",
+  },
+  {
+    id: "minimaxcode",
+    displayName: "MiniMax Token Plan",
+    baseUrl: "https://api.minimax.io/anthropic",
+    wireFamilyDefault: "messages",
+    credentialUrl: "https://platform.minimax.io/subscribe/token-plan",
+    credentialHint: "Requires a Token Plan subscription key, not a pay-as-you-go key.",
+  },
+  {
+    id: "minimaxcodecn",
+    displayName: "MiniMax Token Plan (China)",
+    baseUrl: "https://api.minimaxi.com/anthropic",
+    wireFamilyDefault: "messages",
+    credentialUrl: "https://platform.minimaxi.com/subscribe/token-plan",
+    credentialHint: "Mainland China endpoint; keys are not interchangeable with the international plan.",
+  },
+  {
+    // Umans is an Anthropic-Messages gateway that authenticates with
+    // `x-api-key` rather than a bearer envelope.
+    id: "umans",
+    displayName: "UMANS Coding Plan",
+    baseUrl: "https://api.code.umans.ai",
+    wireFamilyDefault: "messages",
+    credentialUrl: "https://umans.ai",
+  },
+  {
+    // Baidu's OpenAI-compatible surface is rooted at `/v2`, not `/v1`, so its
+    // chat path is `/chat/completions` below that root. It therefore cannot use
+    // the shared generic spec; the registry row pins the paths explicitly.
+    id: "qianfan",
+    displayName: "Qianfan",
+    baseUrl: "https://qianfan.baidubce.com/v2",
+    credentialUrl: "https://console.bce.baidu.com/qianfan/ais/console/apiKey",
+  },
   {
     // The Z.AI Coding Plan subscription endpoint is a dedicated coding-plan
     // surface: different base path, a durable key minted by the sign-in flow,
@@ -139,16 +244,54 @@ const RAW_BUNDLED_PROVIDER_METADATA = [
     baseUrl: "https://api.z.ai/api/coding/paas/v4",
     credentialUrl: "https://chat.z.ai",
   },
+  {
+    // Factory Droid's LLM proxy. The base URL is the global residency host; an
+    // EU account resolves to `api.eu.factory.ai` from the region recorded in
+    // account state, because the two hosts serve different accounts.
+    id: "factory",
+    displayName: "Factory Droid",
+    baseUrl: "https://api.factory.ai",
+    credentialUrl: "https://app.factory.ai",
+  },
+  {
+    // A gateway rather than a model host: the account and gateway slugs are
+    // path segments of the base URL and are stored with the token, so the
+    // origin below is the root the per-account URL is built from.
+    id: "cloudflareai",
+    displayName: "Cloudflare AI Gateway",
+    baseUrl: "https://gateway.ai.cloudflare.com",
+    credentialUrl: "https://dash.cloudflare.com/ai-gateway",
+  },
+  {
+    // Alibaba DashScope, the mainland host. Distinct from `alibabacp` (the
+    // Token Plan, on `token-plan.*.maas.aliyuncs.com`); the international
+    // DashScope host is `coding-intl.dashscope.aliyuncs.com`. Both are
+    // `/v1`-rooted, so the chat path is declared below that root.
+    id: "dashscope",
+    displayName: "Alibaba DashScope",
+    baseUrl: "https://coding.dashscope.aliyuncs.com/v1",
+    credentialUrl: "https://bailian.console.aliyun.com/?apiKey=1",
+  },
+  {
+    // Alibaba Token Plan. Two plans exist — international and mainland China —
+    // on different hosts whose keys are not interchangeable. The region travels
+    // with the token; the default below is the international host.
+    id: "alibabacp",
+    displayName: "Alibaba Coding Plan",
+    baseUrl: "https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1",
+    credentialUrl: "https://bailian.console.aliyun.com/",
+  },
   { id: "hermes", displayName: "Nous Research", baseUrl: "https://inference-api.nousresearch.com/v1", credentialUrl: "https://portal.nousresearch.com" },
   { id: "bai", displayName: "B.AI", baseUrl: "https://api.b.ai/v1", credentialUrl: "https://b.ai" },
-  { id: "inferhub", displayName: "InferHub", baseUrl: "https://api.inferhub.dev/v1", defaultBypassProxy: true, hasAdapterUserAgent: true },
+  { id: "inferhub", displayName: "InferHub", baseUrl: "https://api.inferhub.dev/v1", defaultSkipProxy: true },
   { id: "aihubmix", displayName: "AiHubMix", baseUrl: "https://aihubmix.com/v1", credentialUrl: "https://aihubmix.com/token" },
   { id: "tokenharbor", displayName: "TokenHarbor", baseUrl: "https://tokenharbor.ai/v1", credentialUrl: "https://tokenharbor.ai" },
   { id: "agentrouter", displayName: "AgentRouter", baseUrl: "https://agentrouter.org", hasAdapterUserAgent: true, credentialUrl: "https://agentrouter.org" },
-  { id: "cline", displayName: "Cline", baseUrl: "https://api.cline.bot/api/v1", hasAdapterUserAgent: true, credentialUrl: "https://app.cline.bot" },
-  { id: "cb", displayName: "CodeBuddy", baseUrl: "https://www.codebuddy.ai/v2", hasAdapterUserAgent: true, credentialUrl: "https://www.codebuddy.ai", credentialHint: "Sign in with the same CodeBuddy account you use in the desktop app." },
+  { id: "cline", displayName: "Cline", baseUrl: "https://api.cline.bot/api/v1", hasAdapterUserAgent: true, defaultSkipProxy: true, credentialUrl: "https://app.cline.bot" },
+  { id: "cb", displayName: "CodeBuddy", baseUrl: "https://www.codebuddy.ai/v2", hasAdapterUserAgent: true, serviceKinds: ["llm", "imageGeneration", "videoGeneration"], credentialUrl: "https://www.codebuddy.ai", credentialHint: "Sign in with the same CodeBuddy account you use in the desktop app." },
   { id: "cbcn", displayName: "CodeBuddy CN", baseUrl: "https://copilot.tencent.com/v2", hasAdapterUserAgent: true, credentialUrl: "https://copilot.tencent.com", credentialHint: "Sign in with the same CodeBuddy China account you use in the desktop app." },
-  { id: "workbuddy", displayName: "WorkBuddy", baseUrl: "https://www.workbuddy.ai", hasAdapterUserAgent: true, credentialUrl: "https://www.workbuddy.ai", credentialHint: "Sign in with the same WorkBuddy account you use in the desktop app." },
+  { id: "workbuddy", displayName: "WorkBuddy", baseUrl: "https://www.workbuddy.ai", hasAdapterUserAgent: true, serviceKinds: ["llm", "imageGeneration", "videoGeneration"], credentialUrl: "https://www.workbuddy.ai", credentialHint: "Sign in with the same WorkBuddy account you use in the desktop app." },
+  { id: "workbuddycn", displayName: "WorkBuddy CN", baseUrl: "https://www.workbuddy.cn", hasAdapterUserAgent: true, serviceKinds: ["llm", "imageGeneration", "videoGeneration"], credentialUrl: "https://www.workbuddy.cn", credentialHint: "Sign in with the same WorkBuddy China account you use in the desktop app." },
   {
     // Kilo Code resells the OpenRouter catalog. The base URL carries the API's
     // path prefix (`/api/openrouter`) and every model row carries only the wire
@@ -174,11 +317,9 @@ const RAW_BUNDLED_PROVIDER_METADATA = [
   },
   { id: "qoder", displayName: "Qoder", baseUrl: "https://api2.qoder.sh/algo/api/v2/service/pro/sse/agent_chat_generation?FetchKeys=llm_model_result&AgentId=agent_common&Encode=1", hasAdapterUserAgent: true, credentialUrl: "https://qoder.com/account/integrations", credentialHint: "Paste a Personal Access Token (pt-...) from the Qoder integrations page, or sign in with your Qoder account." },
   { id: "ollamacloud", displayName: "Ollama Cloud", baseUrl: "https://ollama.com/v1", credentialUrl: "https://ollama.com/settings/keys" },
-  { id: "gemini", displayName: "Google Gemini", baseUrl: "https://generativelanguage.googleapis.com/v1beta", serviceKinds: ["llm", "websearch"], credentialUrl: "https://aistudio.google.com/app/apikey" },
+  { id: "gemini", displayName: "Google Gemini", baseUrl: "https://generativelanguage.googleapis.com/v1beta", serviceKinds: ["llm", "websearch", "imageGeneration"], credentialUrl: "https://aistudio.google.com/app/apikey" },
   { id: "xiaomipg", displayName: "Xiaomi MiMo (PAYG)", baseUrl: "https://api.xiaomimimo.com/v1", credentialUrl: "https://platform.xiaomimimo.com" },
   { id: "xiaomitp", displayName: "Xiaomi MiMo (Token Plan)", baseUrl: "https://token-plan-sgp.xiaomimimo.com/v1", credentialUrl: "https://platform.xiaomimimo.com" },
-  { id: "mimodesktop", displayName: "MiMo Desktop", baseUrl: "https://api.xiaomimimo.com/v1", credentialUrl: "https://platform.xiaomimimo.com" },
-  { id: "mimostudio", displayName: "MiMo Studio", baseUrl: "https://aistudio.xiaomimimo.com", credentialUrl: "https://aistudio.xiaomimimo.com", credentialHint: "Paste the browser cookies exported from a signed-in MiMo Studio session." },
   {
     // GitHub Copilot. The registered base URL is the Individual API host and is
     // only a fallback: the account's real host is read out of the Copilot
@@ -193,51 +334,28 @@ const RAW_BUNDLED_PROVIDER_METADATA = [
   { id: "perplexity", displayName: "Perplexity", baseUrl: "https://api.perplexity.ai", credentialUrl: "https://www.perplexity.ai/settings/api" },
   // Native web-search providers expose only the search service. Their catalog
   // rows are served by `/v1/search`, never by the canonical chat pipeline.
-  { id: "exa", displayName: "Exa", baseUrl: "https://api.exa.ai", serviceKinds: ["websearch"], credentialUrl: "https://dashboard.exa.ai/api-keys", credentialHint: "Create an API key in the Exa dashboard." },
+  { id: "exa", displayName: "Exa", baseUrl: "https://mcp.exa.ai", serviceKinds: ["websearch"], requiresAccount: false, credentialHint: "No API key. Search goes through the public MCP." },
+  { id: "parallel", displayName: "Parallel", baseUrl: "https://search.parallel.ai", serviceKinds: ["websearch"], requiresAccount: false, credentialUrl: "https://platform.parallel.ai/settings?tab=api-keys", credentialHint: "Optional. Leave empty for the public MCP, or paste an API key for the higher-limit search API." },
 ] as const;
 
 /**
- * Providers whose adapter drives a provider-side web-search tool itself.
+ * Web search is a route of its own, never a model capability.
  *
- * Search capability is a property of the *provider*, not of a model row: the
- * adapter either frames a hosted `web_search` tool / grounding directive or it
- * does not, and every model it serves inherits that. It used to live on the
- * model row, where discovery wrote `false` for models it had no metadata for
- * — so a perfectly capable route was filtered out of native search by a
- * metadata gap.
+ * There used to be a manual list of providers "whose hosted search had been
+ * proven", and a `providerSupportsWebSearch` helper that consulted it. Both are
+ * gone. A model row no longer advertises search, and a provider serves search
+ * purely by declaring a `serviceKind: "websearch"` catalog row — which is what
+ * Exa, Parallel, and Gemini do. Those rows answer `POST /v1/search` and are
+ * never reached from a chat turn.
  *
- * Membership here is what marks a route `search_route: "native"`; everything
- * else runs the configured search fallback.
+ * The reason is that the flag was never a capability gate: `deriveRequiredCapabilities`
+ * deliberately does not derive `web_search`, so no chat request was ever
+ * filtered or degraded by it. Its only real effect was to smuggle `llm` rows
+ * (Codex, Antigravity) into the fallback candidate list as if they were search
+ * routes, and to show a badge in the console. The fallback is gone too: a chat
+ * turn is dispatched once to the route its model selects, and a hosted search
+ * declaration is answered by that upstream, not executed by the gateway.
  */
-const WEB_SEARCH_CAPABLE_PROVIDER_IDS: ReadonlySet<string> = new Set([
-  // Hosted Anthropic search tool on the Messages wire.
-  "claude",
-  "anthropic",
-  // Codex Responses hosted search.
-  "codex",
-  // Gemini grounding.
-  "gemini",
-  // Gemini wire with its own search plumbing.
-  "antigravity",
-  // Marketplace adapters that expose a search tool per upstream.
-  "devin",
-]);
-
-/**
- * True when this provider serves a provider-side web-search tool.
- *
- * A provider that is *only* a search provider (`serviceKinds: ["websearch"]`,
- * e.g. Exa) answers `POST /v1/search` but never a chat turn, so
- * it is not a native chat search route — it is a fallback source instead.
- */
-export function providerSupportsWebSearch(providerId: string): boolean {
-  const id = providerId.toLowerCase();
-  if (WEB_SEARCH_CAPABLE_PROVIDER_IDS.has(id)) return true;
-  const kinds = providerServiceKinds(id);
-  // An adapter that also implements `websearch` speaks search on a chat wire.
-  return kinds.includes("websearch") && kinds.includes("llm");
-}
-
 export type BundledProviderId = (typeof RAW_BUNDLED_PROVIDER_METADATA)[number]["id"];
 
 /**
@@ -249,7 +367,7 @@ export type BundledProviderId = (typeof RAW_BUNDLED_PROVIDER_METADATA)[number]["
  * get added in one place and silently missed in the others. Declared here
  * beside the identities it names; the layers keep their own *policies*.
  */
-export const BUDDY_PROVIDER_IDS: ReadonlySet<string> = new Set(["cb", "cbcn", "workbuddy"]);
+export const BUDDY_PROVIDER_IDS: ReadonlySet<string> = new Set(["cb", "cbcn", "workbuddy", "workbuddycn"]);
 
 /**
  * Per-provider JWT verification defaults for issued OAuth access tokens. An
@@ -284,9 +402,11 @@ export interface BundledProviderMetadata {
    * self-explanatory.
    */
   readonly credentialHint?: string;
+  /** Presentation-only limitation shown on the provider detail page. */
+  readonly operatorNotice?: string;
   readonly wireFamilyDefault: WireFamily;
   readonly requiresAccount: boolean;
-  readonly defaultBypassProxy: boolean;
+  readonly defaultSkipProxy: boolean;
   /**
    * Whether this provider's rate limits are keyed on the *egress address*
    * rather than on a credential.
@@ -310,7 +430,7 @@ export interface BundledProviderMetadata {
   /**
    * The provider's adapter frames its own wire protocol instead of going
    * through one of the gateway's canonical codecs (chat / responses /
-   * messages). Devin and Kiro are the bundled cases: they encode requests
+   * messages). Kiro is the bundled case: it encodes requests
    * by hand, so a part their codec does not handle is dropped rather than
    * encoded, and generation controls reach them raw.
    */
@@ -323,7 +443,7 @@ export interface BundledProviderMetadata {
 export const BUNDLED_PROVIDER_METADATA: readonly BundledProviderMetadata[] = RAW_BUNDLED_PROVIDER_METADATA.map((definition) => {
   const wireFamilyDefault: WireFamily = "wireFamilyDefault" in definition ? definition.wireFamilyDefault : "chat";
   const requiresAccount = "requiresAccount" in definition ? definition.requiresAccount : true;
-  const defaultBypassProxy = Boolean("defaultBypassProxy" in definition && definition.defaultBypassProxy);
+  const defaultSkipProxy = Boolean("defaultSkipProxy" in definition && definition.defaultSkipProxy);
   const ipScopedRateLimit = Boolean("ipScopedRateLimit" in definition && definition.ipScopedRateLimit);
   const jwtVerification: ProviderJwtVerification =
     "jwtVerification" in definition ? definition.jwtVerification : {};
@@ -335,7 +455,7 @@ export const BUNDLED_PROVIDER_METADATA: readonly BundledProviderMetadata[] = RAW
     serviceKinds,
     wireFamilyDefault,
     requiresAccount,
-    defaultBypassProxy,
+    defaultSkipProxy,
     ipScopedRateLimit,
     jwtVerification,
     bespokeWire,
@@ -369,6 +489,11 @@ export function providerCredentialHint(providerId: string): string | undefined {
   return BUNDLED_PROVIDER_METADATA.find((candidate) => candidate.id === providerId)?.credentialHint;
 }
 
+/** Presentation-only limitation for the provider detail page. */
+export function providerOperatorNotice(providerId: string): string | undefined {
+  return BUNDLED_PROVIDER_METADATA.find((candidate) => candidate.id === providerId)?.operatorNotice;
+}
+
 /** Canonical builtin display name; falls back to the provider id for unknowns. */
 export function providerDisplayName(providerId: string): string {
   return (
@@ -376,9 +501,30 @@ export function providerDisplayName(providerId: string): string {
     providerId
   );
 }
-/** Canonical service surfaces; unknown/custom providers default to LLM. */
+
+/**
+ * Canonical service surfaces a provider can serve.
+ *
+ * A bundled provider gets exactly what its manifest declares. A custom/BYOK
+ * provider has no manifest row, and this is where its capability comes from:
+ * `llm` alone is read as "every media surface this gateway knows", so a
+ * third-party provider can serve image and video generation without the
+ * gateway having to be taught its id.
+ *
+ * That widening is deliberate rather than a default of `["llm"]`, because a
+ * BYOK provider points at an operator-chosen base URL — the operator already
+ * decided what it is, and the alternative silently locked every custom provider
+ * out of the generation routes no matter what its upstream actually answers.
+ * The upstream still decides: a request for a capability the remote does not
+ * have comes back as that remote's own error, not a gateway-side refusal.
+ */
 export function providerServiceKinds(providerId: string): readonly ServiceKind[] {
-  return BUNDLED_PROVIDER_METADATA.find((candidate) => candidate.id === providerId)?.serviceKinds ?? ["llm"];
+  const declared = BUNDLED_PROVIDER_METADATA.find((candidate) => candidate.id === providerId)
+    ?.serviceKinds;
+  // Bundled providers are explicit: they say which surfaces they serve, and a
+  // bundled provider without the declaration serves LLM only.
+  if (declared !== undefined) return declared;
+  return ["llm", "imageGeneration", "videoGeneration"];
 }
 
 
@@ -391,21 +537,21 @@ export function providerBaseUrl(providerId: string): string {
 
 /** Wire-path compatibility overrides owned by the canonical provider registry. */
 export const PROVIDER_COMPATIBILITY_PROFILES: Record<string, CompatibilityProfile> = {
-  opencodeft: {
+  opencode: {
     endpoint_paths_by_wire_family: {
-      chat: "/zen/v1/chat/completions",
-      responses: "/zen/v1/responses",
+      chat: "/inference/v1/chat/completions",
+      responses: "/inference/v1/responses",
     },
     model_wire_families: [{ pattern: "^muse-spark", wire_family: "responses" }],
   },
-  opencodezen: {
+  "opencode-zen": {
     endpoint_paths_by_wire_family: {
-      chat: "/zen/v1/chat/completions",
-      responses: "/zen/v1/responses",
+      chat: "/inference/v1/chat/completions",
+      responses: "/inference/v1/responses",
     },
     model_wire_families: [{ pattern: "^muse-spark", wire_family: "responses" }],
   },
-  opencodego: {
+  "opencode-go": {
     endpoint_paths_by_wire_family: {
       chat: "/zen/go/v1/chat/completions",
       responses: "/zen/go/v1/responses",
@@ -451,9 +597,9 @@ export function providerUpstreamHost(providerId: string): { readonly hostname: s
   return { hostname: url.hostname, port: url.port ? Number(url.port) : url.protocol === "http:" ? 80 : 443 };
 }
 
-/** Default proxy bypass providers. */
-export const DEFAULT_PROXY_BYPASS_PROVIDER_IDS: ReadonlySet<string> = new Set(
-  BUNDLED_PROVIDER_METADATA.filter((entry) => entry.defaultBypassProxy === true).map((entry) => entry.id),
+/** Default proxy-skip providers. */
+export const DEFAULT_PROXY_SKIP_PROVIDER_IDS: ReadonlySet<string> = new Set(
+  BUNDLED_PROVIDER_METADATA.filter((entry) => entry.defaultSkipProxy === true).map((entry) => entry.id),
 );
 
 /** Providers whose rate limits follow the egress address, not a credential. */
@@ -474,126 +620,4 @@ const IP_SCOPED_RATE_LIMIT_PROVIDER_IDS: ReadonlySet<string> = new Set(
  */
 export function providerRateLimitIsIpScoped(providerId: string | undefined): boolean {
   return providerId !== undefined && IP_SCOPED_RATE_LIMIT_PROVIDER_IDS.has(providerId);
-}
-
-// ---------------------------------------------------------------------------
-// Third-party response validation
-//
-// Provider adapters decode payloads from external services. Even when a
-// transport schema validates *structure*, the *content* is untrusted: a
-// compromised or misbehaving upstream can return oversized arrays, control
-// characters, non-finite numbers, or a base URL that redirects authenticated
-// follow-up traffic to an attacker-controlled host. These helpers bound and
-// sanitize that data before it reaches routing, storage, or the next outbound
-// request (OWASP API10:2023 — Unsafe Consumption of APIs).
-// ---------------------------------------------------------------------------
-
-/** Default cap for a single upstream-provided label or identifier. */
-export const MAX_UPSTREAM_LABEL_LENGTH = 256;
-/** Default cap for an upstream-provided list (models, accounts, tools). */
-export const MAX_UPSTREAM_LIST_ITEMS = 10_000;
-
-// All C0/C1 controls including newlines — for labels/identifiers.
-const LABEL_UNSAFE_CONTROL = /[\u0000-\u001F\u007F-\u009F]/g;
-
-function clean(value: unknown, pattern: RegExp, maxLength: number): string | undefined {
-  if (typeof value !== "string") return undefined;
-  const trimmed = value.replace(pattern, "").trim();
-  if (trimmed.length === 0) return undefined;
-  return trimmed.length > maxLength ? trimmed.slice(0, maxLength) : trimmed;
-}
-
-/**
- * Sanitizes an upstream identifier/label: removes every control character
- * (including newlines), trims, and caps length. Returns `undefined` when
- * nothing usable remains.
- */
-export function sanitizeUpstreamLabel(
-  value: unknown,
-  maxLength = MAX_UPSTREAM_LABEL_LENGTH,
-): string | undefined {
-  return clean(value, LABEL_UNSAFE_CONTROL, maxLength);
-}
-
-export interface UpstreamNumberBounds {
-  readonly min?: number;
-  readonly max?: number;
-}
-
-/**
- * Parses and range-checks an upstream numeric field. Returns `undefined` for
- * non-numeric, non-finite, or out-of-range values so callers apply their own
- * fallback instead of trusting an attacker-controlled number.
- */
-export function boundedUpstreamNumber(
-  value: unknown,
-  bounds: UpstreamNumberBounds = {},
-): number | undefined {
-  const parsed =
-    typeof value === "number"
-      ? value
-      : typeof value === "string" && value.trim().length > 0
-        ? Number(value)
-        : Number.NaN;
-  if (!Number.isFinite(parsed)) return undefined;
-  const min = bounds.min ?? Number.NEGATIVE_INFINITY;
-  const max = bounds.max ?? Number.POSITIVE_INFINITY;
-  if (parsed < min || parsed > max) return undefined;
-  return parsed;
-}
-
-/**
- * Bounds an upstream array to `maxItems`. An over-long array is truncated
- * rather than rejected so a single unexpected entry cannot discard an
- * otherwise usable catalog. The typed overload preserves the element type for
- * callers that already decoded a schema; the untyped overload returns
- * `undefined` when the value is not an array.
- */
-export function boundedUpstreamArray<T>(value: readonly T[], maxItems?: number): readonly T[];
-export function boundedUpstreamArray(
-  value: unknown,
-  maxItems?: number,
-): readonly unknown[] | undefined;
-export function boundedUpstreamArray(
-  value: unknown,
-  maxItems = MAX_UPSTREAM_LIST_ITEMS,
-): readonly unknown[] | undefined {
-  if (!Array.isArray(value)) return undefined;
-  const items = value as readonly unknown[];
-  return items.length > maxItems ? items.slice(0, maxItems) : items;
-}
-
-export interface UpstreamBaseUrlOptions {
-  /** Allow `http:` in addition to `https:` (private/dev upstreams only). */
-  readonly allowHttp?: boolean;
-  /** When set, the URL host must be one of these exact hosts. */
-  readonly allowedHosts?: readonly string[];
-}
-
-/**
- * Validates an upstream-supplied absolute base URL. Only `https:` (or `http:`
- * when explicitly allowed) is accepted; embedded credentials and fragments are
- * rejected so a malicious upstream cannot redirect authenticated requests to a
- * different origin or downgrade transport. Returns the normalized URL without a
- * trailing slash, or `undefined` when invalid.
- */
-export function validateUpstreamBaseUrl(
-  value: unknown,
-  options: UpstreamBaseUrlOptions = {},
-): string | undefined {
-  const raw = sanitizeUpstreamLabel(value, 2_048);
-  if (!raw) return undefined;
-  let url: URL;
-  try {
-    url = new URL(raw);
-  } catch {
-    return undefined;
-  }
-  if (url.username.length > 0 || url.password.length > 0) return undefined;
-  if (url.protocol !== "https:" && !(options.allowHttp === true && url.protocol === "http:")) {
-    return undefined;
-  }
-  if (options.allowedHosts && !options.allowedHosts.includes(url.hostname)) return undefined;
-  url.hash = "";
-  return url.toString().replace(/\/+$/, "");
 }

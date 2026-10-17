@@ -29,14 +29,20 @@
  *   idempotent. There is no unique constraint to lean on: `telemetry_events`
  *   has a random PK, so the natural key is checked explicitly.
  */
-import { and, eq, inArray, sql } from "drizzle-orm";
+import { and, eq, sql } from "drizzle-orm";
+import { gzipSync, gunzipSync } from "node:zlib";
+import { differsFrom } from "../../persistence/dialect";
+import { readTelemetryEvents, TELEMETRY_EVENT_DIR } from "../../observability/event-log";
+import { appendFile, mkdir } from "node:fs/promises";
 import { getTableColumns, type Column, type SQL, type Table } from "drizzle-orm";
-import type { CartethyiaDatabase } from "../../persistence/postgres";
+import type { CartethyiaDatabase } from "../../persistence/db-handle";
+import { decryptCredentialToString, encryptCredential } from "../../security/crypto";
 import {
   apiKeys,
   cliToolMappings,
   cliToolSettings,
   consoleSettings,
+  consoleUsers,
   healthEvents,
   modelAliases,
   modelCombos,
@@ -48,7 +54,7 @@ import {
   providerRoutingSettings,
   providers,
   shareLinks,
-  studioSessions,
+  sharePopups,
   tenantDisabledModels,
   telemetryEvents,
   telemetryUsageTotals,
@@ -63,6 +69,8 @@ import {
   columnNames,
   ownershipOf,
   replaceModeOf,
+  payloadNameOf,
+  sealedColumns,
   tableName,
   type BackupBytes,
   type BackupDate,
@@ -71,6 +79,33 @@ import {
   type BackupRow,
   type ValidatedRestore,
 } from "./contracts";
+
+/** The driver's `Buffer` view of a `bytea` cell, or null when it holds none. */
+function toBuffer(value: unknown): Buffer | null {
+  if (Buffer.isBuffer(value)) return value;
+  if (value instanceof Uint8Array) return Buffer.from(value);
+  return null;
+}
+
+/**
+ * A sealed column, as the payload carries it: the plaintext.
+ *
+ * The ciphertext is deliberately *not* what travels — see
+ * {@link sealedColumns} for why. Ciphertext this install's key cannot open
+ * (sealed before a key rotation, or copied in from another install's database)
+ * exports as null rather than as its bytes: writing those bytes as text would
+ * put an unopenable string in the file, which a restore would then re-seal as
+ * though it were the secret itself.
+ */
+function decodeSealedForPayload(value: unknown): string | null {
+  const bytes = toBuffer(value);
+  if (bytes === null) return null;
+  try {
+    return decryptCredentialToString(bytes);
+  } catch {
+    return null;
+  }
+}
 
 /** Encodes one cell into a JSON-safe value. */
 function encodeCell(value: unknown, dataType: string): unknown {
@@ -82,13 +117,50 @@ function encodeCell(value: unknown, dataType: string): unknown {
       : ({ __date: date.toISOString() } satisfies BackupDate);
   }
   if (dataType === "custom") {
-    if (Buffer.isBuffer(value)) return { __bytes: value.toString("base64") } satisfies BackupBytes;
-    if (value instanceof Uint8Array) {
-      return { __bytes: Buffer.from(value).toString("base64") } satisfies BackupBytes;
-    }
-    return null;
+    const bytes = toBuffer(value);
+    if (bytes === null) return null;
+    return { __bytes: bytes.toString("base64") } satisfies BackupBytes;
   }
   return value;
+}
+/**
+ * Adds the `providerConnections` block a router export carries.
+ *
+ * The row tables above are the restore path; this block is the interchange
+ * shape another Cartethyia install (or a router migration) reads accounts from,
+ * so it keeps its own field names — `accessToken`, not
+ * `credential_ciphertext`. Both are built from the same decrypted values, so
+ * there is one decode and two projections of it rather than a second read.
+ */
+function attachOauthSecrets(
+  config: Record<string, readonly BackupRow[]>,
+): readonly Record<string, unknown>[] | undefined {
+  const accounts = config.provider_accounts;
+  const states = config.provider_oauth_states;
+  if (!Array.isArray(accounts)) return undefined;
+  const byAccount = new Map((states ?? []).map((state) => [String(state.provider_account_id), state]));
+  return accounts.map((account) => {
+    const state = byAccount.get(String(account.id));
+    return {
+      id: account.id,
+      provider: account.provider_id,
+      authType: account.credential_kind,
+      name: account.label,
+      accessToken: account.access_token ?? null,
+      refreshToken: state?.refresh_token ?? null,
+      clientSecret: state?.client_secret ?? null,
+      expiresAt: dateText(state?.expires_at),
+      isActive: account.status === "active",
+      createdAt: dateText(account.created_at),
+      providerSpecificData: account.auth_state ?? {},
+    };
+  });
+}
+
+function dateText(value: unknown): string | null {
+  if (typeof value !== "object" || value === null || !("__date" in value)) return null;
+  const date = value.__date;
+  return typeof date === "string" ? date : null;
 }
 
 /** Decodes one payload cell back to what the driver expects for that column. */
@@ -150,7 +222,7 @@ function ownedByFilter(table: Table, tenantId: string): SQL {
     const parentOwner = ownershipOwnerColumn(ownership.parent);
     const mine = sql`${ownership.column} in (select ${ownership.parentColumn} from ${ownership.parent} where ${parentOwner} = ${tenantId})`;
     const shared = sql`${ownership.column} in (select ${ownership.parentColumn} from ${ownership.parent} where ${parentOwner} is null)`;
-    const unreproducible = sql`${ownership.authoredColumn} is distinct from ${ownership.reproducibleValue}`;
+    const unreproducible = differsFrom(sql`${ownership.authoredColumn}`, sql`${ownership.reproducibleValue}`);
     return sql`(${mine} or (${shared} and ${unreproducible}))`;
   }
   return eq(ownership.column, tenantId);
@@ -175,6 +247,7 @@ async function exportTable(
   tenantId: string,
 ): Promise<BackupRow[]> {
   const index = columnIndex(table);
+  const sealed = sealedColumns(table);
   const rows = (await db
     .select()
     .from(table)
@@ -182,7 +255,14 @@ async function exportTable(
     .limit(MAX_ROWS_PER_TABLE)) as Array<Record<string, unknown>>;
   return rows.map((row) => {
     const out: BackupRow = {};
-    for (const [name, { key, dataType }] of index) out[name] = encodeCell(row[key], dataType);
+    for (const [name, { key, dataType }] of index) {
+      // A sealed column is written decrypted, under the name of the secret it
+      // holds — see `SEALED_COLUMNS` for why the column's own name would be a
+      // lie in a file that no longer carries its ciphertext.
+      out[payloadNameOf(table, name)] = sealed.has(name)
+        ? decodeSealedForPayload(row[key])
+        : encodeCell(row[key], dataType);
+    }
     return out;
   });
 }
@@ -207,13 +287,20 @@ export async function exportBackup(
   const telemetrySet = new Set<Table>(TELEMETRY_TABLES);
 
   for (const table of tables) {
-    const rows = await exportTable(db, table, tenantId);
+    const rows = table === telemetryEvents
+      ? await exportEventFile(tenantId)
+      : await exportTable(db, table, tenantId);
     const name = tableName(table);
     counts[name] = rows.length;
     if (configSet.has(table)) config[name] = rows;
     else if (telemetrySet.has(table)) telemetry[name] = rows;
   }
-
+  // Always built: the row tables above now always carry the credentials
+  // decrypted, so the projection is always complete. It used to be conditional
+  // on the export being "raw", which made a plain JSON export carry a block of
+  // null tokens — a router migration from it produced accounts with no
+  // credential at all.
+  const providerConnections = attachOauthSecrets(config);
   const payload: BackupPayload = {
     app: BACKUP_APP,
     version: BACKUP_VERSION,
@@ -222,20 +309,115 @@ export async function exportBackup(
       ...(Object.keys(config).length > 0 ? { config } : {}),
       ...(Object.keys(telemetry).length > 0 ? { telemetry } : {}),
     },
+    ...(providerConnections === undefined ? {} : { providerConnections }),
   };
   return { counts, payload };
+}
+/**
+ * Gzips a backup payload.
+ *
+ * `compressed` is a property of the *file*, and of nothing else: the payload is
+ * the same object either way. It used to also mean "decrypt the credentials",
+ * which coupled a transport choice to a security decision and left the plain
+ * JSON export carrying ciphertext no other install could open.
+ */
+export function compressBackup(payload: unknown): Buffer {
+  return gzipSync(Buffer.from(JSON.stringify(payload), "utf8"));
+}
+
+/** The gzip magic, so a file can be recognised without trusting its name. */
+const GZIP_MAGIC = [0x1f, 0x8b] as const;
+
+/** Whether `bytes` starts with the gzip magic. */
+export function isGzipBytes(bytes: Uint8Array): boolean {
+  return GZIP_MAGIC.every((byte, index) => bytes[index] === byte);
+}
+
+/**
+ * Undoes {@link compressBackup}.
+ *
+ * A restore has to accept the file the export actually produces. The dashboard
+ * offers a compressed download and names it `.json.gz`, and until now that file
+ * could not be restored at all: the import path read the body as JSON text and
+ * `JSON.parse` of gzip bytes fails, so the operator's own backup — the only one
+ * they had — was rejected as "not a JSON backup".
+ *
+ * A file that is not gzipped is returned unchanged rather than refused, because
+ * a plain `.json` export is equally restorable and the bytes are the only thing
+ * that distinguishes them.
+ */
+export function decompressBackup(bytes: Uint8Array): string {
+  if (!isGzipBytes(bytes)) return Buffer.from(bytes).toString("utf8");
+  try {
+    return gunzipSync(bytes).toString("utf8");
+  } catch (error) {
+    throw new Error(
+      `that file is named or marked as gzip but could not be decompressed: ${error instanceof Error ? error.message : String(error)}`,
+    );
+  }
+}
+
+/**
+ * Exports per-request events from the file log, shaped like the table the
+ * backup contract still names. The table is no longer written, so reading it
+ * would export nothing.
+ */
+async function exportEventFile(tenantId: string): Promise<readonly BackupRow[]> {
+  const events = await readTelemetryEvents();
+  return events
+    .filter((event) => event.tenantId === tenantId)
+    .slice(0, MAX_ROWS_PER_TABLE)
+    .map((event) => {
+      const row: BackupRow = {};
+      for (const [key, value] of Object.entries(event)) {
+        if (value === null || value === undefined) continue;
+        row[camelToSnake(key)] = key === "createdAt" ? { __date: String(value) } : value;
+      }
+      return row;
+    });
+}
+
+function camelToSnake(name: string): string {
+  return name.replace(/[A-Z]/g, (char) => `_${char.toLowerCase()}`);
+}
+
+/**
+ * Re-seals one secret column under **this** install's key.
+ *
+ * The payload carries the plaintext (see {@link sealedColumns}), so every
+ * restore writes ciphertext the importing install can actually open. This is
+ * the step whose absence destroyed the receiving install's credentials: the
+ * file's bytes were inserted verbatim after the install's own rows had been
+ * deleted, so the restored configuration held secrets sealed under a key that
+ * was not in the room.
+ *
+ * A null cell is null again — every sealed column is nullable, and "this
+ * account has no stored credential" is a state the schema has to represent.
+ * Validation drops any other non-string cell before it gets here, so a
+ * non-string is a contract break rather than a case to coerce.
+ */
+function sealSecret(value: unknown, table: string, column: string): Buffer | null {
+  if (value === null || value === undefined) return null;
+  if (typeof value !== "string") {
+    throw new Error(`${table}.${column} must be restored as a plaintext string, got ${typeof value}`);
+  }
+  return encryptCredential(value);
 }
 
 /** Builds a Drizzle row object from a payload row, coercing each cell. */
 function toValues(table: Table, row: BackupRow): Record<string, unknown> {
   const index = columnIndex(table);
   const allowed = columnNames(table);
+  const sealed = sealedColumns(table);
+  const name = tableName(table);
   const values: Record<string, unknown> = {};
-  for (const [name, cell] of Object.entries(row)) {
-    if (!allowed.has(name)) throw new Error(`${tableName(table)}.${name} is not a known column`);
-    const entry = index.get(name);
+  for (const [column, cell] of Object.entries(row)) {
+    if (!allowed.has(column)) throw new Error(`${name}.${column} is not a known column`);
+    const entry = index.get(column);
     if (entry === undefined) continue;
-    values[entry.key] = decodeCell(cell, entry.dataType);
+    values[entry.key] = sealed.has(column)
+      ? sealSecret(cell, name, column)
+      : decodeCell(cell, entry.dataType);
   }
   return values;
 }
@@ -271,38 +453,37 @@ function createdAtIso(value: unknown): string {
  * timestamps are normalised in SQL to the same ISO spelling the payload uses,
  * so the two sides are comparable regardless of how the driver types them.
  */
-async function existingTelemetryKeys(
-  db: CartethyiaDatabase,
-  rows: readonly BackupRow[],
-): Promise<Set<string>> {
-  const requestIds = [
-    ...new Set(
-      rows.map((row) => row.request_id).filter((id): id is string => typeof id === "string"),
-    ),
-  ];
-  if (requestIds.length === 0) return new Set();
-  // Scope the read to the rows being restored instead of loading the tenant's
-  // whole retained history. An unfiltered read grows with the tenant's
-  // telemetry, so a restore into a long-lived database fetched far more than it
-  // compared — and the request ids are what identify the rows anyway. Chunked
-  // to stay under the protocol's bind-parameter limit; served by
-  // `telemetry_events_request_id_idx`.
-  const CHUNK = 1000;
-  const existing: Array<{ tenantId: string; requestId: string; createdAt: string }> = [];
-  for (let offset = 0; offset < requestIds.length; offset += CHUNK) {
-    const chunk = requestIds.slice(offset, offset + CHUNK);
-    existing.push(
-      ...(await db
-        .select({
-          tenantId: telemetryEvents.tenantId,
-          requestId: telemetryEvents.requestId,
-          createdAt: sql<string>`to_char(${telemetryEvents.createdAt} at time zone 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"')`,
-        })
-        .from(telemetryEvents)
-        .where(inArray(telemetryEvents.requestId, chunk))),
-    );
+/** Natural keys already present in the event file, so a re-import skips them. */
+async function existingEventFileKeys(rows: readonly BackupRow[]): Promise<Set<string>> {
+  const wanted = new Set(rows.map((row) => row.request_id).filter((id): id is string => typeof id === "string"));
+  if (wanted.size === 0) return new Set();
+  const events = await readTelemetryEvents();
+  return new Set(
+    events
+      .filter((event) => wanted.has(event.requestId))
+      .map((event) => `${event.tenantId ?? ""}\u0000${event.requestId}\u0000${event.createdAt}`),
+  );
+}
+
+/** Appends restored events to the file log, in the shape the writer uses. */
+async function appendRestoredEvents(rows: readonly BackupRow[]): Promise<void> {
+  if (rows.length === 0) return;
+  await mkdir(TELEMETRY_EVENT_DIR, { recursive: true });
+  const lines = rows.map((row) => JSON.stringify(snakeToCamelRecord(row)));
+  await appendFile(`${TELEMETRY_EVENT_DIR}/restored.jsonl`, `${lines.join("\n")}\n`, "utf8");
+}
+
+function snakeToCamelRecord(row: BackupRow): Record<string, unknown> {
+  const out: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(row)) {
+    const camel = key.replace(/_([a-z])/g, (_match, char: string) => char.toUpperCase());
+    out[camel] = isDateCell(value) ? value.__date : value;
   }
-  return new Set(existing.map((row) => `${row.tenantId}\u0000${row.requestId}\u0000${row.createdAt}`));
+  return out;
+}
+
+function isDateCell(value: unknown): value is BackupDate {
+  return typeof value === "object" && value !== null && "__date" in value;
 }
 
 /**
@@ -488,14 +669,11 @@ export async function applyRestore(
       const entry = validation.tables.get(table);
       if (entry === undefined) continue;
       if (table === telemetryEvents) {
-        const existing = await existingTelemetryKeys(scoped, entry.rows);
-        restored[tableName(table)] = await insertRows(scoped, table, entry.rows, {
-          skipKeys: existing,
-          keyOf: telemetryKey,
-        });
-        skipped[tableName(table)] = entry.rows.filter((row) =>
-          existing.has(telemetryKey(row)),
-        ).length;
+        const existing = await existingEventFileKeys(entry.rows);
+        const fresh = entry.rows.filter((row) => !existing.has(telemetryKey(row)));
+        await appendRestoredEvents(fresh);
+        restored[tableName(table)] = fresh.length;
+        skipped[tableName(table)] = entry.rows.length - fresh.length;
       } else if (table === telemetryUsageTotals) {
         const restoredCount = await insertRows(scoped, table, entry.rows, {
           conflictTarget: [
@@ -575,6 +753,7 @@ export async function deleteAll(
     if (all || selected.has("configuration")) {
       await remove(cliToolMappings, direct(cliToolMappings));
       await remove(cliToolSettings, direct(cliToolSettings));
+      await remove(sharePopups, sql`${sharePopups.apiKeyId} in (select ${apiKeys.id} from ${apiKeys} where ${apiKeys.tenantId} = ${tenantId})`);
       await remove(shareLinks, sql`${shareLinks.apiKeyId} in (select ${apiKeys.id} from ${apiKeys} where ${apiKeys.tenantId} = ${tenantId})`);
       const keys = await scoped.delete(apiKeys).where(direct(apiKeys)).returning({ id: apiKeys.id });
       if (keys.length > 0) {
@@ -583,8 +762,8 @@ export async function deleteAll(
       }
       await remove(modelAliases, direct(modelAliases));
       await remove(modelCombos, direct(modelCombos));
+      await remove(consoleUsers, direct(consoleUsers));
       await remove(consoleSettings, direct(consoleSettings));
-      await remove(studioSessions, direct(studioSessions));
     }
   });
 

@@ -1,7 +1,7 @@
 import { consoleRequest } from "../data/api";
 import type { ApiErrorShape } from "../data/api";
 import { queryKeys } from "../data/query-keys";
-import { querySignal } from "./common";
+import { querySignal } from "../data/assert";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 
 
@@ -14,6 +14,7 @@ export interface QuotaProviderSummary {
 export interface QuotaWindow {
   readonly kind?: string;
   readonly label: string;
+  readonly accounting: "pooled" | "independent";
   readonly remainingPercent: number | null;
   readonly usedPercent?: number | null;
   readonly resetsAt: string | null;
@@ -33,6 +34,7 @@ export interface QuotaData {
   readonly lastAttemptAt: string | null;
   readonly lastSuccessAt: string | null;
   readonly error: string | null;
+  readonly refreshError?: string | null;
 }
 
 
@@ -60,7 +62,7 @@ export interface QuotaEntry {
   readonly providerName: string;
   readonly providerIcon: string;
   /**
-   * Present only on buddy-family accounts (`workbuddy`/`cb`/`cbcn`).
+   * Present only on buddy-family accounts (`workbuddy`, `workbuddycn`, `cb`, `cbcn`).
    * `attemptedToday` is the sweep's day marker: true means the sweep already
    * tried this account today (no upstream cost to read). False means unknown —
    * the sweep may simply not have reached it yet, never "not claimed".
@@ -85,27 +87,26 @@ export async function fetchQuotaOverview(signal?: AbortSignal): Promise<QuotaOve
 /**
  * Loads the tenant's providers/accounts joined with quota + health.
  *
- * `staleTime: 0` is deliberate: the overview is cheap (one batch cache read
- * server-side) and the gateway fills cold accounts in the background, so the
- * page must re-read to observe that fill. Polling is adaptive — while the
- * server reports accounts still being refreshed it polls at `refreshingMs`,
- * otherwise it drops to `idleMs` — so a warming page converges in seconds and
- * a settled page stops hammering the API without any manual reload.
+ * Loads once and then only on an explicit refresh. The page used to poll
+ * adaptively — every 2s while accounts were warming, every 60s otherwise — and
+ * every one of those reads re-entered the server's quota path, which is what
+ * made opening the page update every account at once. A periodic worker already
+ * keeps quota warm server-side; the page is a viewer, not a second scheduler.
+ *
+ * `placeholderData` keeps the previous accounts on screen while a manual
+ * refresh is in flight, so the list does not flash empty.
  */
-export function useQuotaOverview(options?: {
-  readonly refreshingMs?: number;
-  readonly idleMs?: number;
-}) {
-  const refreshingMs = options?.refreshingMs ?? 2_000;
-  const idleMs = options?.idleMs ?? 60_000;
+export function useQuotaOverview() {
   return useQuery<QuotaOverview>({
     queryKey: queryKeys.quota.all,
     queryFn: (context) => fetchQuotaOverview(querySignal(context)),
-    staleTime: 0,
-    refetchInterval: (query) => ((query.state.data?.refreshing ?? 0) > 0 ? refreshingMs : idleMs),
+    // No `refetchInterval`, no `refetchOnWindowFocus`, no `refetchOnMount`:
+    // each of those re-reads the quota surface, and the worker owns freshness.
+    staleTime: Infinity,
+    refetchInterval: false,
     refetchIntervalInBackground: false,
-    refetchOnMount: true,
-    refetchOnWindowFocus: true,
+    refetchOnMount: false,
+    refetchOnWindowFocus: false,
     placeholderData: (previous) => previous,
   });
 }
@@ -268,7 +269,7 @@ export interface AccountCheckinResult {
 }
 
 /** Provider ids whose billing facade exposes the daily check-in routes. */
-const CHECKIN_PROVIDER_IDS = new Set(["workbuddy", "cb", "cbcn"]);
+const CHECKIN_PROVIDER_IDS = new Set(["workbuddy", "workbuddycn", "cb", "cbcn"]);
 
 /** True when the account can show a daily check-in action on its card. */
 export function supportsAccountCheckin(providerId: string): boolean {
@@ -296,6 +297,77 @@ export function useTriggerAccountCheckin(accountId: string) {
   });
 }
 
+/**
+ * Triggers one account's growth-activity report on its own.
+ *
+ * The report is the leg that actually lands on a free plan — the check-in is
+ * often simply not open — so an operator needs to be able to run it without
+ * also attempting a claim.
+ */
+export function useTriggerAccountReport(accountId: string) {
+  const queryClient = useQueryClient();
+  return useMutation<AccountActivityReportResult, ApiErrorShape, void>({
+    mutationFn: async () => {
+      return consoleRequest<AccountActivityReportResult>(
+        `/accounts/${encodeURIComponent(accountId)}/activity-report`,
+        {
+          method: "POST",
+        },
+      );
+    },
+    onSuccess: async () => {
+      await Promise.all([
+        queryClient.invalidateQueries({ queryKey: queryKeys.quota.all }),
+        queryClient.invalidateQueries({ queryKey: queryKeys.providers.all }),
+      ]);
+    },
+  });
+}
+
+/** One account's outcome inside a provider-wide daily growth batch. */
+export interface ProviderDailyGrowthEntry {
+  readonly accountId: string;
+  readonly label: string;
+  readonly report: { readonly ok: boolean; readonly message: string };
+  readonly checkin: { readonly ok: boolean; readonly message: string };
+}
+
+/** Result of `POST /quota/daily-growth`. */
+export interface ProviderDailyGrowthResult {
+  readonly ok: boolean;
+  readonly status: number;
+  readonly providerId: string;
+  readonly data: readonly ProviderDailyGrowthEntry[];
+  readonly message: string;
+}
+
+/**
+ * Runs the daily growth pass over every account of one provider.
+ *
+ * Report first, then claim — the order the sweep uses — batched with per-account
+ * egress rotation, so a batch leaves from more than one address instead of
+ * hammering the upstream from one. Per-account outcomes come back individually:
+ * one account's closed check-in must not hide the others' streaks.
+ */
+export function useTriggerProviderDailyGrowth(providerId: string) {
+  const queryClient = useQueryClient();
+  return useMutation<ProviderDailyGrowthResult, ApiErrorShape, void>({
+    mutationFn: async (): Promise<ProviderDailyGrowthResult> => {
+      if (providerId.length === 0) throw new Error("Select a provider first");
+      return consoleRequest<ProviderDailyGrowthResult>("/quota/daily-growth", {
+        method: "POST",
+        body: JSON.stringify({ providerId }),
+      });
+    },
+    onSuccess: async () => {
+      await Promise.all([
+        queryClient.invalidateQueries({ queryKey: queryKeys.quota.all }),
+        queryClient.invalidateQueries({ queryKey: queryKeys.providers.all }),
+      ]);
+    },
+  });
+}
+
 /** Result of one manual growth-activity report (`POST /accounts/:id/activity-report`). */
 export interface AccountActivityReportResult {
   readonly ok: boolean;
@@ -307,50 +379,52 @@ export interface AccountActivityReportResult {
   };
 }
 
-/** Result of one manual growth pass: check-in claim + activity report. */
+/** Result of one manual growth pass: activity report + check-in claim. */
 export interface AccountGrowthPassResult {
   /** Human summary covering both steps, e.g. what happened per step. */
   readonly message: string;
-  /** True only when both steps succeeded. */
+  /**
+   * True when the report leg landed. The report is the reliable one — the
+   * check-in is often simply not open on a free plan — so a pass is a success
+   * when the account got its streak, whether or not a credit was claimable.
+   */
   readonly ok: boolean;
   readonly checkin: AccountCheckinResult;
   readonly report: AccountActivityReportResult;
 }
 
 /**
- * Runs the full daily growth pass for one account: check-in claim first, then
- * the growth-activity report. Sequential — the report only fires when the
- * check-in step does not hard-fail, so one toast tells the whole story.
+ * Runs the daily growth pass for one account: the growth-activity report first,
+ * then the check-in claim — the order the sweep uses, so both surfaces agree.
+ *
+ * Report first because it is the leg that lands on a free plan. The check-in
+ * activity is often not running at all, and running the claim first meant its
+ * outcome decided whether the report fired, so those accounts got neither.
+ * Both legs now always run, and one toast tells the whole story.
  */
-/** Runs the full daily growth pass for one account: check-in claim first, then
- * the growth-activity report. */
 export function useTriggerGrowthPass(accountId: string) {
   const queryClient = useQueryClient();
   return useMutation<AccountGrowthPassResult, ApiErrorShape, void>({
     mutationFn: async (): Promise<AccountGrowthPassResult> => {
-      const checkin = await consoleRequest<AccountCheckinResult>(
-        `/accounts/${encodeURIComponent(accountId)}/checkin`,
-        { method: "POST" },
-      );
-      const checkinMsg = checkin.message ?? "Daily check-in done";
-      if (!checkin.ok) {
-        return {
-          ok: false,
-          message: `Check-in failed: ${checkinMsg}. Report skipped.`,
-          checkin,
-          report: { ok: false, message: "Skipped (check-in failed)" },
-        };
-      }
       const report = await consoleRequest<AccountActivityReportResult>(
         `/accounts/${encodeURIComponent(accountId)}/activity-report`,
         { method: "POST" },
       );
       const reportMsg = report.message ?? "Activity reported";
+      const checkin = await consoleRequest<AccountCheckinResult>(
+        `/accounts/${encodeURIComponent(accountId)}/checkin`,
+        { method: "POST" },
+      );
+      const checkinMsg = checkin.message ?? "Daily check-in done";
+      // Report is the reliable leg, so the pass succeeds when it landed. A
+      // check-in that is merely unavailable is the normal case on a free plan,
+      // not a failure — so it reads as a status, not an error, and says when
+      // the credit arrives.
       return {
         ok: report.ok,
         message: report.ok
-          ? `Check-in: ${checkinMsg} · Report: ${reportMsg}`
-          : `Check-in: ${checkinMsg} · Report failed: ${reportMsg}`,
+          ? `Report success · Check-in ${checkinMsg}`
+          : `Report failed: ${reportMsg} · Check-in ${checkinMsg}`,
         checkin,
         report,
       };

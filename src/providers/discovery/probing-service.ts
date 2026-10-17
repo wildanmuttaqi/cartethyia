@@ -1,15 +1,17 @@
+import { captureProviderExchange, type ProviderExchangeCapture } from "../../transport/dispatch/attempt-finalize";
+import { globalOrOwnedBy } from "../../persistence/tenant-scope";
 /**
  * Provider probing and model-discovery orchestration.
  *
  * Network probes and `/v1/models` discovery stay separate from the Drizzle
  * catalog repository while sharing the provider catalog contract.
  */
-import { and, eq, inArray, isNull, or, sql } from "drizzle-orm";
-import type { CartethyiaDatabase } from "../../persistence/postgres";
+import { and, eq, inArray, sql } from "drizzle-orm";
+import type { CartethyiaDatabase } from "../../persistence/db-handle";
 import { models, providerAccounts, providers } from "../../persistence/schema";
-import type { CanonicalEvent, CanonicalRequest, WireFamily } from "../../transport/canonical-model";
-import { WIRE_FAMILIES } from "../../transport/canonical-model";
-import { isRecord } from "../../protocol/primitives";
+import type { CanonicalEvent, CanonicalRequest, WireFamily } from "../../protocol/canonical-model";
+import { WIRE_FAMILIES } from "../../protocol/canonical-model";
+import { isRecord } from "../../protocol/codecs";
 import type { FetchLike } from "../quota/quota-contracts";
 import type { CompatibilityProfile } from "../provider-metadata";
 import {
@@ -24,7 +26,6 @@ import { modelsDevCatalog } from "./models-dev-catalog";
 import { fetchOpenAICompatibleModels } from "./openai-model-discovery";
 import {
   applyDiscoveredWire,
-  discoveryPathsFor,
   resolveDiscoveredWire,
   staticEndpointForWire,
   type DiscoveredModelWire,
@@ -44,30 +45,26 @@ import {
   wireContextFrom,
   type ProbeProviderRow,
 } from "./probe-phases";
-import { createDefaultProviderRegistry } from "../default-registry";
 import { createProbeFetch } from "../operations/probe-fetch";
-import { authHeaders } from "../compatible-adapter";
+import { authHeaders } from "../adapters/compatible-adapter";
 import {
   byokAuthHeaderShape,
   modelDiscoveryBaseUrl,
   modelListUrl,
   resolveByokWireProfile,
+  splitEndpointBaseUrl,
 } from "../operations/byok-wire-profile";
 import { resolveCustomCliHeaders } from "../operations/custom-cli-headers";
 import { resolveCredentialForAccount } from "../operations/provider-credential-service";
 import { decryptCredentialToString } from "../../security/crypto";
-import { GatewayError } from "../../transport/gateway-error";
+import { GatewayError } from "../../protocol/gateway-error";
 import type { TelemetryBatchBuffer } from "../../observability/telemetry-buffer";
 import { computeTokensPerSec } from "../../observability/token-speed";
 import { TelemetryPayloadCapture } from "../../observability/payload-capture";
-import {
-  providerBaseUrl,
-  parseProviderId,
-  type ProviderDispatchTarget as AdapterDispatchTarget,
-  type ModelDefinition,
-  type ValidatedOutboundFetch,
-  type ProviderRegistry,
-} from "../provider-registry";
+import { providerBaseUrl } from "../provider-metadata";
+import { isBundledProviderId, parseProviderId, type ProviderDispatchTarget as AdapterDispatchTarget, type ValidatedOutboundFetch } from "../provider-contracts";
+import type { ModelDefinition } from "../provider-model-definition";
+import type { ProviderRegistry } from "../provider-registry";
 
 /** Max models probed concurrently per batch (outside the sequential warm-up). */
 const PROBE_CONCURRENCY = 5;
@@ -93,34 +90,6 @@ interface ProviderProbingDeps {
   readonly outboundFetchFor: ProbeOutboundResolver;
   readonly snapshotInvalidator: { invalidate(): unknown };
   readonly providerRegistry: ProviderRegistry;
-}
-
-interface ProviderProbingTestDeps {
-  readonly db: CartethyiaDatabase;
-  readonly telemetryBuffer?: TelemetryBatchBuffer;
-  readonly defaultEndpoints?: Record<WireFamily, string>;
-  readonly bundledModelCatalog?: ReadonlyMap<string, readonly ModelDefinition[]>;
-  readonly outboundFetchFor?: ProbeOutboundResolver;
-  readonly snapshotInvalidator?: { invalidate(): unknown };
-  readonly providerRegistry?: ProviderRegistry;
-}
-
-export function createProviderProbingServiceForTests(deps: ProviderProbingTestDeps): ProviderProbingService {
-  return new ProviderProbingService({
-    db: deps.db,
-    telemetryBuffer: deps.telemetryBuffer,
-    defaultEndpoints: deps.defaultEndpoints ?? {
-      chat: "/v1/chat/completions",
-      responses: "/v1/responses",
-      messages: "/v1/messages",
-    },
-    bundledModelCatalog: deps.bundledModelCatalog ?? new Map(),
-    outboundFetchFor:
-      deps.outboundFetchFor ??
-      (() => ({ fetch: (async () => new Response("{}", { status: 500 })) as ValidatedOutboundFetch })),
-    snapshotInvalidator: deps.snapshotInvalidator ?? { invalidate: () => 0 },
-    providerRegistry: deps.providerRegistry ?? createDefaultProviderRegistry(),
-  });
 }
 
 /**
@@ -179,17 +148,15 @@ export class ProviderProbingService {
   }
 
   /**
-   * Resolves a provider's model endpoint from its static catalog or registry
-   * contract. Manual model registration uses the same route as probes.
+   * Static endpoint for one provider + wire family, if the bundled catalog
+   * ships a static definition for it. Used by manual registration (via the
+   * console store) so it resolves the same provider-truth endpoints as probes.
    */
-  async resolveProviderEndpoint(
+  async resolveStaticEndpoint(
     providerId: string,
     wireFamily: WireFamily,
   ): Promise<string | undefined> {
-    return (
-      staticEndpointForWire(this.bundledModelCatalog, providerId, wireFamily) ??
-      discoveryPathsFor(providerId)?.[wireFamily]
-    );
+    return staticEndpointForWire(this.bundledModelCatalog, providerId, wireFamily);
   }
 
   /** One-shot connectivity test: resolves a usable account + the real per-provider
@@ -274,6 +241,12 @@ export class ProviderProbingService {
 
     const probeSignal = AbortSignal.timeout(30_000);
     const events: CanonicalEvent[] = [];
+    /**
+     * Populated when the probe dials. Declared here, not inside the try, so the
+     * model the upstream named is still readable after the block unwinds — the
+     * result is assembled outside it.
+     */
+    let probeCapture: ProviderExchangeCapture | undefined;
     let ttfbMs: number | undefined;
     let dispatchError: unknown;
     /** Hits a `websearch` probe returned; surfaced to the console verbatim. */
@@ -286,7 +259,15 @@ export class ProviderProbingService {
         : { provider_id: parsedProviderId, credential_kind: "none" as const };
       const outbound = asOutboundBinding(await this.outboundFetchFor(tenantId, providerId));
       networkPoolId = outbound.networkPoolId;
-      const probeFetch = createProbeFetch(outbound.fetch);
+      probeCapture = {
+        request: null,
+        response: Promise.resolve(null),
+      };
+      // The same wrapper a real dispatch uses, so the probe reads the model the
+      // upstream named from the raw bytes rather than from a synthesized event.
+      const probeFetch = createProbeFetch(
+        captureProviderExchange(outbound.fetch, probeCapture, false),
+      );
       try {
         if (serviceKind === "websearch") {
           if (typeof adapter.websearch !== "function") {
@@ -469,10 +450,7 @@ export class ProviderProbingService {
         : computeProbeVerdict({
             events,
             dispatchError,
-            providerId,
-            modelId,
             wireFamily,
-            endpointPath,
           });
 
     const requestId = crypto.randomUUID();
@@ -518,6 +496,7 @@ export class ProviderProbingService {
     }
 
     const sample = extractSample(events);
+    const reportedModel = await probeCapture?.reportedModel?.catch(() => undefined);
     return {
       ...(accountId ? { accountId } : {}),
       ok,
@@ -525,6 +504,7 @@ export class ProviderProbingService {
       ...(ttfbMs !== undefined ? { ttfbMs } : {}),
       ...(upstreamStatusCode === undefined ? {} : { statusCode: upstreamStatusCode }),
       ...(sample ? { sample } : {}),
+      ...(reportedModel === undefined ? {} : { reportedModel }),
       ...(searchResults !== undefined && searchResults.length > 0 ? { searchResults } : {}),
       ...(errorMessage ? { error: errorMessage } : {}),
     };
@@ -550,6 +530,15 @@ export class ProviderProbingService {
     const wireFamily: WireFamily = (WIRE_FAMILIES as readonly string[]).includes(requestedWire)
       ? (requestedWire as WireFamily)
       : "chat";
+    // An operator who pasted a full endpoint (`…/anthropic/v1/messages`) gets it
+    // stripped before the model list is derived, and told so. Probing the
+    // corrected root is what makes the result actionable: the alternative is a
+    // bare 404 against a path the gateway built from their own typo.
+    const submitted = splitEndpointBaseUrl(request.baseUrl);
+    const warning =
+      submitted.stripped === ""
+        ? undefined
+        : `Base URL pointed at the endpoint "${submitted.stripped}". Cartethyia derives the model list from the root, so it tested "${submitted.baseUrl}" instead. Save that root as the Base URL.`;
     const url = modelListUrl(request.baseUrl);
     const outbound = asOutboundBinding(await this.outboundFetchFor(tenantId));
     const probeFetch = createProbeFetch(outbound.fetch);
@@ -576,6 +565,7 @@ export class ProviderProbingService {
           latencyMs,
           statusCode: response.status,
           error: `Upstream rejected the connection test with HTTP ${response.status}`,
+          ...(warning === undefined ? {} : { warning }),
         };
       }
       // A body is nice to have but not required: some gateways answer `/models`
@@ -600,12 +590,14 @@ export class ProviderProbingService {
         latencyMs,
         statusCode: response.status,
         ...(modelCount === undefined ? {} : { modelCount }),
+        ...(warning === undefined ? {} : { warning }),
       };
     } catch (error) {
       return {
         ok: false,
         latencyMs: Date.now() - startedAt,
         error: error instanceof Error ? error.message : "Connection test failed",
+        ...(warning === undefined ? {} : { warning }),
       };
     } finally {
       outbound.release?.();
@@ -618,18 +610,14 @@ export class ProviderProbingService {
       const discoveryFetch = asFetchLike(outbound.fetch);
       const resolver = await this.providerRegistry.resolveModelDiscovery(providerId);
       if (resolver) {
-        const requiresCredential = this.providerRegistry.modelDiscoveryRequiresCredential(providerId);
-        const account = requiresCredential
-          ? await this.usableAccount(tenantId, providerId)
-          : undefined;
+        // An account is used when one is usable, and the fetch is attempted
+        // either way. Gating on a credential only made the common case
+        // unreachable: most providers list their models without auth, and the
+        // ones that do not answer 401 themselves, which names the actual
+        // problem where a local 409 named a missing account the operator may
+        // not even need.
+        const account = await this.usableAccount(tenantId, providerId);
         const secret = account?.secret;
-        if (requiresCredential && secret === undefined) {
-          throw new GatewayError(
-            "invalid_request",
-            409,
-            `Model sync needs a usable (active, non-cooldown) ${providerId} account first`,
-          );
-        }
         const providerRow = await this.loadProviderWireRow(providerId);
         const effectiveBaseUrl = providerRow?.baseUrl ?? providerBaseUrl(providerId) ?? "";
         let discovered: readonly ModelDefinition[] | null;
@@ -721,7 +709,45 @@ export class ProviderProbingService {
         }
       }
 
-      return { synced: 0 };
+      // Two reasons a sync reaches here with nothing dialed, and the operator
+      // needs to be told which one. Returning `{synced: 0}` for both made an
+      // unsupported provider indistinguishable from a successful fetch that
+      // found nothing — the console showed a green "0 synced" for a provider
+      // it can never sync.
+      const bundled = isBundledProviderId(providerId);
+      if (!bundled) {
+        // A custom provider has a row and a base URL but no usable credential.
+        // The fix is an account, and saying "no listing endpoint" would send the
+        // operator looking for a capability the provider may well have.
+        throw new GatewayError(
+          "invalid_request",
+          400,
+          `Add an account for ${providerId} first — model listing needs a credential.`,
+          {},
+          "cartethyia",
+        );
+      }
+      if (!(await this.usableAccountSecret(tenantId, providerId))) {
+        // A bundled provider with an account would have gone through the
+        // resolver branch above, so reaching here means none is registered.
+        // Add one first, then fetch.
+        throw new GatewayError(
+          "invalid_request",
+          400,
+          `Add an account for ${providerId} before fetching its models.`,
+          {},
+          "cartethyia",
+        );
+      }
+      // A credential exists and the provider still has no listing path: the
+      // catalog is the compiled one, and new models arrive with an update.
+      throw new GatewayError(
+        "capability_unsupported",
+        400,
+        `${providerId} publishes no model-listing endpoint. Its catalog ships with Cartethyia; new models appear with an update.`,
+        {},
+        "cartethyia",
+      );
     } finally {
       outbound.release?.();
     }
@@ -886,7 +912,7 @@ export class ProviderProbingService {
       .where(
         and(
           eq(providerAccounts.providerId, providerId),
-          or(isNull(providerAccounts.tenantId), eq(providerAccounts.tenantId, tenantId)),
+          globalOrOwnedBy(providerAccounts.tenantId, tenantId),
         ),
       );
     const now = Date.now();
@@ -949,7 +975,7 @@ export class ProviderProbingService {
       .where(
         and(
           eq(providerAccounts.providerId, providerId),
-          or(isNull(providerAccounts.tenantId), eq(providerAccounts.tenantId, tenantId)),
+          globalOrOwnedBy(providerAccounts.tenantId, tenantId),
         ),
       );
     const results: ProbeAllAccountsResult["results"][number][] = [];

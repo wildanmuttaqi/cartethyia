@@ -1,5 +1,7 @@
-import { GripVertical } from "lucide-react";
+import { ChevronDown, ChevronUp, GripVertical } from "lucide-react";
 import { useRef, useState, type DragEvent, type ReactNode } from "react";
+import { cn } from "../lib/classnames";
+import { gapUtility } from "../lib/spacing";
 
 /**
  * A vertical list whose rows the operator can drag into a new order.
@@ -54,27 +56,31 @@ export function SortableList<T extends { id: string }>({
     <div
       role="list"
       aria-label={label}
-      style={{ display: "flex", flexDirection: "column", gap }}
+      className={cn("flex flex-col min-w-0", gapUtility(gap) ?? "gap-5")}
     >
       {items.map((item, index) => {
         const dragging = dragId === item.id;
         const isOver = overId === item.id && dragId !== null && dragId !== item.id;
+        const moveBy = (offset: -1 | 1) => {
+          const targetIndex = index + offset;
+          if (disabled || targetIndex < 0 || targetIndex >= items.length) return;
+          const ids = items.map((entry) => entry.id);
+          const [movedId] = ids.splice(index, 1);
+          if (movedId === undefined) return;
+          ids.splice(targetIndex, 0, movedId);
+          onReorder(ids);
+        };
         return (
           <div
             key={item.id}
             role="listitem"
-            className="sortable-row"
-            draggable={!disabled}
+            className={cn(
+              "relative flex items-stretch gap-5 min-w-0 rounded-card transition-opacity duration-150 ease-spring",
+              dragging && "opacity-50",
+              isOver && "before:absolute before:inset-x-0 before:top-0 before:h-0.5 before:bg-accent before:content-['']",
+            )}
             data-dragging={dragging ? "true" : undefined}
             data-drop-target={isOver ? "true" : undefined}
-            onDragStart={(event: DragEvent<HTMLDivElement>) => {
-              if (disabled) return;
-              dragIdRef.current = item.id;
-              setDragId(item.id);
-              event.dataTransfer.effectAllowed = "move";
-              // Firefox needs data set for a drag to start at all.
-              event.dataTransfer.setData("text/plain", item.id);
-            }}
             onDragOver={(event: DragEvent<HTMLDivElement>) => {
               if (disabled || dragIdRef.current === null) return;
               // Required for `drop` to fire on this element.
@@ -88,13 +94,52 @@ export function SortableList<T extends { id: string }>({
               if (fromId !== null) move(fromId, item.id);
               endDrag();
             }}
-            onDragEnd={endDrag}
           >
-            <div className="sortable-rail" aria-hidden="true">
-              <GripVertical size={14} className="sortable-grip" />
-              <span className="sortable-index">{index + 1}</span>
+            <div className="flex flex-none flex-col items-center gap-1 pt-4 text-text-tertiary select-none">
+              <div className="flex items-center gap-1">
+                <span className="font-mono text-badge tabular-nums leading-none">{index + 1}</span>
+                <button
+                  type="button"
+                  draggable={!disabled}
+                  aria-label={`Drag item at position ${index + 1} to reorder`}
+                  title="Drag to reorder"
+                  disabled={disabled}
+                  onDragStart={(event: DragEvent<HTMLButtonElement>) => {
+                    dragIdRef.current = item.id;
+                    setDragId(item.id);
+                    event.dataTransfer.effectAllowed = "move";
+                    event.dataTransfer.setData("text/plain", item.id);
+                  }}
+                  onDragEnd={endDrag}
+                  className="grid size-7 cursor-grab place-items-center rounded-control text-text-tertiary hover:bg-hover active:cursor-grabbing disabled:cursor-not-allowed"
+                >
+                  <GripVertical size={14} />
+                </button>
+              </div>
+              <div className="flex gap-1">
+                <button
+                  type="button"
+                  aria-label={`Move item ${index + 1} up`}
+                  title="Move up"
+                  disabled={disabled || index === 0}
+                  onClick={() => moveBy(-1)}
+                  className="grid size-7 place-items-center rounded-control text-text-tertiary hover:bg-hover disabled:cursor-not-allowed disabled:opacity-40"
+                >
+                  <ChevronUp size={14} />
+                </button>
+                <button
+                  type="button"
+                  aria-label={`Move item ${index + 1} down`}
+                  title="Move down"
+                  disabled={disabled || index === items.length - 1}
+                  onClick={() => moveBy(1)}
+                  className="grid size-7 place-items-center rounded-control text-text-tertiary hover:bg-hover disabled:cursor-not-allowed disabled:opacity-40"
+                >
+                  <ChevronDown size={14} />
+                </button>
+              </div>
             </div>
-            <div className="sortable-body">{renderItem(item, index)}</div>
+            <div className="flex-auto min-w-0">{renderItem(item, index)}</div>
           </div>
         );
       })}

@@ -8,25 +8,25 @@
  * tool-use pairing, streaming, and `cache_control` prompt-cache markers.
  *
  * Kimi's reference catalog carries model bootstrap metadata that is not part
- * of Cartethyia's generic `ModelDefinition`: tokenizer family and prompt-cache
- * / max-token defaults. The exported lookup keeps this metadata centralized
+ * of Cartethyia's generic `ModelDefinition`: prompt-cache support and
+ * max-token defaults. The exported lookup keeps this metadata centralized
  * and the adapter uses it when selecting request defaults.
  *
  * Bespoke by wire protocol (Phase C5): verified Claude-pipeline reuse
  * (Messages envelope via `../claude/*`) — stays bespoke, never re-audit.
  */
-import type { ModelDefinition } from "../../provider-registry";
+import type { ModelDefinition } from "../../provider-model-definition";
 import { createHash } from "node:crypto";
-import type { CanonicalEvent, CanonicalRequest } from "../../../transport/canonical-model";
-import { isRecord } from "../../../protocol/primitives";
+import type { CanonicalEvent, CanonicalRequest } from "../../../protocol/canonical-model";
+import { isRecord } from "../../../protocol/codecs";
 import { resolvePromptCacheKey } from "../../operations/session-resolution";
-import { GatewayError } from "../../../transport/gateway-error";
+import { GatewayError } from "../../../protocol/gateway-error";
 import {
   canonicalToClaudeMessagesPayload,
 } from "../../../protocol/request/messages";
-import { sendClaudeMessagesRequest } from "../../../protocol/transport/messages";
-import { endpointUrl } from "../../../protocol/primitives";
-import type { ProviderDispatchTarget, ProviderAdapter, ProviderDispatchContext } from "../../provider-registry";
+import { sendClaudeMessagesRequest } from "../../../protocol/upstream/send-claude-messages";
+import { endpointUrl } from "../../../protocol/codecs";
+import type { ProviderDispatchTarget, ProviderAdapter, ProviderDispatchContext } from "../../provider-contracts";
 import {
   getKimiCommonHeaders,
   parseKimiCredential,
@@ -38,7 +38,6 @@ export const KIMI_CODE_PROVIDER_ID = "kimi" as const;
 export const KIMI_CODE_BASE_URL = providerBaseUrl("kimi");
 
 export interface KimiModelBootstrap {
-  readonly tokenizer?: "kimi-k2";
   readonly supportsPromptCache: boolean;
   readonly alwaysSendMaxTokens: boolean;
   readonly maxOutputTokens: number;
@@ -56,41 +55,32 @@ const KIMI_MODEL_BOOTSTRAP: Readonly<Record<string, KimiModelBootstrap>> = {
     maxOutputTokens: 131_072,
   },
   "kimi-for-coding": {
-    tokenizer: "kimi-k2",
     supportsPromptCache: true,
     alwaysSendMaxTokens: true,
     maxOutputTokens: 32_768,
   },
   "kimi-for-coding-highspeed": {
-    tokenizer: "kimi-k2",
     supportsPromptCache: true,
     alwaysSendMaxTokens: true,
     maxOutputTokens: 32_768,
   },
   "kimi-k2": {
-    tokenizer: "kimi-k2",
     supportsPromptCache: true,
     alwaysSendMaxTokens: true,
     maxOutputTokens: 262_144,
   },
   "kimi-k2-turbo-preview": {
-    tokenizer: "kimi-k2",
     supportsPromptCache: true,
     alwaysSendMaxTokens: true,
     maxOutputTokens: 32_000,
   },
   "kimi-k2.5": {
-    tokenizer: "kimi-k2",
     supportsPromptCache: true,
     alwaysSendMaxTokens: true,
     maxOutputTokens: 65_536,
   },
 };
-/** Returns the reference tokenizer family for a Kimi model, when one is declared. */
-export function lookupKimiTokenizer(modelId: string): "kimi-k2" | undefined {
-  return lookupKimiModelBootstrap(modelId)?.tokenizer;
-}
-/** Looks up Kimi's bootstrap tokenizer/cache metadata by model id. */
+/** Looks up Kimi's bootstrap cache/max-token metadata by model id. */
 export function lookupKimiModelBootstrap(
   modelId: string,
 ): KimiModelBootstrap | undefined {
@@ -99,7 +89,7 @@ export function lookupKimiModelBootstrap(
 
 
 
-import { defineModel } from "../../model-definition";
+import { defineModel } from "../../provider-model-definition";
 
 const kimiModel = (
   modelId: string,
@@ -182,7 +172,7 @@ class KimiCodeAdapter implements ProviderAdapter {
       // max-token caps. Kimi's own per-model caps are applied below.
       isOAuth: false,
     });
-    applyKimiBootstrap(payload, bootstrap, request);
+    applyKimiBootstrap(payload, bootstrap, request, context);
     const headers: Record<string, string> = {
       "content-type": "application/json",
       accept: request.stream ? "text/event-stream" : "application/json",
@@ -211,6 +201,7 @@ function applyKimiBootstrap(
   payload: Record<string, unknown>,
   bootstrap: KimiModelBootstrap | undefined,
   request: CanonicalRequest,
+  context: ProviderDispatchContext,
 ): void {
   if (!bootstrap) return;
   // `canonicalToClaudeMessagesPayload` already emits the provider-native
@@ -220,7 +211,7 @@ function applyKimiBootstrap(
   if (!bootstrap.supportsPromptCache && request.cache_hint !== undefined) {
     removeKimiCacheControls(payload);
   }
-  const promptCacheKey = lookupKimiPromptCacheKey(request);
+  const promptCacheKey = lookupKimiPromptCacheKey(request, context);
   if (bootstrap.supportsPromptCache && promptCacheKey !== undefined) {
     const metadata = isRecord(payload["metadata"])
       ? (payload["metadata"] as Record<string, unknown>)
@@ -239,8 +230,9 @@ function applyKimiBootstrap(
 /** Looks up Kimi's normalized prompt-cache affinity key from canonical controls. */
 export function lookupKimiPromptCacheKey(
   request: CanonicalRequest,
+  context?: ProviderDispatchContext,
 ): string | undefined {
-  const raw = resolvePromptCacheKey(request);
+  const raw = resolvePromptCacheKey(request, context);
   if (typeof raw !== "string") return undefined;
   const trimmed = raw.trim();
   if (!trimmed) return undefined;

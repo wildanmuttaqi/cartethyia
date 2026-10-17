@@ -1,18 +1,17 @@
-// Provider contracts, registry, and credential resolution.
+// The provider registry: lazy loader cache for adapters, authentication,
+// quota collectors, and model discovery. One registration authority.
 
-import type { CanonicalEvent, CanonicalRequest, ServiceKind, WireFamily } from "../transport/canonical-model";
-import { GatewayError } from "../transport/gateway-error";
+import type { ServiceKind, WireFamily } from "../protocol/canonical-model";
+import { GatewayError } from "../protocol/gateway-error";
 import type { BundledProviderId, CompatibilityProfile } from "./provider-metadata";
 import type { OAuthLoginClient } from "./authentication/oauth-flow-store";
 import type { OAuthTokenRefresher } from "./authentication/oauth-refresh-service";
 import type { QuotaFetcher } from "./quota/quota-support";
-import { unwrapProviderToken, type TokenEnvelope } from "./credential-envelope";
-import { BUNDLED_PROVIDER_METADATA, DEFAULT_PROXY_BYPASS_PROVIDER_IDS, providerBaseUrl, providerJwtVerification, providerRateLimitIsIpScoped, providerRequiresAccount, providerUpstreamHost, providerDefaultWireFamily } from "./provider-metadata";
 import { metrics } from "../observability/metrics";
 import { trackAdapterLoad } from "../observability/performance-metrics";
-import type { ModelDefinition } from "./model-definition";
+import type { ModelDefinition } from "./provider-model-definition";
 import type { ProviderModelDiscovery } from "./discovery/discovery-types";
-export type { ModelCostDefinition, ModelDefinition } from "./model-definition";
+import { parseProviderId, type ProviderAdapter, type ProviderId } from "./provider-contracts";
 
 /** Identity, adapter, model, OAuth, quota, and compatibility data for one provider. */
 export interface ProviderModule {
@@ -24,7 +23,6 @@ export interface ProviderModule {
   readonly loadAuthentication?: () => Promise<ProviderAuthentication>;
   readonly loadQuotaCollector?: () => Promise<QuotaFetcher>;
   readonly loadModelDiscovery?: () => Promise<ProviderModelDiscovery>;
-  readonly modelDiscoveryRequiresCredential?: boolean;
   readonly loadAdapter: () => Promise<ProviderAdapter>;
   /** Lazy model-catalog loader kept separate from heavy adapter modules. */
   readonly loadModels?: () => Promise<readonly ModelDefinition[]>;
@@ -32,7 +30,32 @@ export interface ProviderModule {
   readonly compatibility?: CompatibilityProfile;
   readonly wireFamilyDefault: WireFamily;
   readonly requiresAccount: boolean;
-  readonly defaultBypassProxy?: boolean;
+  readonly defaultSkipProxy?: boolean;
+}
+
+/**
+ * One provider registration: identity, lazy adapter loader, and metadata.
+ * `upstream_host` is the SSRF-validated network-binding target for this
+ * provider — carried on the same registration object as the adapter loader
+ * so adding a provider touches one call-site instead of a second map kept
+ * in sync by hand elsewhere (`transport/dispatch/proxy-request.ts` used to hardcode this
+ * separately; `providers/operations/provider-catalog-service.ts` now derives it from here).
+ */
+export interface ProviderRegistration {
+  readonly provider_id: ProviderId;
+  readonly load: () => Promise<ProviderAdapter>;
+  readonly upstream_host?: { readonly hostname: string; readonly port: number };
+  readonly loadModels?: () => Promise<readonly ModelDefinition[]>;
+  readonly endpoint_paths_by_wire_family?: Readonly<Partial<Record<WireFamily, string>>>;
+  readonly loadAuthentication?: () => Promise<ProviderAuthentication>;
+  readonly loadQuotaCollector?: () => Promise<QuotaFetcher>;
+  readonly loadModelDiscovery?: () => Promise<ProviderModelDiscovery>;
+}
+
+/** Authentication capabilities exposed by one provider integration. */
+export interface ProviderAuthentication {
+  readonly client?: OAuthLoginClient;
+  readonly refresher?: OAuthTokenRefresher;
 }
 
 /**
@@ -52,27 +75,9 @@ export function toRegistration(module: ProviderModule): ProviderRegistration {
     ...(module.loadAuthentication === undefined ? {} : { loadAuthentication: module.loadAuthentication }),
     ...(module.loadQuotaCollector === undefined ? {} : { loadQuotaCollector: module.loadQuotaCollector }),
     ...(module.loadModelDiscovery === undefined ? {} : { loadModelDiscovery: module.loadModelDiscovery }),
-    ...(module.modelDiscoveryRequiresCredential === undefined
-      ? {}
-      : { modelDiscoveryRequiresCredential: module.modelDiscoveryRequiresCredential }),
   };
 }
 
-export { DEFAULT_PROXY_BYPASS_PROVIDER_IDS, providerBaseUrl, providerJwtVerification, providerRateLimitIsIpScoped, providerRequiresAccount, providerUpstreamHost, providerDefaultWireFamily };
-export type { BundledProviderId, ProviderJwtVerification } from "./provider-metadata";
-
-/**
- * Normalizes a provider slug, rejecting anything that is not one. Persisted
- * IDs are already canonical, so no alias mapping is applied: an unknown or
- * misspelled slug is a caller error.
- */
-function normalizeProviderSlug(id: string): string {
-  const trimmed = id.trim().toLowerCase();
-  if (!/^[a-z][a-z0-9-]{0,63}$/.test(trimmed)) {
-    throw new GatewayError("invalid_request", 400, "Provider ID must be a lowercase slug");
-  }
-  return trimmed;
-}
 /**
  * Every adapter must report the id it was registered under. A mismatch means
  * the registry would dispatch requests to an adapter that believes it serves a
@@ -89,246 +94,6 @@ function assertAdapterIdentity(expected: ProviderId, adapter: ProviderAdapter): 
     adapter_id: adapter.provider_id,
   });
 }
-
-/** Closed union of every shipped provider ID. */
-export const BUNDLED_PROVIDER_IDS = BUNDLED_PROVIDER_METADATA.map((definition) => definition.id) as readonly BundledProviderId[];
-
-/** Normalized builtin or validated custom provider identifier. */
-declare const customProviderIdBrand: unique symbol;
-export type CustomProviderId = string & { readonly [customProviderIdBrand]: true };
-export type ProviderId = BundledProviderId | CustomProviderId;
-
-/** Credential alternatives supported by the control-plane resolver. */
-export type CredentialKind =
-  "none" | "api_key" | "oauth" | "scoped_access_token" | "workload_identity";
-
-/** Credential returned by control-plane resolution and consumed by adapters. */
-export interface ResolvedCredential {
-  readonly provider_id: ProviderId;
-  readonly account_id?: string | undefined;
-  readonly credential_kind: CredentialKind;
-  readonly secret?: Uint8Array | undefined;
-  /** Operator-configured outbound headers, filtered by the owning adapter. */
-  readonly custom_headers?: Readonly<Record<string, string>> | undefined;
-  /**
-   * Per-account upstream auth configuration that is not a secret — auth method,
-   * region, profile ARN, OAuth client id, token endpoint. Carried beside the
-   * secret because the request an adapter builds depends on it and a single
-   * opaque credential string cannot express both. Never holds secrets.
-   */
-  readonly auth_state?: Readonly<Record<string, unknown>> | undefined;
-}
-
-export function readCredentialSecret(credential: ResolvedCredential, errorMessage?: string): string {
-  const raw = credential.secret ? new TextDecoder().decode(credential.secret).trim() : "";
-  if (!raw) {
-    throw new GatewayError(
-      "authentication_failed",
-      401,
-      errorMessage ?? "Provider credential secret is missing or empty",
-    );
-  }
-  return raw;
-}
-
-/** Fetch capability that validates DNS answers and redirects before each request. */
-export type ValidatedOutboundFetch = (
-  input: RequestInfo | URL,
-  init?: RequestInit,
-) => Promise<Response>;
-
-/** Provider WebSocket session over validated WSS egress. */
-export interface ProviderWebSocketSession {
-  send(message: string): void;
-  receive(signal: AbortSignal): Promise<string>;
-  close(code?: number, reason?: string): void;
-}
-
-/** WSS connector bound to the request's selected network-pool slot. */
-export type ValidatedOutboundWebSocket = (
-  url: URL,
-  headers: Readonly<Record<string, string>>,
-  signal: AbortSignal,
-) => Promise<ProviderWebSocketSession>;
-
-/** Context passed from routing to a provider adapter. */
-export interface ProviderDispatchContext {
-  readonly credential: ResolvedCredential;
-  readonly deadline: number;
-  readonly abort_signal: AbortSignal;
-  readonly outbound_fetch?: ValidatedOutboundFetch | undefined;
-  /** Validated WSS egress bound to the same selected network pool as HTTP. */
-  readonly outbound_websocket?: ValidatedOutboundWebSocket | undefined;
-  /** Built-in API-key route-selected fallback User-Agent; custom providers leave this unset. */
-  readonly user_agent?: string | undefined;
-  /** Original inbound headers needed only for provider-specific negotiation. */
-  readonly request_headers?: Readonly<Record<string, string>> | undefined;
-  /** Stable per-conversation cache affinity passed through dispatch. */
-  readonly conversation_affinity?: string | undefined;
-  /** Opaque identity shared by retries of one logical gateway request. */
-  readonly request_identity?: object | undefined;
-}
-
-const USER_AGENT_HEADER_NAME = /^user-agent$/i;
-const USER_AGENT_HEADER_LENGTH = "user-agent".length;
-
-function hasUserAgentHeader(headers: Record<string, string>): boolean {
-  for (const headerName in headers) {
-    if (headerName.length !== USER_AGENT_HEADER_LENGTH) continue;
-    if (Object.hasOwn(headers, headerName) && USER_AGENT_HEADER_NAME.test(headerName)) return true;
-  }
-  return false;
-}
-
-/** Uses the route identity as a fallback without replacing provider-supplied headers. */
-export function applyRouteUserAgent(
-  headers: Record<string, string>,
-  credential: ResolvedCredential,
-  userAgent: string | undefined,
-): void {
-  if (
-    credential.credential_kind === "oauth" ||
-    credential.credential_kind === "scoped_access_token" ||
-    userAgent === undefined
-  ) {
-    return;
-  }
-  if (hasUserAgentHeader(headers)) return;
-  headers["user-agent"] = userAgent;
-}
-
-/** ProviderDispatchTarget identity already resolved by routing before credential leasing. */
-export interface ProviderDispatchTarget {
-  readonly provider_id: ProviderId;
-  readonly model_id: string;
-  readonly wire_family: WireFamily;
-  readonly endpoint_path: string;
-  readonly capabilities: Readonly<Record<string, boolean>>;
-}
-
-/** Provider adapter boundary: canonical request/events in, no public HTTP routes. */
-export interface ProviderAdapter {
-  readonly provider_id: ProviderId;
-  dispatch(
-    request: CanonicalRequest,
-    candidate: ProviderDispatchTarget,
-    context: ProviderDispatchContext,
-  ): AsyncIterable<CanonicalEvent>;
-  /**
-   * Optional native-protocol capability. A provider whose catalog serves a
-   * non-`llm` service kind (System One) implements the matching method; the
-   * native route handler looks it up and dispatches the caller's opaque body
-   * through it. The body is forwarded untouched — the method only adds the
-   * provider's auth/identity headers and posts it to `endpoint_path`.
-   *
-   * An adapter without this method is simply not eligible for the route, which
-   * is why it is optional rather than a required no-op.
-   */
-  systemone?(
-    body: Record<string, unknown>,
-    candidate: ProviderDispatchTarget,
-    context: ProviderDispatchContext,
-  ): Promise<Response>;
-  /**
-   * Optional native web-search capability, the analogue of {@link systemone}
-   * for the `/v1/search` route. The caller's body is opaque (`{query,
-   * max_results, …}`); the adapter maps it onto the provider's own search API
-   * and returns the raw upstream `Response`, which the route normalizes into
-   * the unified search envelope. The route performs the SSRF/credential work,
-   * so an adapter without this method is simply not eligible.
-   */
-  websearch?(
-    body: Record<string, unknown>,
-    candidate: ProviderDispatchTarget,
-    context: ProviderDispatchContext,
-  ): Promise<WebSearchOutcome>;
-}
-
-/** One provider-independent web-search hit, normalized from a provider's own response shape. */
-export interface WebSearchResult {
-  readonly title: string;
-  readonly url: string;
-  readonly snippet: string;
-  readonly published_at?: string | null;
-  /** Provider relevance score, clamped to `[0, 1]`; absent when the provider reports none. */
-  readonly score?: number | null;
-}
-
-/**
- * The normalized result of one web-search dispatch. The adapter owns both the
- * request mapping onto its provider's search API and the normalization of that
- * provider's response shape into this vocabulary, so the `/v1/search` route
- * never learns any provider's wire. A failed upstream throws a `GatewayError`
- * carrying the upstream status — the same contract as `systemone` — so the
- * attempt loop's retry classifier sees it; a success returns this.
- */
-export interface WebSearchOutcome {
-  readonly results: readonly WebSearchResult[];
-  readonly total_results?: number | null;
-}
-
-/**
- * Cost fields for one model. `pricing_model: "subscription"` means the
- * model is billed via a flat plan (no meaningful per-token input/output
- * figures) — both `input`/`output` stay `null` in that case.
- */
-/**
- * One provider registration: identity, lazy adapter loader, and metadata.
- * `upstream_host` is the SSRF-validated network-binding target for this
- * provider — carried on the same registration object as the adapter loader
- * so adding a provider touches one call-site instead of a second map kept
- * in sync by hand elsewhere (`transport/dispatch/proxy-request.ts` used to hardcode this
- * separately; `providers/operations/provider-catalog-service.ts` now derives it from here).
- */
-export interface ProviderRegistration {
-  readonly provider_id: ProviderId;
-  readonly load: () => Promise<ProviderAdapter>;
-  readonly upstream_host?: { readonly hostname: string; readonly port: number };
-  readonly loadModels?: () => Promise<readonly ModelDefinition[]>;
-  readonly endpoint_paths_by_wire_family?: Readonly<Partial<Record<WireFamily, string>>>;
-  readonly loadAuthentication?: () => Promise<ProviderAuthentication>;
-  readonly loadQuotaCollector?: () => Promise<QuotaFetcher>;
-  readonly loadModelDiscovery?: () => Promise<ProviderModelDiscovery>;
-  readonly modelDiscoveryRequiresCredential?: boolean;
-}
-
-/** Authentication capabilities exposed by one provider integration. */
-export interface ProviderAuthentication {
-  readonly client?: OAuthLoginClient;
-  readonly refresher?: OAuthTokenRefresher;
-}
-
-/** Returns true for one of Cartethyia's reserved builtin IDs, case-insensitively. */
-export function isBundledProviderId(value: string): value is BundledProviderId {
-  const normalized = value.trim().toLowerCase();
-  return (BUNDLED_PROVIDER_IDS as readonly string[]).includes(normalized);
-}
-
-/** Normalizes a provider identifier before persistence or registry lookup. */
-export function parseProviderId(value: string): ProviderId {
-  const normalized = normalizeProviderSlug(value);
-  return isBundledProviderId(normalized) ? normalized : normalized as CustomProviderId;
-}
-
-/**
- * Validates a custom/BYOK slug before any provider row is written.
- * Builtin collisions are case-insensitive and fail with typed `slug_reserved`.
- */
-export function parseCustomProviderId(value: string): CustomProviderId {
-  const normalized = parseProviderId(value);
-  if (isBundledProviderId(normalized)) {
-    throw new GatewayError(
-      "slug_reserved",
-      409,
-      "The provider ID is reserved for a builtin provider",
-      { provider_id: normalized },
-    );
-  }
-  return normalized as CustomProviderId;
-}
-
-
-// Registry
 
 /** Result of loading the configured provider registrations. */
 export interface ProviderRegistrySnapshot {
@@ -470,6 +235,21 @@ export class ProviderRegistry {
     return this.#registrations.get(parseProviderId(providerId))?.loadQuotaCollector !== undefined;
   }
 
+  /**
+   * Whether a provider declares a model-discovery resolver. Sync declaration
+   * check — no module is loaded — for list projections that must hide the
+   * "Fetch models" control from providers with no discovery endpoint.
+   *
+   * This is the question the projection should be asking. "Is this a builtin?"
+   * was a proxy for it that was true for every provider when the catalog had no
+   * discovery-backed builtins, and wrong for every one added since: a builtin
+   * that registers a resolver cannot list any model until an operator runs a
+   * sync, so hiding the control leaves it permanently empty.
+   */
+  hasModelDiscovery(providerId: string): boolean {
+    return this.#registrations.get(parseProviderId(providerId))?.loadModelDiscovery !== undefined;
+  }
+
   /** Lazily resolves and caches one provider's quota collector. */
   async resolveQuotaCollector(providerId: string): Promise<QuotaFetcher | undefined> {
     const normalized = parseProviderId(providerId);
@@ -566,92 +346,4 @@ export class ProviderRegistry {
     return this.#registrations.get(normalized)?.upstream_host;
   }
 
-  /** Whether model discovery needs a stored account credential. */
-  modelDiscoveryRequiresCredential(providerId: string): boolean {
-    const normalized = parseProviderId(providerId);
-    return this.#registrations.get(normalized)?.modelDiscoveryRequiresCredential !== false;
-  }
 }
-
-// Credential resolver
-
-/** One control-plane credential alternative, ordered by operator preference. */
-export interface CredentialAlternative {
-  readonly provider_id: ProviderId;
-  readonly account_id?: string | undefined;
-  readonly credential_kind: CredentialKind;
-  /** Secret supplied by the control plane, never read from a client request. */
-  readonly secret?: string | Uint8Array | undefined;
-  /** Explicit envelope label for provider-issued token normalization. */
-  readonly token_envelope?: TokenEnvelope | undefined;
-  /** Health/expiry/quota result from the account control plane. */
-  readonly usable?: boolean | undefined;
-  /** Non-secret per-account upstream auth configuration; see `ResolvedCredential`. */
-  readonly auth_state?: Readonly<Record<string, unknown>> | undefined;
-}
-
-/** Result of ordered credential selection, with no client-auth fields. */
-export interface CredentialResolution {
-  readonly credential: ResolvedCredential;
-  readonly alternative_index: number;
-}
-
-/**
- * Selects the first usable upstream credential alternative in operator order.
- * Public Cartethyia authentication is intentionally absent from this interface.
- */
-export class CredentialResolver {
-  /**
-   * Resolves an ordered list, including a genuine no-credential route.
-   * @throws GatewayError when all alternatives are unavailable.
-   */
-  resolve(
-    providerId: ProviderId,
-    alternatives: readonly CredentialAlternative[],
-  ): CredentialResolution {
-    for (const [alternativeIndex, alternative] of alternatives.entries()) {
-      if (alternative.provider_id !== providerId) continue;
-      if (alternative.usable === false) continue;
-      if (alternative.credential_kind === "none") {
-        return {
-          credential: {
-            provider_id: providerId,
-            ...(alternative.account_id === undefined ? {} : { account_id: alternative.account_id }),
-            credential_kind: "none",
-            ...(alternative.auth_state === undefined ? {} : { auth_state: alternative.auth_state }),
-          },
-          alternative_index: alternativeIndex,
-        };
-      }
-      const secret = resolveSecret(alternative.secret, alternative.token_envelope);
-      if (secret === undefined) continue;
-      return {
-        credential: {
-          provider_id: providerId,
-          ...(alternative.account_id === undefined ? {} : { account_id: alternative.account_id }),
-          credential_kind: alternative.credential_kind,
-          secret,
-          ...(alternative.auth_state === undefined ? {} : { auth_state: alternative.auth_state }),
-        },
-        alternative_index: alternativeIndex,
-      };
-    }
-
-    throw new GatewayError(
-      "invalid_request",
-      401,
-      "No usable upstream credential is configured for the selected provider",
-      { provider_id: providerId },
-    );
-  }
-}
-
-function resolveSecret(
-  value: CredentialAlternative["secret"],
-  envelope: TokenEnvelope | undefined,
-): Uint8Array | undefined {
-  if (value === undefined) return undefined;
-  const unwrapped = unwrapProviderToken(value, envelope);
-  return unwrapped.length === 0 ? undefined : unwrapped;
-}
-

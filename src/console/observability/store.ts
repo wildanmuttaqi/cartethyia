@@ -1,10 +1,16 @@
-import { loadavg, cpus } from "node:os";
-import { and, desc, eq, gte, inArray, isNotNull, ne, sql } from "drizzle-orm";
-import type { CartethyiaDatabase } from "../../persistence/postgres";
+import { loadavg, cpus, totalmem } from "node:os";
+import { and, desc, eq, inArray } from "drizzle-orm";
+import type { CartethyiaDatabase } from "../../persistence/db-handle";
 import type { RedisClient } from "../../persistence/redis";
-import { apiKeys, networkPools, telemetryEvents, telemetryPayloads } from "../../persistence/schema";
-import { decodeDatedCursor, encodeCursor } from "../../persistence/page-cursor";
-import { CARTETHYIA_VERSION } from "../../transport/version";
+import { apiKeys, networkPools, telemetryPayloads } from "../../persistence/schema";
+import {
+  queryTelemetryEvents,
+  type TelemetryEventRecord,
+} from "../../observability/event-log";
+import { isGatewayError } from "../../observability/telemetry-status";
+import { cachedRead } from "../shared/read-through-cache";
+import { decodeDatedCursor, encodeCursor } from "../shared/cursor";
+import { CARTETHYIA_VERSION } from "../../version";
 import { CachedPreferencesReader, DrizzlePreferencesReader, type PreferencesReader } from "../../persistence/tenant-preferences";
 import type {
   ObservabilityStore,
@@ -25,19 +31,19 @@ import type {
 } from "./contracts";
 import { maskClientIp } from "../../observability/redaction";
 import { splitEndpointConfig } from "../../network/pool/agent";
+import { resolveDbMode } from "../../persistence/db-mode";
 import { payloadReferenceFromRow, readPayloadFrame } from "../../observability/payload-store";
-import { ConsoleDomainError } from "../shared/errors";
 import { shouldMaskClientIp } from "../shared/ip-privacy";
-import { gatewayErrorSql } from "../../observability/telemetry-status";
 
-function mapTelemetryEventRow(event: typeof telemetryEvents.$inferSelect): TelemetryEventView {
+function mapTelemetryEventRow(event: TelemetryEventRecord): TelemetryEventView {
   return {
     id: event.id,
-    createdAt: event.createdAt.toISOString(),
-    tenantId: event.tenantId,
+    createdAt: event.createdAt,
+    tenantId: event.tenantId ?? "",
     requestId: event.requestId,
     ...(event.sourceSurface ? { sourceSurface: event.sourceSurface } : {}),
     ...(event.requestedModel ? { requestedModel: event.requestedModel } : {}),
+    ...(event.reportedModel ? { reportedModel: event.reportedModel } : {}),
     ...(event.providerId ? { providerId: event.providerId } : {}),
     ...(event.latencyMs !== null ? { latencyMs: event.latencyMs ?? undefined } : {}),
     ...(event.status ? { status: event.status } : {}),
@@ -51,28 +57,13 @@ function mapTelemetryEventRow(event: typeof telemetryEvents.$inferSelect): Telem
     ...(event.lastEventAtMs !== null ? { lastEventAtMs: event.lastEventAtMs } : {}),
   };
 }
-function effectiveHttpStatusExpression() {
-  return sql<number>`coalesce(
-    ${telemetryEvents.httpStatus},
-    case ${telemetryEvents.status}
-      when 'completed' then 200
-      when 'cancelled' then 499
-      when 'truncated' then 502
-      else 500
-    end
-  )`;
-}
-
-/**
- * Counts gateway errors, not client outcomes.
- *
- * Delegates to the one shared predicate so the summary, health, breakdown and
- * the durable rollup cannot drift apart: 404/499/503 are recorded and shown
- * but never counted, because they are the caller's own outcome, a client
- * abort, or the gateway correctly refusing work it cannot do.
- */
-function gatewayErrors() {
-  return gatewayErrorSql(telemetryEvents.status, telemetryEvents.httpStatus);
+/** The HTTP status a row renders as when the wire status was never recorded. */
+function effectiveHttpStatus(event: TelemetryEventRecord): number {
+  if (event.httpStatus !== null) return event.httpStatus;
+  if (event.status === "completed") return 200;
+  if (event.status === "cancelled") return 499;
+  if (event.status === "truncated") return 502;
+  return 500;
 }
 
 /**
@@ -123,14 +114,14 @@ function chartBucketSeconds(period: string): number {
  * The model id with the client's requested reasoning effort as a display
  * suffix — only when the request actually carried one.
  */
-function modelWithEffort(event: typeof telemetryEvents.$inferSelect): string | undefined {
+function modelWithEffort(event: TelemetryEventRecord): string | undefined {
   const model = event.requestedModel;
   if (!model) return undefined;
   return event.requestedEffort ? `${model} (${event.requestedEffort})` : model;
 }
 
 function mapUsageRequestItem(
-  event: typeof telemetryEvents.$inferSelect,
+  event: TelemetryEventRecord,
   hideClientIp: boolean,
 ): UsageRequestItem {
   const input = event.inputTokens ?? 0;
@@ -141,20 +132,13 @@ function mapUsageRequestItem(
     ...(event.providerId ? { providerId: event.providerId } : {}),
     ...(event.accountId ? { accountId: event.accountId } : {}),
     ...(modelWithEffort(event) === undefined ? {} : { model: modelWithEffort(event) as string }),
+    ...(event.reportedModel ? { reportedModel: event.reportedModel } : {}),
     status: event.status ?? "unknown",
     ...(event.errorCategory ? { errorKind: event.errorCategory } : {}),
     ...(event.errorOrigin ? { errorOrigin: event.errorOrigin } : {}),
-    httpStatus:
-      event.httpStatus ??
-      (event.status === "completed"
-        ? 200
-        : event.status === "cancelled"
-          ? 499
-          : event.status === "truncated"
-            ? 502
-            : 500),
+    httpStatus: effectiveHttpStatus(event),
     mode: event.stream ? "stream" : "non_stream",
-    startedAt: event.createdAt.toISOString(),
+    startedAt: event.createdAt,
     ...(event.latencyMs !== null ? { durationMs: event.latencyMs ?? undefined } : {}),
     ...(event.inputTokens !== null ? { inputTokens: event.inputTokens ?? undefined } : {}),
     ...(event.outputTokens !== null ? { outputTokens: event.outputTokens ?? undefined } : {}),
@@ -185,6 +169,9 @@ function mapUsageRequestItem(
     ...(event.resolveMs !== null && event.resolveMs !== undefined
       ? { resolveMs: event.resolveMs }
       : {}),
+    // Why the drawer is empty for this request — see the contract field. This is
+    // what makes the blank panels diagnosable without server logs.
+    ...(event.payloadCaptureState ? { payloadCaptureState: event.payloadCaptureState } : {}),
   };
 }
 async function resolveProxyLabel(
@@ -204,9 +191,100 @@ async function resolveProxyLabel(
 }
 const HEALTH_WINDOW_MS = 24 * 3_600_000;
 const TOP_N = 50;
+/**
+ * How long a parsed window is shared. A dashboard poll fires ~8 usage
+ * endpoints at once, and a slow parse used to outlive a 1.5 s window — so the
+ * endpoints that missed it each re-read and re-parsed the same files, which is
+ * how one page load became several full parses of the retention window.
+ */
+const PERIOD_MEMO_TTL_MS = 5_000;
+
+/** Nearest-rank percentile over a sorted array, matching `percentile_cont` closely enough for a health gauge. */
+function percentile(sorted: readonly number[], fraction: number): number {
+  if (sorted.length === 0) return 0;
+  const index = Math.min(sorted.length - 1, Math.max(0, Math.ceil(fraction * sorted.length) - 1));
+  return Math.round(sorted[index] ?? 0);
+}
+
+export interface UsagePerformanceSummary {
+  avgResolveMs: number;
+  avgDurationMs: number;
+  latencyP50Ms: number;
+  latencyP95Ms: number;
+  latencyP99Ms: number;
+  /** Events each series was computed from; see `UsageSummaryTotals`. */
+  latencySampleCount: number;
+  resolveSampleCount: number;
+}
+
+/** Summarizes routing delay and request latency for an already-filtered period. */
+export function summarizeUsagePerformance(
+  events: readonly Pick<TelemetryEventRecord, "latencyMs" | "resolveMs">[],
+): UsagePerformanceSummary {
+  const latencies: number[] = [];
+  let latencySum = 0;
+  let resolveSum = 0;
+  let resolveCount = 0;
+  for (const event of events) {
+    if (event.latencyMs !== null) {
+      latencies.push(event.latencyMs);
+      latencySum += event.latencyMs;
+    }
+    if (event.resolveMs !== null) {
+      resolveSum += event.resolveMs;
+      resolveCount += 1;
+    }
+  }
+  latencies.sort((a, b) => a - b);
+  return {
+    avgResolveMs: resolveCount > 0 ? resolveSum / resolveCount : 0,
+    avgDurationMs: latencies.length > 0 ? latencySum / latencies.length : 0,
+    latencyP50Ms: percentile(latencies, 0.5),
+    latencyP95Ms: percentile(latencies, 0.95),
+    latencyP99Ms: percentile(latencies, 0.99),
+    latencySampleCount: latencies.length,
+    resolveSampleCount: resolveCount,
+  };
+}
+
+/** The largest entries of a count map, capped. */
+function topCounts(counts: ReadonlyMap<string, number>, limit: number): Array<[string, number]> {
+  return [...counts].sort((a, b) => b[1] - a[1]).slice(0, limit);
+}
+
+/** The grouping value for one usage breakdown dimension. */
+function dimensionName(dimension: UsageDimension, event: TelemetryEventRecord): string | null {
+  if (dimension === "model") return event.requestedModel;
+  if (dimension === "key") return event.apiKeyId;
+  if (dimension === "client") return event.userAgent;
+  if (dimension === "client_ip") return event.clientIp;
+  return event.providerId;
+}
+
+interface BreakdownBucket {
+  name: string;
+  requests: number;
+  input: number;
+  output: number;
+  cached: number;
+  errors: number;
+  cost: number | null;
+  rateSum: number;
+  rateCount: number;
+}
+
+function emptyBreakdown(name: string): BreakdownBucket {
+  return { name, requests: 0, input: 0, output: 0, cached: 0, errors: 0, cost: null, rateSum: 0, rateCount: 0 };
+}
 
 /** Real Drizzle-backed observability repository used by the production console. */
 export class DrizzleObservabilityStore implements ObservabilityStore {
+  /**
+   * Per-(tenant, period) parsed event set, shared by the ~8 usage endpoints
+   * one dashboard poll fires in parallel. 1.5 s window: a poll burst shares
+   * one file parse; the next poll re-reads. In-flight shares one promise.
+   */
+  private readonly periodMemo = new Map<string, { at: number; promise: Promise<readonly TelemetryEventRecord[]> }>();
   constructor(
     private readonly db: CartethyiaDatabase,
     private readonly redis: RedisClient | undefined,
@@ -237,36 +315,44 @@ export class DrizzleObservabilityStore implements ObservabilityStore {
     let cacheHitRate = 0;
     let avgTokensPerSec = 0;
     try {
-      // Bounded 24h rolling window (matches the Overview copy) over the
-      // tenant+created index — never a whole-table percentile sort.
+      // Bounded 24h rolling window (matches the Overview copy). The file is the
+      // source, so the percentiles are computed over the retained events.
       const since = new Date(Date.now() - HEALTH_WINDOW_MS);
-      const rows = await this.db
-        .select({
-          total: sql<number>`count(*)`,
-          errors: sql<number>`count(*) filter (where ${gatewayErrors()})`,
-          avg: sql<number>`coalesce(avg(${telemetryEvents.latencyMs}), 0)`,
-          p95: sql<number>`coalesce(percentile_cont(0.95) within group (order by ${telemetryEvents.latencyMs}), 0)`,
-          p99: sql<number>`coalesce(percentile_cont(0.99) within group (order by ${telemetryEvents.latencyMs}), 0)`,
-          cachedTokens: sql<number>`coalesce(sum(${telemetryEvents.cachedInputTokens}) filter (where ${telemetryEvents.cachedInputTokens} is not null), 0)`,
-          inputTokens: sql<number>`coalesce(sum(${telemetryEvents.inputTokens}) filter (where ${telemetryEvents.cachedInputTokens} is not null), 0)`,
-          outputTokens: sql<number>`coalesce(sum(${telemetryEvents.outputTokens}) filter (where ${telemetryEvents.cachedInputTokens} is not null), 0)`,
-          avgTokensPerSec: sql<number>`coalesce(avg(${telemetryEvents.tokensPerSec}) filter (where ${telemetryEvents.tokensPerSec} is not null), 0)`,
-        })
-        .from(telemetryEvents)
-        .where(and(eq(telemetryEvents.tenantId, tenantId), gte(telemetryEvents.createdAt, since)));
-      const row = rows[0];
-      total = Number(row?.total ?? 0);
-      errors = Number(row?.errors ?? 0);
-      avg = Math.round(Number(row?.avg ?? 0));
-      p95 = Math.round(Number(row?.p95 ?? 0));
-      p99 = Math.round(Number(row?.p99 ?? 0));
-      const inputTokens = Number(row?.inputTokens ?? 0);
-      const outputTokens = Number(row?.outputTokens ?? 0);
-      // Prompt share of all tokens: the operator-facing cache column now
-      // leads with input, so a cached/input ratio would read a constant 100%.
-      const tokenTotal = inputTokens + outputTokens;
-      cacheHitRate = tokenTotal > 0 ? Math.round((inputTokens / tokenTotal) * 10000) / 100 : 0;
-      avgTokensPerSec = Number(row?.avgTokensPerSec ?? 0);
+      const events = await queryTelemetryEvents({ tenantId, since });
+      const latencies: number[] = [];
+      let latencySum = 0;
+      let inputTokens = 0;
+      let cachedTokens = 0;
+      let outputTokens = 0;
+      let tokensPerSecSum = 0;
+      let tokensPerSecCount = 0;
+      for (const event of events) {
+        total += 1;
+        if (isGatewayError(event.status, event.httpStatus)) errors += 1;
+        if (event.latencyMs !== null) {
+          latencies.push(event.latencyMs);
+          latencySum += event.latencyMs;
+        }
+        if (event.cachedInputTokens !== null && event.cachedInputTokens > 0) {
+          inputTokens += event.inputTokens ?? 0;
+          cachedTokens += event.inputTokens ?? 0;
+          outputTokens += event.outputTokens ?? 0;
+        }
+        if (event.tokensPerSec !== null) {
+          tokensPerSecSum += event.tokensPerSec;
+          tokensPerSecCount += 1;
+        }
+      }
+      latencies.sort((a, b) => a - b);
+      avg = latencies.length > 0 ? Math.round(latencySum / latencies.length) : 0;
+      p95 = percentile(latencies, 0.95);
+      p99 = percentile(latencies, 0.99);
+      // Cached share of the prompt: cached/input, the same honest definition
+      // usageSummary uses, so the health card and the Usage page cannot
+      // disagree. (This used to be prompt-share input/(input+output), which
+      // read ~99% and was mislabeled a cache hit rate.)
+      cacheHitRate = inputTokens > 0 ? Math.round((cachedTokens / inputTokens) * 10000) / 100 : 0;
+      avgTokensPerSec = tokensPerSecCount > 0 ? tokensPerSecSum / tokensPerSecCount : 0;
     } catch {
       databaseHealthy = false;
     }
@@ -288,16 +374,20 @@ export class DrizzleObservabilityStore implements ObservabilityStore {
         : "healthy";
 
     return {
-      version: process.env.CARTETHYIA_VERSION ?? CARTETHYIA_VERSION,
+      version: CARTETHYIA_VERSION,
       status,
       uptime_seconds: Math.floor(process.uptime()),
       database_healthy: databaseHealthy,
       redis_healthy: redisHealthy,
+      redis_configured: this.redis !== undefined,
+      memory_heap_bytes: memory.heapUsed,
+      memory_external_bytes: memory.external,
       memory_bytes: memory.rss,
-      memory_percent: Math.round((memory.rss / Math.max(memory.heapTotal, 1)) * 10000) / 100,
-      heap_used_bytes: memory.heapUsed,
-      heap_total_bytes: memory.heapTotal,
-      external_bytes: memory.external,
+      memory_percent: Math.round((memory.rss / Math.max(totalmem(), 1)) * 10000) / 100,
+      // Reported so the console can explain a large RSS instead of leaving the
+      // operator to read it as the gateway alone. In lite mode this process
+      // hosts the database too, so the resident set covers both.
+      database_in_process: resolveDbMode() === "lite",
       cpu_percent: cpuPercent,
       cpu_cores: cpus().length,
       pid: process.pid,
@@ -312,165 +402,158 @@ export class DrizzleObservabilityStore implements ObservabilityStore {
     };
   }
   async usage(tenantId: string, period: string): Promise<UsageResponse> {
-    return this.computeUsage(tenantId, period);
+    return this.readThrough(this.usageCacheKey(tenantId, period, "usage"), () =>
+      this.computeUsage(tenantId, period),
+    );
+  }
+
+  /**
+   * Cache key for one usage response. Versioned so a shape change can never be
+   * read back from a deployment that still holds the old one.
+   */
+  private usageCacheKey(tenantId: string, period: string, shape: string): string {
+    return `cartethyia:usage:v1:${shape}:${tenantId}:${period}`;
+  }
+
+  /** Reads a usage response through Redis; computes when no cache is configured. */
+  private readThrough<T>(key: string, compute: () => Promise<T>): Promise<T> {
+    return cachedRead(this.redis, key, compute);
   }
 
   private async computeUsage(tenantId: string, period: string): Promise<UsageResponse> {
-    const since = periodStartDate(period);
-    const scope = since
-      ? and(eq(telemetryEvents.tenantId, tenantId), gte(telemetryEvents.createdAt, since))
-      : eq(telemetryEvents.tenantId, tenantId);
-    // Single indexed aggregate row instead of materializing every event
-    // into the Node heap and regrouping in JS.
-    const [totals] = await this.db
-      .select({
-        requestsTotal: sql<number>`count(*)`,
-        requestsSucceeded: sql<number>`count(*) filter (where ${telemetryEvents.status} = 'completed')`,
-        requestsFailed: sql<number>`count(*) filter (where ${gatewayErrors()})`,
-        tokensUsed: sql<number>`coalesce(sum(${telemetryEvents.inputTokens} + ${telemetryEvents.outputTokens}), 0)`,
-        estimatedCost: sql<number>`coalesce(sum(${telemetryEvents.estimatedCostUsd}), 0)`,
-      })
-      .from(telemetryEvents)
-      .where(scope);
-    const requestsTotal = Number(totals?.requestsTotal ?? 0);
-    const requestsSucceeded = Number(totals?.requestsSucceeded ?? 0);
-    const requestsFailed = Number(totals?.requestsFailed ?? 0);
-    const modelRows = await this.db
-      .select({
-        modelId: telemetryEvents.requestedModel,
-        count: sql<number>`count(*)`,
-      })
-      .from(telemetryEvents)
-      .where(scope)
-      .groupBy(telemetryEvents.requestedModel)
-      .orderBy(sql`count(*) desc`)
-      .limit(TOP_N);
-    const providerRows = await this.db
-      .select({
-        providerId: telemetryEvents.providerId,
-        count: sql<number>`count(*)`,
-      })
-      .from(telemetryEvents)
-      .where(scope)
-      .groupBy(telemetryEvents.providerId)
-      .orderBy(sql`count(*) desc`)
-      .limit(TOP_N);
+    const events = await this.periodEvents(tenantId, period);
+    let requestsTotal = 0;
+    let requestsSucceeded = 0;
+    let requestsFailed = 0;
+    let tokensUsed = 0;
+    let estimatedCost = 0;
+    const models = new Map<string, number>();
+    const providers = new Map<string, number>();
+    for (const event of events) {
+      requestsTotal += 1;
+      if (event.status === "completed") requestsSucceeded += 1;
+      if (isGatewayError(event.status, event.httpStatus)) requestsFailed += 1;
+      tokensUsed += (event.inputTokens ?? 0) + (event.outputTokens ?? 0);
+      estimatedCost += event.estimatedCostUsd ?? 0;
+      if (event.requestedModel) models.set(event.requestedModel, (models.get(event.requestedModel) ?? 0) + 1);
+      if (event.providerId) providers.set(event.providerId, (providers.get(event.providerId) ?? 0) + 1);
+    }
     return {
       tenantId,
       period,
       requestsTotal,
       requestsSucceeded,
       requestsFailed,
-      tokensUsed: Number(totals?.tokensUsed ?? 0),
-      estimatedCost: Number(totals?.estimatedCost ?? 0),
-      topModels: modelRows
-        .filter((row) => row.modelId !== null)
-        .map((row) => {
-          if (typeof row.modelId !== "string")
-            throw new ConsoleDomainError("internal_error", 500, "Usage model row missing modelId");
-          return { modelId: row.modelId, count: Number(row.count) };
-        }),
-      topProviders: providerRows
-        .filter((row) => row.providerId !== null)
-        .map((row) => {
-          if (typeof row.providerId !== "string")
-            throw new ConsoleDomainError("internal_error", 500, "Usage provider row missing providerId");
-          return { providerId: row.providerId, count: Number(row.count) };
-        }),
+      tokensUsed,
+      estimatedCost,
+      topModels: topCounts(models, TOP_N).map(([modelId, count]) => ({ modelId, count })),
+      topProviders: topCounts(providers, TOP_N).map(([providerId, count]) => ({ providerId, count })),
     };
   }
 
-  private usageScope(tenantId: string, period: string) {
+  /** The tenant's retained events inside a usage period. `all` keeps everything. */
+  private periodEvents(tenantId: string, period: string): Promise<readonly TelemetryEventRecord[]> {
+    const key = `${tenantId}:${period}`;
+    const now = Date.now();
+    const hit = this.periodMemo.get(key);
+    if (hit && now - hit.at < PERIOD_MEMO_TTL_MS) return hit.promise;
     const since = periodStartDate(period);
-    return since
-      ? and(eq(telemetryEvents.tenantId, tenantId), gte(telemetryEvents.createdAt, since))
-      : eq(telemetryEvents.tenantId, tenantId);
+    const promise = queryTelemetryEvents(since === undefined ? { tenantId } : { tenantId, since });
+    this.periodMemo.set(key, { at: now, promise });
+    // A rejected parse must not poison the memo for the next poll.
+    void promise.catch(() => {
+      if (this.periodMemo.get(key)?.promise === promise) this.periodMemo.delete(key);
+    });
+    return promise;
   }
 
   async usageSummary(tenantId: string, period: string): Promise<UsageSummaryResponse> {
-    const [row] = await this.db
-      .select({
-        requests: sql<number>`count(*)`,
-        inputTokens: sql<number>`coalesce(sum(${telemetryEvents.inputTokens}), 0)`,
-        cachedTokens: sql<number>`coalesce(sum(${telemetryEvents.inputTokens}) filter (where ${telemetryEvents.cachedInputTokens} > 0), 0)`,
-        outputTokens: sql<number>`coalesce(sum(${telemetryEvents.outputTokens}), 0)`,
-        errors: sql<number>`count(*) filter (where ${gatewayErrors()})`,
-        cancelled: sql<number>`count(*) filter (where ${telemetryEvents.status} = 'cancelled')`,
-        truncated: sql<number>`count(*) filter (where ${telemetryEvents.status} = 'truncated')`,
-        avgDurationMs: sql<number>`coalesce(avg(${telemetryEvents.latencyMs}), 0)`,
-        estimatedCostUsd: sql<number>`coalesce(sum(${telemetryEvents.estimatedCostUsd}), 0)`,
-        unpriced: sql<number>`count(*) filter (where ${telemetryEvents.status} = 'completed' and ${telemetryEvents.estimatedCostUsd} is null)`,
-        avgTokensPerSec: sql<number>`coalesce(avg(${telemetryEvents.tokensPerSec}) filter (where ${telemetryEvents.tokensPerSec} is not null), 0)`,
-      })
-      .from(telemetryEvents)
-      .where(this.usageScope(tenantId, period));
-    const statusRows = await this.db
-      .select({
-        status: effectiveHttpStatusExpression(),
-        count: sql<number>`count(*)`,
-      })
-      .from(telemetryEvents)
-      .where(this.usageScope(tenantId, period))
-      .groupBy(sql`1`)
-      .orderBy(sql`1`);
-    const statusCounts = statusRows.map((statusRow) => ({
-      status: Number(statusRow.status),
-      count: Number(statusRow.count),
-    }));
-    const inputTokens = Number(row?.inputTokens ?? 0);
-    const cachedTokens = Number(row?.cachedTokens ?? 0);
-    const outputTokens = Number(row?.outputTokens ?? 0);
+    return this.readThrough(this.usageCacheKey(tenantId, period, "summary"), () =>
+      this.computeSummary(tenantId, period),
+    );
+  }
+
+  private async computeSummary(tenantId: string, period: string): Promise<UsageSummaryResponse> {
+    const events = await this.periodEvents(tenantId, period);
+    const performance = summarizeUsagePerformance(events);
+    let requests = 0;
+    let inputTokens = 0;
+    let cachedTokens = 0;
+    let outputTokens = 0;
+    let errors = 0;
+    let cancelled = 0;
+    let truncated = 0;
+    let estimatedCostUsd = 0;
+    let unpriced = 0;
+    let tokensPerSecSum = 0;
+    let tokensPerSecCount = 0;
+    const statuses = new Map<number, number>();
+    for (const event of events) {
+      requests += 1;
+      inputTokens += event.inputTokens ?? 0;
+      outputTokens += event.outputTokens ?? 0;
+      if (event.cachedInputTokens !== null && event.cachedInputTokens > 0) {
+        cachedTokens += event.inputTokens ?? 0;
+      }
+      if (isGatewayError(event.status, event.httpStatus)) errors += 1;
+      if (event.status === "cancelled") cancelled += 1;
+      if (event.status === "truncated") truncated += 1;
+      if (event.estimatedCostUsd !== null) estimatedCostUsd += event.estimatedCostUsd;
+      else if (event.status === "completed") unpriced += 1;
+      if (event.tokensPerSec !== null) {
+        tokensPerSecSum += event.tokensPerSec;
+        tokensPerSecCount += 1;
+      }
+      const status = effectiveHttpStatus(event);
+      statuses.set(status, (statuses.get(status) ?? 0) + 1);
+    }
     return {
       period,
       totals: {
-        statusCounts,
-        requests: Number(row?.requests ?? 0),
+        statusCounts: [...statuses].sort(([a], [b]) => a - b).map(([status, count]) => ({ status, count })),
+        requests,
         inputTokens,
         cachedTokens,
         outputTokens,
-        errors: Number(row?.errors ?? 0),
-        cancelled: Number(row?.cancelled ?? 0),
-        truncated: Number(row?.truncated ?? 0),
-        avgDurationMs: Number(row?.avgDurationMs ?? 0),
-        estimatedCostUsd: Number(row?.estimatedCostUsd ?? 0),
-        partial: Number(row?.unpriced ?? 0) > 0,
+        errors,
+        cancelled,
+        truncated,
+        ...performance,
+        estimatedCostUsd,
+        partial: unpriced > 0,
         cacheHitRate: inputTokens > 0 ? (cachedTokens / inputTokens) * 100 : 0,
-        avgTokensPerSec: Number(row?.avgTokensPerSec ?? 0),
+        avgTokensPerSec: tokensPerSecCount > 0 ? tokensPerSecSum / tokensPerSecCount : 0,
       },
     };
   }
 
   async usageChart(tenantId: string, period: string): Promise<UsageChartResponse> {
+    return this.readThrough(this.usageCacheKey(tenantId, period, "chart"), () =>
+      this.computeChart(tenantId, period),
+    );
+  }
+
+  private async computeChart(tenantId: string, period: string): Promise<UsageChartResponse> {
     const since = periodStartDate(period);
     const bucketSeconds = chartBucketSeconds(period);
-    const rows = await this.db
-      .select({
-        bucket: sql<Date>`to_timestamp(floor(extract(epoch from ${telemetryEvents.createdAt}) / ${bucketSeconds}) * ${bucketSeconds})`,
-        requests: sql<number>`count(*)`,
-        input: sql<number>`coalesce(sum(${telemetryEvents.inputTokens}), 0)`,
-        cached: sql<number>`coalesce(sum(${telemetryEvents.inputTokens}) filter (where ${telemetryEvents.cachedInputTokens} > 0), 0)`,
-        output: sql<number>`coalesce(sum(${telemetryEvents.outputTokens}), 0)`,
-      })
-      .from(telemetryEvents)
-      .where(this.usageScope(tenantId, period))
-      .groupBy(sql`1`)
-      .orderBy(sql`1`);
+    const stepMs = bucketSeconds * 1000;
+    const events = await this.periodEvents(tenantId, period);
     const byTime = new Map<number, UsageChartBucket>();
-    for (const row of rows) {
-      const start = Math.floor(new Date(row.bucket).getTime() / 1000) * 1000;
-      if (!Number.isFinite(start)) continue;
-      byTime.set(start, {
-        t: new Date(start).toISOString(),
-        requests: Number(row.requests ?? 0),
-        input: Number(row.input ?? 0),
-        cached: Number(row.cached ?? 0),
-        output: Number(row.output ?? 0),
-      });
+    for (const event of events) {
+      const at = new Date(event.createdAt).getTime();
+      if (!Number.isFinite(at)) continue;
+      const start = Math.floor(at / stepMs) * stepMs;
+      const bucket = byTime.get(start) ?? { t: new Date(start).toISOString(), requests: 0, input: 0, cached: 0, output: 0 };
+      bucket.requests += 1;
+      bucket.input += event.inputTokens ?? 0;
+      bucket.cached += event.cachedInputTokens !== null && event.cachedInputTokens > 0 ? (event.inputTokens ?? 0) : 0;
+      bucket.output += event.outputTokens ?? 0;
+      byTime.set(start, bucket);
     }
+    const rows = [...byTime.keys()];
     const first = rows.length > 0 ? Math.min(...byTime.keys()) : undefined;
     const startMs = since ? since.getTime() : first;
     if (startMs === undefined) return { buckets: [] };
-    const stepMs = bucketSeconds * 1000;
     const aligned = Math.floor(startMs / stepMs) * stepMs;
     const buckets: UsageChartBucket[] = [];
     for (let at = aligned; at <= Date.now(); at += stepMs) {
@@ -486,61 +569,57 @@ export class DrizzleObservabilityStore implements ObservabilityStore {
     dimension: UsageDimension,
     period: string,
   ): Promise<UsageByResponse> {
-    const column =
-      dimension === "model"
-        ? telemetryEvents.requestedModel
-        : dimension === "key"
-          ? telemetryEvents.apiKeyId
-          : dimension === "client"
-            ? telemetryEvents.userAgent
-            : dimension === "client_ip"
-              ? telemetryEvents.clientIp
-              : telemetryEvents.providerId;
-    const rows = await this.db
-      .select({
-        name: column,
-        requests: sql<number>`count(*)`,
-        input: sql<number>`coalesce(sum(${telemetryEvents.inputTokens}), 0)`,
-        output: sql<number>`coalesce(sum(${telemetryEvents.outputTokens}), 0)`,
-        cached: sql<number>`coalesce(sum(${telemetryEvents.inputTokens}) filter (where ${telemetryEvents.cachedInputTokens} > 0), 0)`,
-        errors: sql<number>`count(*) filter (where ${gatewayErrors()})`,
-        cost: sql<string | null>`sum(${telemetryEvents.estimatedCostUsd})`,
-        avgTokensPerSec: sql<number>`coalesce(avg(${telemetryEvents.tokensPerSec}) filter (where ${telemetryEvents.tokensPerSec} is not null), 0)`,
-      })
-      .from(telemetryEvents)
-      .where(
-        dimension === "key"
-          ? and(this.usageScope(tenantId, period), isNotNull(telemetryEvents.apiKeyId))
-          : and(this.usageScope(tenantId, period), isNotNull(column), ne(column, "")),
-      )
-      .groupBy(column)
-      .orderBy(sql`count(*) desc`)
-      .limit(100);
-    const mapped = rows.map((row) => {
-      const input = Number(row.input ?? 0);
-      const output = Number(row.output ?? 0);
-      const cached = Number(row.cached ?? 0);
-      if (typeof row.name !== "string" || row.name.length === 0)
-        throw new ConsoleDomainError("internal_error", 500, "Usage breakdown row missing name");
-      const name = dimension === "client" ? clientNameFromUserAgent(row.name) : row.name;
-      return {
-        name,
-        requests: Number(row.requests ?? 0),
-        input,
-        output,
-        cached,
-        total: input + output,
-        errors: Number(row.errors ?? 0),
-        costUsd: row.cost === null ? null : Number(row.cost),
-        cacheHitRate: input + output > 0 ? (input / (input + output)) * 100 : 0,
-        avgTokensPerSec: Number(row.avgTokensPerSec ?? 0),
-      };
-    });
+    return this.readThrough(this.usageCacheKey(tenantId, `${dimension}:${period}`, "by"), () =>
+      this.computeBy(tenantId, dimension, period),
+    );
+  }
+
+  private async computeBy(
+    tenantId: string,
+    dimension: UsageDimension,
+    period: string,
+  ): Promise<UsageByResponse> {
+    const events = await this.periodEvents(tenantId, period);
+    const groups = new Map<string, BreakdownBucket>();
+    for (const event of events) {
+      const raw = dimensionName(dimension, event);
+      if (raw === null || raw.length === 0) continue;
+      const name = dimension === "client" ? clientNameFromUserAgent(raw) : raw;
+      const bucket = groups.get(name) ?? emptyBreakdown(name);
+      bucket.requests += 1;
+      bucket.input += event.inputTokens ?? 0;
+      bucket.output += event.outputTokens ?? 0;
+      if (event.cachedInputTokens !== null && event.cachedInputTokens > 0) {
+        bucket.cached += event.inputTokens ?? 0;
+      }
+      if (isGatewayError(event.status, event.httpStatus)) bucket.errors += 1;
+      if (event.estimatedCostUsd !== null) bucket.cost = (bucket.cost ?? 0) + event.estimatedCostUsd;
+      if (event.tokensPerSec !== null) {
+        bucket.rateSum += event.tokensPerSec;
+        bucket.rateCount += 1;
+      }
+      groups.set(name, bucket);
+    }
+    const mapped = [...groups.values()]
+      .map((bucket) => ({
+        name: bucket.name,
+        requests: bucket.requests,
+        input: bucket.input,
+        output: bucket.output,
+        cached: bucket.cached,
+        total: bucket.input + bucket.output,
+        errors: bucket.errors,
+        costUsd: bucket.cost,
+        cacheHitRate: bucket.input > 0 ? (bucket.cached / bucket.input) * 100 : 0,
+        avgTokensPerSec: bucket.rateCount > 0 ? bucket.rateSum / bucket.rateCount : 0,
+      }))
+      .sort((a, b) => b.requests - a.requests)
+      .slice(0, 100);
     if (dimension === "client_ip") {
       // Same fail-closed gate as the request list: storage keeps the raw
       // address, only presentation masks it.
       const hideClientIp = await shouldMaskClientIp(this.preferences, tenantId);
-      if (!hideClientIp) return { rows: mapped };
+      if (!hideClientIp) return { dimension, rows: mapped };
       // Grouping happened on the raw address, so masking can collapse distinct
       // hosts into one display name (`203.0.113.7` and `203.0.113.9` both become
       // `203.0.113.xxx`). Re-aggregate by the masked name: two rows the operator
@@ -567,17 +646,19 @@ export class DrizzleObservabilityStore implements ObservabilityStore {
             existing.costUsd === null && row.costUsd === null
               ? null
               : (existing.costUsd ?? 0) + (row.costUsd ?? 0),
-          cacheHitRate: input + output > 0 ? (input / (input + output)) * 100 : 0,
+          cacheHitRate: input > 0 ? (existing.cached + row.cached) / input * 100 : 0,
         });
       }
       return {
+        dimension,
         rows: [...merged.values()].sort((a, b) => b.requests - a.requests),
       };
     }
-    if (dimension !== "key") return { rows: mapped };
+    if (dimension !== "key") return { dimension, rows: mapped };
     const ids = [...new Set(mapped.map((row) => row.name))];
     const labels = ids.length > 0 ? await this.apiKeyLabels(tenantId, ids) : new Map<string, string>();
     return {
+      dimension,
       rows: mapped.map((row) => {
         const label = labels.get(row.name);
         return label === undefined ? row : { ...row, label };
@@ -596,17 +677,23 @@ export class DrizzleObservabilityStore implements ObservabilityStore {
   }
 
   async usageCache(tenantId: string, period: string): Promise<UsageCacheResponse> {
-    const [row] = await this.db
-      .select({
-        inputTokens: sql<number>`coalesce(sum(${telemetryEvents.inputTokens}), 0)`,
-        cachedTokens: sql<number>`coalesce(sum(${telemetryEvents.inputTokens}) filter (where ${telemetryEvents.cachedInputTokens} > 0), 0)`,
-        outputTokens: sql<number>`coalesce(sum(${telemetryEvents.outputTokens}), 0)`,
-      })
-      .from(telemetryEvents)
-      .where(this.usageScope(tenantId, period));
-    const inputTokens = Number(row?.inputTokens ?? 0);
-    const cachedTokens = Number(row?.cachedTokens ?? 0);
-    const outputTokens = Number(row?.outputTokens ?? 0);
+    return this.readThrough(this.usageCacheKey(tenantId, period, "cache"), () =>
+      this.computeCache(tenantId, period),
+    );
+  }
+
+  private async computeCache(tenantId: string, period: string): Promise<UsageCacheResponse> {
+    const events = await this.periodEvents(tenantId, period);
+    let inputTokens = 0;
+    let cachedTokens = 0;
+    let outputTokens = 0;
+    for (const event of events) {
+      inputTokens += event.inputTokens ?? 0;
+      outputTokens += event.outputTokens ?? 0;
+      if (event.cachedInputTokens !== null && event.cachedInputTokens > 0) {
+        cachedTokens += event.inputTokens ?? 0;
+      }
+    }
     const tokenTotal = inputTokens + outputTokens;
     return {
       period,
@@ -623,16 +710,18 @@ export class DrizzleObservabilityStore implements ObservabilityStore {
     limit: number,
     httpStatus?: number,
   ): Promise<UsageRequestsResponse> {
-    const scope = this.usageScope(tenantId, period);
-    const filter = httpStatus === undefined
-      ? scope
-      : and(scope, eq(effectiveHttpStatusExpression(), httpStatus));
-    const rows = await this.db
-      .select()
-      .from(telemetryEvents)
-      .where(filter)
-      .orderBy(desc(telemetryEvents.createdAt), desc(telemetryEvents.id))
-      .limit(limit);
+    // Ask the reader for `limit` rows instead of folding the whole window and
+    // slicing it. It stops at the newest file that fills the page, so the
+    // console's most-polled endpoint no longer parses the retention window just
+    // to show 50 rows.
+    const since = periodStartDate(period);
+    const events = await queryTelemetryEvents({
+      tenantId,
+      limit,
+      ...(httpStatus === undefined ? {} : { httpStatus }),
+      ...(since === undefined ? {} : { since }),
+    });
+    const rows = events.slice(0, limit);
     const hideClientIp = await shouldMaskClientIp(this.preferences, tenantId);
     const keyIds = [...new Set(rows.map((row) => row.apiKeyId).filter((id): id is string => id !== null))];
     const labels = await this.apiKeyLabels(tenantId, keyIds);
@@ -648,23 +737,19 @@ export class DrizzleObservabilityStore implements ObservabilityStore {
     tenantId: string,
     requestId: string,
   ): Promise<UsageRequestDetail | undefined> {
-    const rows = await this.db
-      .select()
-      .from(telemetryEvents)
-      .where(and(eq(telemetryEvents.tenantId, tenantId), eq(telemetryEvents.requestId, requestId)))
-      .orderBy(desc(telemetryEvents.createdAt), desc(telemetryEvents.id))
-      .limit(1);
+    const rows = await queryTelemetryEvents({ tenantId, requestId });
     const event = rows[0];
     if (!event) return undefined;
-    const hideClientIp = await shouldMaskClientIp(this.preferences, tenantId);
+    // The label, proxy, and mask lookups are independent: run them together
+    // instead of three sequential round trips.
+    const [hideClientIp, keyLabels, proxy] = await Promise.all([
+      shouldMaskClientIp(this.preferences, tenantId),
+      event.apiKeyId ? this.apiKeyLabels(tenantId, [event.apiKeyId]) : undefined,
+      event.networkPoolId ? resolveProxyLabel(this.db, tenantId, event.networkPoolId) : ("direct" as const),
+    ]);
     const item = mapUsageRequestItem(event, hideClientIp);
-    const keyLabel = event.apiKeyId
-      ? (await this.apiKeyLabels(tenantId, [event.apiKeyId])).get(event.apiKeyId)
-      : undefined;
+    const keyLabel = event.apiKeyId ? keyLabels?.get(event.apiKeyId) : undefined;
     const labeled = keyLabel === undefined ? item : { ...item, apiKeyLabel: keyLabel };
-    const proxy = event.networkPoolId
-      ? await resolveProxyLabel(this.db, tenantId, event.networkPoolId)
-      : "direct";
     const presented = { ...labeled, proxy };
     // Filter the payload table directly instead of joining `telemetry_events`
     // only to re-apply the tenant predicate: `telemetry_payloads` carries
@@ -710,18 +795,11 @@ export class DrizzleObservabilityStore implements ObservabilityStore {
     cursor?: string,
   ): Promise<TelemetryEventListPage> {
     const before = decodeDatedCursor(cursor);
-    const filters = [eq(telemetryEvents.tenantId, tenantId)];
-    if (before) {
-      filters.push(
-        sql`(${telemetryEvents.createdAt}, ${telemetryEvents.id}) < (${new Date(before.createdAt)}, ${before.id})`,
-      );
-    }
-    const rows = await this.db
-      .select()
-      .from(telemetryEvents)
-      .where(and(...filters))
-      .orderBy(desc(telemetryEvents.createdAt), desc(telemetryEvents.id))
-      .limit(limit + 1);
+    const events = await queryTelemetryEvents({ tenantId, ...(before ? {} : { limit: limit + 1 }) });
+    const rows = (before
+      ? events.filter((event) => event.createdAt < before.createdAt || (event.createdAt === before.createdAt && event.id < before.id))
+      : events
+    ).slice(0, limit + 1);
     const overflow = rows.length > limit;
     const trimmed = overflow ? rows.slice(0, limit) : rows;
     const entries = trimmed.map(mapTelemetryEventRow);
@@ -739,17 +817,11 @@ export class DrizzleObservabilityStore implements ObservabilityStore {
     includePayload = false,
     createdAt?: string,
   ): Promise<TelemetryEventDetail | undefined> {
-    const filters = [eq(telemetryEvents.tenantId, tenantId), eq(telemetryEvents.id, eventId)];
-    if (createdAt) {
-      const at = new Date(createdAt);
-      if (!Number.isNaN(at.getTime())) filters.push(eq(telemetryEvents.createdAt, at));
-    }
-    const rows = await this.db
-      .select()
-      .from(telemetryEvents)
-      .where(and(...filters))
-      .limit(1);
-    const event = rows[0];
+    const events = await queryTelemetryEvents({ tenantId });
+    const event = events.find(
+      (candidate) =>
+        candidate.id === eventId && (createdAt === undefined || candidate.createdAt === createdAt),
+    );
     if (!event) return undefined;
     const base = mapTelemetryEventRow(event);
     if (!includePayload) return base;

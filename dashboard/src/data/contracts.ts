@@ -24,7 +24,7 @@ export type { TenantScope } from "../../../src/security/access-control";
 export {
   SHARE_POPUP_IMAGE_MAX_BYTES,
   SHARE_POPUP_IMAGE_MIMES,
-} from "../../../src/console/domains/api-keys/share-popup-image";
+} from "../../../src/console/api-keys/share-popup-image";
 // `CLIENT_ROUTER_IDS` is re-exported so the API-key editor offers exactly the
 // routers the backend can fingerprint, instead of a hand-kept copy that would
 // let the form offer an id the backend rejects. The module is pure (no imports),
@@ -47,6 +47,13 @@ export type {
   UsageSummaryTotals,
 } from "../../../src/console/observability/contracts";
 
+// The update badge compares the running version against the latest public
+// release tag. Both the payload shape and the comparison live in the backend's
+// `updates/` domain — the version module is pure, so importing it as a value
+// keeps the dashboard from carrying a second, drifted copy of the ordering.
+export type { LatestRelease } from "../../../src/console/updates/repository-updates";
+export { isNewerRelease } from "../../../src/console/updates/version-compare";
+
 export type {
   AccountInflightReading,
   ProviderResponse,
@@ -59,6 +66,7 @@ export type {
   ProviderRoutingResponse,
   UpdateProviderRoutingRequest,
   CreateProviderAccountRequest,
+  CreateProviderAccountBatchResult,
   CredentialKind,
   CredentialMode,
   UpdateProviderAccountRequest,
@@ -71,6 +79,7 @@ export type {
   ByokConnectionTestRequest,
   ByokConnectionTestResult,
   SetModelEnabledRequest,
+  BuddyGrowthTaskLedgerEntry,
 } from "../../../src/console/providers/catalog/contracts";
 
 export type { AccountHealthEventRecord } from "../../../src/providers/operations/account-health-service";
@@ -109,7 +118,7 @@ export type {
   CreateApiKeyResponse,
   UpdateApiKeyResponse,
   ShareKeyResponse,
-} from "../../../src/console/domains/api-keys/contracts";
+} from "../../../src/console/api-keys/contracts";
 
 // Model-abuse bans are a platform-admin, cross-tenant list (`GET`/`DELETE
 // /model-bans`). The row shape is the backend's own, so the dashboard never
@@ -129,15 +138,7 @@ export type { BackupPayload as BackupExportResponse } from "../../../src/console
 export type { ImportResult as BackupImportResponse } from "../../../src/console/backup/service";
 export type { ImportReport as BackupImportReport } from "../../../src/console/backup/nine-router";
 
-export type { AuditEntry, AuditListPage } from "../../../src/console/domains/audit/contracts";
-
-export type {
-  StudioMessage,
-  StudioAttachment,
-  StudioMediaResult,
-  StudioSessionView,
-  StudioSessionSummary,
-} from "../../../src/console/domains/studio/contracts";
+export type { AuditEntry, AuditListPage } from "../../../src/console/audit/contracts";
 
 export type {
   RuntimeSettingsResponse,
@@ -180,6 +181,8 @@ export type {
   CreateNetworkPoolRequest,
   NetworkPoolResponse,
   HealthCheckResult,
+  PoolProviderProbeResult,
+  PoolBatchProviderProbeResult,
   PoolSpeedTestResult,
   PoolStrategySetting,
   PoolBatchProbeResult,
@@ -190,6 +193,15 @@ export type {
   RelayTarget,
 } from "../../../src/console/routing/pools/relay-deploy";
 export { RELAY_TARGETS } from "../../../src/console/routing/pools/relay-deploy";
+// The region picker renders the backend's own list, so the form cannot offer a
+// region the deployer rejects. Both modules are pure, so these are safe values
+// in the browser bundle.
+export {
+  DEFAULT_RELAY_REGION,
+  RELAY_REGION_GROUPS,
+  RELAY_REGIONS,
+} from "../../../src/console/routing/pools/relay-regions";
+export type { RelayRegion } from "../../../src/console/routing/pools/relay-regions";
 export type { PoolHealthEvent } from "../../../src/network/pool-health-machine";
 
 

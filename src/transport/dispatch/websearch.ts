@@ -14,12 +14,12 @@
  * it only validates the trust boundary, drives the loop, and serializes the
  * normalized envelope.
  */
-import type { ProviderAdapter, ProviderDispatchTarget } from "../../providers/provider-registry";
-import { GatewayError } from "../gateway-error";
+import type { ProviderAdapter, ProviderDispatchTarget } from "../../providers/provider-contracts";
+import { GatewayError } from "../../protocol/gateway-error";
 import { resolveCredentialForAccount } from "../../providers/operations/provider-credential-service";
 import type { OAuthTokenRefresher, OAuthRefreshService } from "../../providers/authentication/oauth-refresh-service";
 import type { ValidatedNetworkBindingFactory } from "../../network/pool/resolver";
-import type { CartethyiaDatabase } from "../../persistence/postgres";
+import type { CartethyiaDatabase } from "../../persistence/db-handle";
 import type { RouteSnapshotService } from "../routing/route-model";
 import { metrics } from "../../observability/metrics";
 import type { NetworkPoolSelector } from "../../network/pool/selector";
@@ -44,8 +44,7 @@ export interface WebsearchHandlerDeps {
   readonly oauthRefreshService?: OAuthRefreshService;
 }
 
-/** Stable failover order for the built-in web-search surfaces. */
-const SEARCH_PROVIDER_ORDER = ["exa", "gemini", "codex"] as const;
+
 
 /** Adapter that can serve a web-search request. */
 type WebsearchAdapter = ProviderAdapter & {
@@ -69,10 +68,10 @@ export function createWebsearchHandler(deps: WebsearchHandlerDeps) {
     const authorization = state.authorization;
     const body = state.ingressBody;
     if (!authorization || body === null || typeof body !== "object" || Array.isArray(body))
-      throw new GatewayError("invalid_request", 400, "search request body must be a JSON object");
+      throw new GatewayError("invalid_request", 400, "The search body must be a JSON object. Send one with at least a model and a query.");
     const search = body as Record<string, unknown>;
     if (typeof search.model !== "string" || search.model.trim().length === 0)
-      throw new GatewayError("invalid_request", 400, "model is required");
+      throw new GatewayError("invalid_request", 400, "A model is required: it names the search provider to use.");
     // The search "model" names the provider (or an alias/combo of one). A
     // thinking suffix is stripped for the same reason the canonical preparer
     // strips it: it is not part of any registered id.
@@ -94,12 +93,6 @@ export function createWebsearchHandler(deps: WebsearchHandlerDeps) {
       ...(state.abortController.signal ? { signal: state.abortController.signal } : {}),
       ...(state.clientUserAgent === undefined ? {} : { clientUserAgent: state.clientUserAgent }),
     });
-    const order = new Map<string, number>(SEARCH_PROVIDER_ORDER.map((id, index) => [id, index]));
-    (prepared.candidates as unknown as { provider_id: string }[]).sort(
-      (left, right) =>
-        (order.get(left.provider_id.toLowerCase()) ?? SEARCH_PROVIDER_ORDER.length) -
-        (order.get(right.provider_id.toLowerCase()) ?? SEARCH_PROVIDER_ORDER.length),
-    );
     return runAttemptLoop<Response, WebsearchAdapter>({
       state,
       deps,
@@ -146,6 +139,7 @@ export function createWebsearchHandler(deps: WebsearchHandlerDeps) {
           provider_id: candidate.provider_id as ProviderAdapter["provider_id"],
           model_id: candidate.model_id,
           wire_family: candidate.wire_family,
+          ...(candidate.output_limit == null ? {} : { output_limit: candidate.output_limit }),
           endpoint_path: candidate.endpoint,
           capabilities: candidate.capability_profile,
         };

@@ -19,26 +19,20 @@
  * read the test database, because those are exactly the layers whose SQL a
  * stub would stop covering.
  */
-import { createGatewayApp } from "../../src/app";
-import type { App } from "../../src/app";
+import { createGatewayApp } from "../../src/boot/app";
+import type { App } from "../../src/boot/app";
 import { createDefaultProviderRegistry } from "../../src/providers/default-registry";
-import type { CartethyiaDatabase } from "../../src/persistence/postgres";
-import { getDb } from "../../src/persistence/postgres";
+import type { CartethyiaDatabase } from "../../src/persistence/db-handle";
+import { getDb } from "../../src/persistence/boot";
 import type { ReadinessCheckResult } from "../../src/persistence/readiness";
 import type {
   CanonicalEvent,
   CanonicalRequest,
   ContentPart,
   UsageRecord,
-} from "../../src/transport/canonical-model";
-import type {
-  ProviderAdapter,
-  ProviderDispatchContext,
-  ProviderDispatchTarget,
-  WebSearchOutcome,
-  WebSearchResult,
-} from "../../src/providers/provider-registry";
-import { parseProviderId } from "../../src/providers/provider-registry";
+} from "../../src/protocol/canonical-model";
+import type { ProviderAdapter, ProviderDispatchContext, ProviderDispatchTarget, WebSearchOutcome, WebSearchResult } from "../../src/providers/provider-contracts";
+import { parseProviderId } from "../../src/providers/provider-contracts";
 import { ProxyRequestPreparer } from "../../src/transport/request/preparer";
 import { RoutingEngine } from "../../src/transport/routing/router";
 import { ApiKeyAdmissionService } from "../../src/security/admission/service";
@@ -50,8 +44,8 @@ import { TelemetryBatchBuffer } from "../../src/observability/telemetry-buffer";
 import { IpAbuseProtectionService, InMemoryIpAbuseStore } from "../../src/security/abuse";
 import { ValidatedNetworkBindingFactory } from "../../src/network/pool/resolver";
 import { NetworkPoolSelector } from "../../src/network/pool/selector";
-import { ShutdownCoordinator } from "../../src/runtime/lifecycle";
-import type { TrustedProxyBoundary } from "../../src/config";
+import { ShutdownCoordinator } from "../../src/boot/lifecycle";
+import type { TrustedProxyBoundary } from "../../src/config/network";
 import { getTestPool } from "./database";
 
 /**
@@ -89,6 +83,18 @@ export interface TestRoute {
   readonly healthStatus?: "cooldown" | "model_cooldown" | "disabled";
   /** Cooldown class the catalog projects when `healthStatus` is `cooldown`. */
   readonly cooldownKind?: "hard" | "soft";
+  /**
+   * Epoch ms at which the cooling window ends — what `route-catalog.ts` derives
+   * from the account row's own deadline and attaches to the candidate. Only the
+   * evaluator and `plan()` read it, to report a real `retry-after` on the
+   * all-accounts-cooling answer.
+   */
+  readonly cooldownUntil?: number;
+}
+
+/** Optional routing tables a suite needs beyond the candidate list. */
+export interface TestRouteSnapshotOptions {
+  readonly combos?: RouteSnapshot["combos"];
 }
 /**
  * Capabilities a fixture route advertises unless a suite says otherwise.
@@ -191,6 +197,8 @@ export interface DispatchRecord {
 export interface StubAdapterOptions {
   /** Replaces the default event sequence for every dispatch. */
   readonly events?: (request: CanonicalRequest) => readonly CanonicalEvent[];
+  /** Supplies a demand-driven stream for tests of timing, backpressure, and abort. */
+  readonly streamEvents?: (request: CanonicalRequest) => AsyncIterable<CanonicalEvent>;
   /** Throws instead of yielding, to exercise the failure/retry path. */
   readonly failWith?: (request: CanonicalRequest, attempt: number) => Error | undefined;
   /** Emits a non-streaming-style single response for `stream: false` requests. */
@@ -233,6 +241,13 @@ export function createStubAdapter(
       options.onDispatch?.(record);
       const failure = options.failWith?.(request, attempt);
       if (failure) throw failure;
+      if (options.streamEvents) {
+        for await (const event of options.streamEvents(request)) {
+          if (context.abort_signal.aborted) return;
+          yield event;
+        }
+        return;
+      }
       const events = options.events?.(request) ?? defaultEvents(request);
       for (const event of events) {
         // Yield to the microtask queue between frames so an aborted request is
@@ -292,7 +307,7 @@ export interface TestGateway {
     init?: RequestInit & { clientIp?: string; token?: string },
   ): Promise<Response>;
   /** Replaces the routing snapshot; call after changing fixture rows. */
-  setRoutes(routes: readonly TestRoute[]): void;
+  setRoutes(routes: readonly TestRoute[], options?: TestRouteSnapshotOptions): void;
   /**
    * Serves every model a world created, on that world's provider and account.
    *
@@ -469,8 +484,8 @@ export async function createTestGateway(
         }),
       );
     },
-    setRoutes(routes) {
-      routeSnapshot.current = buildSnapshot(routes);
+    setRoutes(routes, options = {}) {
+      routeSnapshot.current = buildSnapshot(routes, options);
       // Drop the cached snapshot so the next request observes the new routes.
       void snapshotService.invalidate();
     },
@@ -507,7 +522,10 @@ function emptySnapshot(): RouteSnapshot {
 }
 
 /** Projects test routes onto the real `RouteSnapshot` shape. */
-export function buildSnapshot(routes: readonly TestRoute[]): RouteSnapshot {
+export function buildSnapshot(
+  routes: readonly TestRoute[],
+  options: TestRouteSnapshotOptions = {},
+): RouteSnapshot {
   const candidates: RouteCandidate[] = routes.map((route) => ({
     provider_id: route.providerId,
     model_id: route.modelId,
@@ -522,13 +540,14 @@ export function buildSnapshot(routes: readonly TestRoute[]): RouteSnapshot {
     // `EligibilityEvaluator` reads it from there, so the fixture sets it there.
     ...(route.healthStatus === undefined ? {} : { health_status: route.healthStatus }),
     ...(route.cooldownKind === undefined ? {} : { cooldown_kind: route.cooldownKind }),
+    ...(route.cooldownUntil === undefined ? {} : { cooldown_until: route.cooldownUntil }),
     tenant_id: null,
   }));
   return {
     revision: 1,
     candidates,
     aliases: {},
-    combos: {},
+    combos: options.combos ?? {},
     created_at: Date.now(),
   };
 }

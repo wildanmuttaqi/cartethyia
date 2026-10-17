@@ -1,5 +1,6 @@
-import type { CanonicalEvent, CanonicalStopReason, ContentPart, UsageRecord } from "../../canonical-model";
-import { assertBoundedJsonDepth, isRecord } from "../../../protocol/primitives";
+import type { CanonicalEvent, CanonicalStopReason, ContentPart, UsageRecord } from "../../../protocol/canonical-model";
+import { assertBoundedJsonDepth, isRecord } from "../../../protocol/codecs";
+import { messagesStopReason } from "../../../protocol/stop-reason";
 import {
   reasoningSummaryHasBoundary,
   reasoningSummaryIdentity,
@@ -7,7 +8,7 @@ import {
   type ReasoningSummaryIdentity,
 } from "../reasoning-summary";
 import type { MessagesWireObject } from "./parse";
-import { GatewayError } from "../../gateway-error";
+import { GatewayError } from "../../../protocol/gateway-error";
 
 /**
  * Requires a provider-emitted tool call to carry a real name before it reaches
@@ -115,9 +116,14 @@ export function blockFromPart(part: ContentPart): MessagesWireObject | undefined
       };
     }
     case "extension": {
-      if (isRecord(part.payload) && part.name === "server_tool_use") return part.payload;
-      if (isRecord(part.payload) && part.name === "search_result") return part.payload;
-      if (isRecord(part.payload) && part.name === "document") return part.payload;
+      if (
+        isRecord(part.payload) &&
+        (part.name === "server_tool_use" ||
+          part.name === "search_result" ||
+          part.name === "web_search_tool_result" ||
+          part.name === "document")
+      )
+        return part.payload;
       // Messages-native unknown types (`messages:*`, e.g. a newer Anthropic
       // block the parser does not know yet) round-trip under their native
       // type. Foreign-surface annotations (`responses:*`, chat `audio`,
@@ -229,30 +235,13 @@ export function groupedBlocks(events: readonly CanonicalEvent[]): {
   flushTools();
   return { blocks, droppedUnnamedToolCalls };
 }
+/**
+ * Messages' `stop_reason`, or `null` when the terminal recorded none — this
+ * wire omits the field rather than defaulting it.
+ */
 export function mapStopReason(reason: CanonicalStopReason | undefined): string | null {
-  switch (reason) {
-    case "stop":
-      return "end_turn";
-    case "length":
-      return "max_tokens";
-    case "tool_use":
-      return "tool_use";
-    case "refusal":
-    case "content_filter":
-      return "refusal";
-    case "error":
-    case "cancelled":
-      return "end_turn";
-    case "pause_turn":
-      return "pause_turn";
-    case undefined:
-      return null;
-    default:
-      reason satisfies never;
-      return null;
-  }
+  return messagesStopReason(reason);
 }
-
 export function startModel(events: readonly CanonicalEvent[]): string | undefined {
   const start = events.find(
     (event) => event.type === "response_start" || event.type === "message_start",

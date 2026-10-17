@@ -1,4 +1,5 @@
 import {
+  Copy,
   KeyRound,
   Pencil,
   Plus,
@@ -20,35 +21,21 @@ import { ConfirmDialog } from "./ConfirmDialog";
 import { ModelBansDialog } from "./ModelBansDialog";
 import { regenerateWarning, ShareManagementDialog } from "./ShareManagementDialog";
 import { SortableList } from "./SortableList";
-import { toast } from "../shared/toast";
-import { getErrorMessage } from "../shared/helpers";
+import { toast } from "../lib/toast";
+import { getErrorMessage } from "../data/api";
+import { compactTokens, limitLabel } from "../lib/format/tokens";
 import { useSessionUser } from "../hooks/system";
+import { useClipboard } from "../hooks/use-clipboard";
 import type { ApiKeyResponse } from "../data/contracts";
 import {
   useApiKeys,
   useCreateApiKey,
   useRegenerateApiKey,
   useReorderApiKeys,
+  useRevealApiKey,
   useRevokeApiKey,
   useUpdateApiKey,
 } from "../hooks/api-keys";
-
-/** Compact K/M/B/T token count used by the credential rows. */
-function compactTokens(value: number | null | undefined): string {
-  if (value === null || value === undefined || !Number.isFinite(value)) return "—";
-  const amount = Math.max(0, value);
-  if (amount >= 1_000_000_000_000) return `${Number((amount / 1_000_000_000_000).toFixed(2))}T`;
-  if (amount >= 1_000_000_000) return `${Number((amount / 1_000_000_000).toFixed(2))}B`;
-  if (amount >= 1_000_000) return `${Number((amount / 1_000_000).toFixed(2))}M`;
-  if (amount >= 1_000) return `${Number((amount / 1_000).toFixed(2))}K`;
-  return amount.toLocaleString();
-}
-
-
-function limitLabel(value: number | null | undefined): string {
-  if (value === null || value === undefined) return "Unlimited";
-  return Number.isFinite(value) ? value.toLocaleString() : "—";
-}
 
 /**
  * API-key management panel: access, budgets, usage, and share links.
@@ -63,7 +50,9 @@ export function ApiKeysPanel(): ReactNode {
   const updateKey = useUpdateApiKey();
   const revokeKey = useRevokeApiKey();
   const regenerateKey = useRegenerateApiKey();
+  const revealKey = useRevealApiKey();
   const reorderKeys = useReorderApiKeys();
+  const { copy } = useClipboard();
   const [createOpen, setCreateOpen] = useState(false);
   const [editTarget, setEditTarget] = useState<ApiKeyResponse | null>(null);
   const [revokeTarget, setRevokeTarget] = useState<ApiKeyResponse | null>(null);
@@ -71,6 +60,8 @@ export function ApiKeysPanel(): ReactNode {
   const [revealedSecret, setRevealedSecret] = useState<string | null>(null);
   const [shareTarget, setShareTarget] = useState<ApiKeyResponse | null>(null);
   const [bansOpen, setBansOpen] = useState(false);
+  const [createActions, setCreateActions] = useState<ReactNode>(null);
+  const [editActions, setEditActions] = useState<ReactNode>(null);
 
   const keys = keysQuery.data ?? [];
   // Bans are keyed on the client address, so they are cross-tenant: only a
@@ -81,6 +72,19 @@ export function ApiKeysPanel(): ReactNode {
   const openShare = (key: ApiKeyResponse) => {
     setRevealedSecret(null);
     setShareTarget(key);
+  };
+
+  const copyApiKey = async (key: ApiKeyResponse) => {
+    try {
+      const { secret } = await revealKey.mutateAsync({ keyId: key.id });
+      if (await copy(secret)) {
+        toast.success("API key copied");
+      } else {
+        toast.error("Clipboard unavailable on this origin");
+      }
+    } catch (error) {
+      toast.error(getErrorMessage(error, "Could not reveal API key."));
+    }
   };
 
   // A personal key rotates its own credential; a share template has none, so its
@@ -95,7 +99,7 @@ export function ApiKeysPanel(): ReactNode {
         subtitle="Manage tenant API keys, model access, budgets, and sharing."
         icon={<KeyRound size={16} />}
         action={
-          <div style={{ display: "flex", alignItems: "center", gap: "8px" }}>
+          <div className="flex items-center gap-4">
             {isPlatformAdmin ? (
               <Button
                 variant="secondary"
@@ -134,7 +138,7 @@ export function ApiKeysPanel(): ReactNode {
         ) : (
           // The key list is the tallest thing on the page; bounding it keeps the
           // page chrome in place and scrolls only the rows, like the sidebar.
-          <div className="scroll-region" style={{ maxHeight: "560px", paddingRight: "2px" }}>
+          <div className="scroll-region max-h-280 pr-1">
           <SortableList
             items={keys}
             label="API credentials"
@@ -146,23 +150,12 @@ export function ApiKeysPanel(): ReactNode {
               })
             }
             renderItem={(key) => (
-              <div
-                style={{
-                  display: "flex",
-                  alignItems: "flex-start",
-                  justifyContent: "space-between",
-                  gap: "12px",
-                  padding: "12px 14px",
-                  borderRadius: "12px",
-                  border: "1px solid var(--inner-border)",
-                  background: "var(--surface-2)",
-                }}
-              >
-                <div style={{ minWidth: 0, flex: 1 }}>
+              <div className="api-key-card flex items-start justify-between gap-6 px-6 py-4 rounded-chip border border-inner-border bg-surface-2 max-medium:flex-col max-medium:items-stretch max-medium:gap-4 max-medium:p-5 [&>div:last-child]:flex-wrap">
+                <div className="min-w-0 flex-1">
                   <div
-                    style={{ display: "flex", alignItems: "center", gap: "8px", flexWrap: "wrap" }}
+                    className="flex items-center gap-4 flex-wrap"
                   >
-                    <strong style={{ fontSize: "13px" }}>
+                    <strong className="text-body">
                       {key.label || "Unnamed credential"}
                     </strong>
                     <Badge tone={key.revokedAt ? "err" : key.enabled ? "ok" : "warn"}>
@@ -171,51 +164,52 @@ export function ApiKeysPanel(): ReactNode {
                     <Badge tone={key.keyMode === "share" ? "accent" : "default"}>
                       {key.keyMode === "share" ? "share template" : "personal"}
                     </Badge>
+                    {key.isDefault ? (
+                      <Badge tone="warn" title="Required by the gateway. Rotate it; it cannot be deleted.">
+                        default · rotate only
+                      </Badge>
+                    ) : null}
                   </div>
-                  <code
-                    style={{
-                      display: "block",
-                      marginTop: "2px",
-                      fontFamily: "var(--font-mono)",
-                      fontSize: "11px",
-                      color: "var(--text-secondary)",
-                      overflow: "hidden",
-                      textOverflow: "ellipsis",
-                      whiteSpace: "nowrap",
-                    }}
-                  >
-                    {key.keyPrefix ? `${key.keyPrefix}…` : `${key.id.slice(0, 12)}…`}
-                  </code>
-                  <p style={{ fontSize: "11px", color: "var(--text-tertiary)", marginTop: "2px" }}>
-                    Created {new Date(key.createdAt).toLocaleDateString()}
-                  </p>
-                  <div
-                    style={{
-                      display: "flex",
-                      gap: "8px",
-                      flexWrap: "wrap",
-                      marginTop: "6px",
-                      fontSize: "10.5px",
-                      color: "var(--text-tertiary)",
-                    }}
-                  >
-                    <span>
-                      {key.keyMode === "share" ? "Total usage " : "Usage "}
+                  <div className="api-key-facts flex items-center flex-wrap gap-2 mt-3 min-w-0 max-medium:grid max-medium:grid-cols-3 max-medium:gap-2 max-medium:mt-0">
+                    <span className="inline-flex items-center gap-2.5 px-3.5 py-1 border border-inner-border rounded-chip bg-surface-1 text-text-secondary text-badge leading-normal whitespace-nowrap max-medium:justify-between">
+                      <span className="text-text-tertiary text-micro font-semibold uppercase tracking-label">Created</span>
+                      {new Date(key.createdAt).toLocaleDateString()}
+                    </span>
+                    <span className="inline-flex items-center gap-2.5 px-3.5 py-1 border border-inner-border rounded-chip bg-surface-1 text-text-secondary text-badge leading-normal whitespace-nowrap max-medium:justify-between">
+                      <span className="text-text-tertiary text-micro font-semibold uppercase tracking-label">{key.keyMode === "share" ? "Total usage" : "Usage"}</span>
                       {compactTokens(key.tokensConsumed)}
                     </span>
-                    <span>RPM {limitLabel(key.requestsPerMinute)}</span>
-                    <span>Daily {limitLabel(key.dailyTokenLimit)}</span>
-                    <span>Monthly {limitLabel(key.monthlyTokenLimit)}</span>
-                    <span>One-time {limitLabel(key.lifetimeTokenBudget)}</span>
-                    <span>Concurrent {limitLabel(key.maxConcurrentRequests)}</span>
-                    <span>
+                    <span className="inline-flex items-center gap-2.5 px-3.5 py-1 border border-inner-border rounded-chip bg-surface-1 text-text-secondary text-badge leading-normal whitespace-nowrap max-medium:justify-between">
+                      <span className="text-text-tertiary text-micro font-semibold uppercase tracking-label">RPM</span>
+                      {limitLabel(key.requestsPerMinute)}
+                    </span>
+                  </div>
+                  <div className="api-key-facts flex items-center flex-wrap gap-2 mt-3 min-w-0 max-medium:grid max-medium:grid-cols-3 max-medium:gap-2 max-medium:mt-0">
+                    <span className="inline-flex items-center gap-2.5 px-3.5 py-1 border border-inner-border rounded-chip bg-surface-1 text-text-secondary text-badge leading-normal whitespace-nowrap max-medium:justify-between">
+                      <span className="text-text-tertiary text-micro font-semibold uppercase tracking-label">Daily</span>
+                      {limitLabel(key.dailyTokenLimit)}
+                    </span>
+                    <span className="inline-flex items-center gap-2.5 px-3.5 py-1 border border-inner-border rounded-chip bg-surface-1 text-text-secondary text-badge leading-normal whitespace-nowrap max-medium:justify-between">
+                      <span className="text-text-tertiary text-micro font-semibold uppercase tracking-label">Monthly</span>
+                      {limitLabel(key.monthlyTokenLimit)}
+                    </span>
+                    <span className="inline-flex items-center gap-2.5 px-3.5 py-1 border border-inner-border rounded-chip bg-surface-1 text-text-secondary text-badge leading-normal whitespace-nowrap max-medium:justify-between">
+                      <span className="text-text-tertiary text-micro font-semibold uppercase tracking-label">One-time</span>
+                      {limitLabel(key.lifetimeTokenBudget)}
+                    </span>
+                    <span className="inline-flex items-center gap-2.5 px-3.5 py-1 border border-inner-border rounded-chip bg-surface-1 text-text-secondary text-badge leading-normal whitespace-nowrap max-medium:justify-between">
+                      <span className="text-text-tertiary text-micro font-semibold uppercase tracking-label">Concurrent</span>
+                      {limitLabel(key.maxConcurrentRequests)}
+                    </span>
+                    <span className="inline-flex items-center gap-2.5 px-3.5 py-1 border border-inner-border rounded-chip bg-surface-1 text-text-secondary text-badge leading-normal whitespace-nowrap max-medium:justify-between">
+                      <span className="text-text-tertiary text-micro font-semibold uppercase tracking-label">{key.modelAccessMode === "blacklist" ? "Blocked" : "Models"}</span>
                       {key.modelAccessMode === "blacklist"
-                        ? `Blocked ${key.modelList?.length ?? 0}`
-                        : `Models ${key.modelList?.length ? key.modelList.length : "All"}`}
+                        ? (key.modelList?.length ?? 0)
+                        : key.modelList?.length ? key.modelList.length : "All"}
                     </span>
                   </div>
                 </div>
-                <div style={{ display: "flex", gap: "6px", flexShrink: 0, flexWrap: "wrap" }}>
+                <div className="flex gap-3 shrink-0 flex-wrap">
                   {!key.revokedAt ? (
                     <Switch
                       checked={key.enabled}
@@ -246,6 +240,17 @@ export function ApiKeysPanel(): ReactNode {
                   >
                     Edit
                   </Button>
+                  {!key.revokedAt && key.keyMode !== "share" ? (
+                    <Button
+                      variant="secondary"
+                      size="sm"
+                      icon={<Copy size={13} />}
+                      onClick={() => void copyApiKey(key)}
+                      disabled={revealKey.isPending}
+                    >
+                      Copy
+                    </Button>
+                  ) : null}
                   {!key.revokedAt && <Button
                     variant="secondary"
                     size="sm"
@@ -265,15 +270,17 @@ export function ApiKeysPanel(): ReactNode {
                       Rotate
                     </Button>
                   )}
-                  <Button
-                    variant="danger"
-                    size="sm"
-                    icon={<Trash2 size={13} />}
-                    onClick={() => setRevokeTarget(key)}
-                    disabled={Boolean(key.revokedAt) || revokeKey.isPending}
-                  >
-                    Revoke
-                  </Button>
+                  {!key.revokedAt && !key.isDefault && (
+                    <Button
+                      variant="danger"
+                      size="sm"
+                      icon={<Trash2 size={13} />}
+                      onClick={() => setRevokeTarget(key)}
+                      disabled={revokeKey.isPending}
+                    >
+                      Revoke
+                    </Button>
+                  )}
                 </div>
               </div>
             )}
@@ -288,12 +295,14 @@ export function ApiKeysPanel(): ReactNode {
         title="Create API Key"
         description="Create a tenant-scoped credential. Choose model access, permissions, limits, and optional blocked client routers."
         size="lg"
+        footer={createActions}
       >
         <ApiKeyForm
           mode="create"
           record={null}
           busy={createKey.isPending}
           onClose={() => setCreateOpen(false)}
+          actionsRef={setCreateActions}
           onDone={(input: KeyFormInput) => {
             createKey.mutate(input, {
               onSuccess: (res) => {
@@ -313,12 +322,14 @@ export function ApiKeysPanel(): ReactNode {
         title="Edit API Key"
         description="Update the key's model access, permissions, limits, share notes, and optional public popup."
         size="lg"
+        footer={editActions}
       >
         <ApiKeyForm
           mode="edit"
           record={editTarget}
           busy={updateKey.isPending}
           onClose={() => setEditTarget(null)}
+          actionsRef={setEditActions}
           onDone={(input: KeyFormInput) => {
             if (!editTarget) return;
             updateKey.mutate(

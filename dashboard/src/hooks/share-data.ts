@@ -1,4 +1,5 @@
-import { shareCodeMessage } from "../shared/helpers";
+import { shareCodeMessage } from "../apps/share/share-code";
+import { STREAM_RETRY_MS } from "../lib/stream-retry";
 import { useEffect, useState } from "react";
 
 /** Context and capabilities for one allowed model, from the model catalog. */
@@ -45,7 +46,6 @@ export interface ShareLinkPolicyData {
 export interface ShareEnrollmentData extends ShareLinkPolicyData {
   readonly kind: "enroll";
   readonly canIssue: boolean;
-  readonly alreadyIssued: boolean;
 }
 
 /** A handoff link, which reveals the personal key it was created for. */
@@ -70,7 +70,7 @@ export interface ShareFamilyStatsData {
     readonly monthTokens: number;
   };
   readonly recipients: { readonly total: number; readonly active: number };
-  readonly hourly: readonly { readonly hour: string; readonly requests: number }[];
+  readonly hourly: readonly { readonly hour: string; readonly requests: number; readonly tokens: number }[];
   readonly models: readonly {
     readonly modelId: string;
     readonly requests: number;
@@ -113,9 +113,6 @@ function errorCode(payload: ShareErrorResponse): string | null {
   const rawError = payload.error;
   return (typeof rawError === "string" ? rawError : rawError?.code) ?? null;
 }
-
-/** Delay before re-opening a dropped share stats stream. */
-const STREAM_RETRY_MS = 5_000;
 
 /**
  * Loads the public enrollment contract without caching response bodies.
@@ -162,7 +159,10 @@ export function useShareData<TData>(
 
     // SSE mode. EventSource reconnects on its own for transient drops; this
     // loop owns the "stream ended / never opened" case so the section keeps
-    // updating instead of freezing on its last frame.
+    // updating instead of freezing on its last frame. The first failure clears
+    // `loading` so the section can say the activity is unavailable instead of
+    // spinning forever; retries continue and a later snapshot still applies.
+    let failedOnce = false;
     const connect = () => {
       if (!active) return;
       const next = new EventSource(path);
@@ -178,6 +178,10 @@ export function useShareData<TData>(
       next.addEventListener("error", () => {
         next.close();
         if (!active) return;
+        if (!failedOnce) {
+          failedOnce = true;
+          setState((current) => (current.data === null ? { ...current, loading: false } : current));
+        }
         retryTimer = setTimeout(connect, STREAM_RETRY_MS);
       });
     };

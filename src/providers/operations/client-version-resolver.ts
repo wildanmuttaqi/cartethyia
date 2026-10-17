@@ -33,6 +33,8 @@ export interface ClientVersionSource {
 export interface ClientVersionResolverOptions {
   /** Stable cache key; must be unique per provider (`grok`, `codex`, …). */
   readonly key: string;
+  /** The client this version belongs to, shown beside it. */
+  readonly client: string;
   /** Pinned constant used until (or unless) discovery succeeds. */
   readonly fallback: string;
   /** Ordered upstream probes; first valid version wins. */
@@ -54,17 +56,34 @@ export interface ClientVersionResolverOptions {
 }
 
 export interface ClientVersionSnapshot {
+  readonly client: string;
   readonly version: string;
   readonly source: "latest" | "fallback";
 }
 
 export interface ClientVersionResolver {
-  /** Current version: discovered → pinned fallback. Sync, never fetches. */
+  /** Current version: adopted → discovered → pinned fallback. Sync, never fetches. */
   get(): string;
   /** Current version and whether discovery has replaced the fallback. */
   snapshot(): ClientVersionSnapshot;
+  /**
+   * The floor discovery refused to move below, when this client declares one.
+   *
+   * Exposed so a fallback can be reported *with* the bound that produced it: a
+   * pinned version means one of two different things — discovery never
+   * succeeded, or it succeeded and answered with something below the floor. The
+   * second is the interesting one (an upstream artifact the provider does not
+   * gate on), and it is indistinguishable from the first unless the floor
+   * travels with the fallback.
+   */
+  readonly minVersion?: string;
   /** Resolve from upstream (cached, deduped, never throws). */
   ensure(fetcher?: ClientVersionFetcher, signal?: AbortSignal): Promise<void>;
+  /**
+   * Adopt a server-named version for the rest of the process. Moves `get()`
+   * ahead of both discovery and the pinned fallback; `reset()` clears it.
+   */
+  adopt(version: string): void;
   /**
    * Test-only: seed a version and stop discovery entirely, or `null` to
    * restore normal discovery behaviour. Keeps suites deterministic without
@@ -125,6 +144,11 @@ export function createClientVersionResolver(
   const sources = options.sources;
   let discovered: string | null = null;
   let seeded = false;
+  // Server-adopted version (adopt-on-rejection): a rejection naming a newer
+  // required version promotes it for the rest of the process, ahead of both
+  // discovery and the pinned fallback, so a stale pin costs one rejected
+  // request instead of a hard outage. `reset()` clears it with everything else.
+  let adopted: string | null = null;
 
   function meetsMinimum(version: string, min: string | undefined): boolean {
     if (min === undefined) return true;
@@ -167,21 +191,63 @@ export function createClientVersionResolver(
     if (resolved !== null && meetsMinimum(resolved, options.minVersion)) discovered = resolved;
   }
 
+  function get(): string {
+    return adopted ?? discovered ?? options.fallback;
+  }
+
+  function snapshot(): ClientVersionSnapshot {
+    const version = adopted ?? discovered ?? options.fallback;
+    return {
+      client: options.client,
+      version,
+      source: adopted !== null || discovered !== null ? "latest" : "fallback",
+    };
+  }
+
   return {
-    get(): string {
-      return discovered ?? options.fallback;
-    },
-    snapshot(): ClientVersionSnapshot {
-      return {
-        version: discovered ?? options.fallback,
-        source: discovered === null ? "fallback" : "latest",
-      };
-    },
+    get,
+    snapshot,
+    ...(options.minVersion === undefined ? {} : { minVersion: options.minVersion }),
     ensure,
+    adopt(version: string): void {
+      if (isSemverish(version) && compareVersions(version.trim(), get()) > 0)
+        adopted = version.trim();
+    },
     reset(version: string | null = null): void {
       discovered = version;
+      adopted = null;
       seeded = version !== null;
       resetVersionCacheForTesting();
     },
   };
+}
+
+/**
+ * Parses a server-named minimum version out of a version rejection and adopts
+ * it when it moves the resolver forward. Returns the adopted version, or null
+ * when the error names nothing newer (same/older version, unparseable body,
+ * explicit env pin) — callers retry once on a non-null return, so a repeated
+ * rejection at the same version cannot loop.
+ */
+export function adoptRequiredVersion(
+  resolver: { get(): string },
+  setAdopted: (version: string) => void,
+  error: unknown,
+  options: {
+    /** Rejection marker, e.g. `claude_code_version_too_old`. */
+    marker: string;
+    /** Pattern capturing the required `x.y.z` from the message. */
+    pattern: RegExp;
+    /** True while an explicit env/config pin owns the version (never adopt). */
+    pinned?: boolean;
+  },
+): string | null {
+  if (options.pinned === true) return null;
+  const message = error instanceof Error ? error.message : String(error);
+  if (!message.includes(options.marker)) return null;
+  const required = options.pattern.exec(message)?.[1];
+  if (required === undefined || !isSemverish(required)) return null;
+  if (compareVersions(required, resolver.get()) <= 0) return null;
+  setAdopted(required);
+  return required;
 }

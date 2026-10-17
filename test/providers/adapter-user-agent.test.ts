@@ -15,10 +15,7 @@
  * on the provider response).
  */
 import { describe, expect, test } from "bun:test";
-import {
-  providerHasAdapterUserAgent,
-  BUNDLED_PROVIDER_METADATA,
-} from "../../src/providers/provider-metadata";
+import { providerHasAdapterUserAgent, BUNDLED_PROVIDER_METADATA } from "../../src/providers/provider-metadata";
 import { resolveRouteUserAgent } from "../../src/transport/routing/route-catalog";
 
 describe("route User-Agent is only offered where the adapter reads it", () => {
@@ -40,5 +37,16 @@ describe("route User-Agent is only offered where the adapter reads it", () => {
     // `openai` is a bundled API-key provider with no adapter-built identity.
     expect(providerHasAdapterUserAgent("openai")).toBe(false);
     expect(resolveRouteUserAgent("openai", "Custom/1.0", "Global/2.0")).toBe("Custom/1.0");
+  });
+
+  test("InferHub takes the selected route identity", () => {
+    expect(providerHasAdapterUserAgent("inferhub")).toBe(false);
+    expect(resolveRouteUserAgent("inferhub", "Cartethyia/2.1", "codex_cli_rs/0.161.0")).toBe(
+      "Cartethyia/2.1",
+    );
+  });
+
+  test("an empty route identity sends no User-Agent", () => {
+    expect(resolveRouteUserAgent("inferhub", "", "codex_cli_rs/0.161.0")).toBeUndefined();
   });
 });

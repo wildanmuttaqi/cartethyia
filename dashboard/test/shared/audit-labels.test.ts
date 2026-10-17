@@ -20,7 +20,7 @@
  * sites.
  */
 import { describe, expect, test } from "bun:test";
-import { auditActionLabel, prettifyAuditAction } from "../../src/shared/audit-labels";
+import { auditActionLabel, prettifyAuditAction } from "../../src/features/logs/audit-labels";
 
 /**
  * Every audit action id the backend writes, extracted from `src/` by grepping for
@@ -76,9 +76,6 @@ const BACKEND_ACTIONS = [
   "provider_account.updated",
   "security.ip_banned",
   "settings.runtime.updated",
-  "studio.session.created",
-  "studio.session.deleted",
-  "studio.session.updated",
 ] as const;
 
 describe("prettifyAuditAction", () => {
@@ -213,7 +210,7 @@ describe("auditActionLabel", () => {
   test("every action the backend emits has a curated label", () => {
     // The invariant the module's doc comment claims, and the one that keeps the
     // table readable. The backend's `action` field is a plain string with no enum
-    // behind it (`src/console/domains/audit/contracts.ts`), so nothing fails when a
+    // behind it (`src/console/audit/contracts.ts`), so nothing fails when a
     // new emit site appears — this test is the only thing that catches the two
     // lists drifting.
     const unlabelled = BACKEND_ACTIONS.filter(

@@ -1,7 +1,7 @@
 import { consoleErrorHandler } from "../../shared/errors";
 import { literalUnion } from "../../shared/elysia-schema";
 import { Elysia, t } from "elysia";
-import { SERVICE_KINDS, WIRE_FAMILIES } from "../../../transport/canonical-model";
+import { SERVICE_KINDS, WIRE_FAMILIES } from "../../../protocol/canonical-model";
 import { PROBE_REASONING_EFFORTS } from "../../../providers/discovery/discovery-types";
 import {
   ACCOUNT_STATUSES,
@@ -13,12 +13,15 @@ import {
   createProviderCatalogOperations,
   type ProviderCatalogConfig,
 } from "./provider-operations";
+import { buddyDayKey } from "../../../workers/buddy-growth-tasks";
 import type {
   ByokConnectionTestRequest,
   CreateProviderAccountRequest,
   CreateProviderRequest,
   ProbeModelRequest,
+  RegisterModelsRequest,
   SetModelEnabledRequest,
+  UpdateModelMetadataRequest,
   UpdateProviderAccountRequest,
   UpdateProviderRequest,
 } from "./contracts";
@@ -73,15 +76,45 @@ const createAccountBody = t.Object({
   secret: t.String(),
   authState: t.Optional(t.Record(t.String(), t.Unknown())),
 });
+/**
+ * Batch create body.
+ *
+ * The cap is the same bound the proxy batch probe uses: a paste is bounded so
+ * one request cannot open an unbounded transaction. It is a validation limit,
+ * not a throughput one — the route stays a single round-trip either way.
+ */
+const MAX_BATCH_CREATE_ACCOUNTS = 100;
+const createAccountBatchBody = t.Object({
+  accounts: t.Array(createAccountBody, {
+    minItems: 1,
+    maxItems: MAX_BATCH_CREATE_ACCOUNTS,
+  }),
+});
 const updateAccountBody = t.Object({
   label: t.Optional(t.String()),
   secret: t.Optional(t.String()),
   status: t.Optional(literalUnion(ACCOUNT_STATUSES)),
   staticToken: t.Optional(t.Boolean()),
 });
+/**
+ * Operator-supplied limits/capabilities for a model the catalog cannot size.
+ *
+ * `passthrough` grants every capability at once and supersedes the per-flag
+ * fields, so an operator who cannot know a model's capabilities does not have
+ * to guess them one by one.
+ */
+const modelMetadataOverrideBody = t.Object({
+  contextLimit: t.Optional(t.Union([t.Integer({ minimum: 1 }), t.Null()])),
+  outputLimit: t.Optional(t.Union([t.Integer({ minimum: 1 }), t.Null()])),
+  passthrough: t.Optional(t.Boolean()),
+  image: t.Optional(t.Boolean()),
+  reasoning: t.Optional(t.Boolean()),
+  toolCall: t.Optional(t.Boolean()),
+});
 const registerModelsBody = t.Object({
   modelIds: t.Array(t.String()),
   wireFamily: t.Optional(t.String()),
+  metadata: t.Optional(modelMetadataOverrideBody),
 });
 const probeModelBody = t.Object({
   modelId: t.String(),
@@ -105,6 +138,7 @@ const setModelEnabledBody = t.Object({
   modelId: t.String(),
   route: t.String(),
   enabled: t.Boolean(),
+  metadata: t.Optional(modelMetadataOverrideBody),
 });
 const deleteModelBody = t.Object({
   modelId: t.String(),
@@ -181,12 +215,13 @@ export function createProviderCatalogRoutes(config: ProviderCatalogConfig): Elys
       "/:providerId/models",
       { body: registerModelsBody },
       async ({ request, params, body }) => {
-        const b = body as { modelIds: readonly string[]; wireFamily?: string };
+        const b = body as RegisterModelsRequest;
         return await modelFactory.registerModels(
           config.accessResolver(request),
           params.providerId,
           b.modelIds,
           b.wireFamily,
+          b.metadata,
         );
 },
     )
@@ -219,6 +254,18 @@ export function createProviderCatalogRoutes(config: ProviderCatalogConfig): Elys
       "/:providerId/models",
       { body: setModelEnabledBody },
       async ({ request, params, body }) => {
+        const b = body as UpdateModelMetadataRequest;
+        // One PATCH, two operations. A payload carrying `metadata` is an edit;
+        // one without it is the enable/disable toggle this route has always
+        // served. A separate path would split one row's mutation surface across
+        // two endpoints for no gain.
+        if (b.metadata !== undefined) {
+          return await modelFactory.updateModelMetadata(
+            config.accessResolver(request),
+            params.providerId,
+            b,
+          );
+        }
         return await modelFactory.setModelEnabled(
           config.accessResolver(request),
           params.providerId,
@@ -268,6 +315,17 @@ export function createProviderCatalogRoutes(config: ProviderCatalogConfig): Elys
         return created;
 },
     )
+    .post(
+      "/:providerId/accounts/batch",
+      { body: createAccountBatchBody },
+      async ({ request, params, body }) => {
+        return await factory.createAccountBatch(
+          config.accessResolver(request),
+          params.providerId,
+          body.accounts as CreateProviderAccountRequest[],
+        );
+      },
+    )
     .patch(
       "/:providerId/accounts/:accountId",
       { body: updateAccountBody },
@@ -286,6 +344,15 @@ export function createProviderCatalogRoutes(config: ProviderCatalogConfig): Elys
         config.accessResolver(request),
         params.providerId,
         params.accountId,
+      );
+})
+    .get("/:providerId/accounts/:accountId/growth-tasks", async ({ request, params }) => {
+      const dayKey = buddyDayKey();
+      return await factory.listBuddyGrowthTasks(
+        config.accessResolver(request),
+        params.providerId,
+        params.accountId,
+        dayKey,
       );
 })
     .post("/:providerId/accounts/:accountId/recover", async ({ request, params }) => {

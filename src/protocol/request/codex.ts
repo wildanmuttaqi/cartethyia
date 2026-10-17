@@ -7,10 +7,10 @@
  * - reasoning include/effort/summary/context wiring
  * - Responses Lite reasoning override + body shape mutation
  */
-import type { CanonicalMessage, CanonicalRequest, ContentPart } from "../../transport/canonical-model";
-import { canContainToolResult, toolResultParts } from "../../transport/canonical-model";
-import { isWebSearchTool } from "../../transport/translation/capabilities";
-import { reasoningEffortFromIntent } from "../../providers/reasoning";
+import type { CanonicalMessage, CanonicalRequest, ContentPart } from "../canonical-model";
+import { canContainToolResult, toolResultParts } from "../canonical-model";
+import { isWebSearchTool } from "../../transport/translation/search";
+import { reasoningEffortFromIntent } from "../../providers/provider-reasoning";
 import {
   decodeCodexToolCallId,
   encodeCodexToolCallId,
@@ -21,7 +21,26 @@ import {
   resolveImageSource,
   resolveOutputVerbosity,
   tryParseJsonObject,
-} from "../primitives";
+} from "../codecs";
+
+/**
+ * `provider_options` key that opts one request into the Daybreak
+ * `access_programs.cyber` member. See the UNCONFIRMED note at its use site.
+ */
+export const CODEX_ACCESS_PROGRAMS_CYBER_OPTION = "codex_access_programs_cyber";
+
+/**
+ * Removes `access_programs` from an already-built Codex Responses payload.
+ * Returns true when something was removed, so the caller knows a replay
+ * without the field actually differs from the request it just sent.
+ */
+export function dropCodexAccessPrograms(
+  payload: Record<string, unknown>,
+): boolean {
+  if (!("access_programs" in payload)) return false;
+  delete payload["access_programs"];
+  return true;
+}
 
 /**
  * Repairs branched/aborted tool-call histories before they hit the wire
@@ -538,6 +557,34 @@ export function canonicalToCodexResponsesPayload(
       request.cache_hint === "stable_prefix"
         ? "stable_prefix"
         : `breakpoints:${request.cache_hint.list.join(",")}`;
+  }
+  // The reference client threads `prompt_cache_retention` alongside the key
+  // on sticky sessions; emit it when the caller declares one so a session
+  // that opts into 24h retention keeps it. Unknown to the backend it is
+  // ignored server-side, so this is additive, never load-bearing.
+  const retention = request.provider_options?.["codex_prompt_cache_retention"];
+  if (retention === "in_memory" || retention === "24h") {
+    payload["prompt_cache_retention"] = retention;
+  }
+  // Daybreak access programs (`access_programs.cyber`).
+  //
+  // UNCONFIRMED — the field name, its `cyber` member, and the "drop the field
+  // and replay once when the upstream rejects it" recovery are transcribed
+  // from the donor implementation only (`access-programs.ts:32-63`); no
+  // request capture or upstream response in this repository documents any of
+  // it. Eligibility is a per-(account, model) Daybreak entitlement that
+  // neither the stored Codex credential (account id + residency only,
+  // `codex-identity.ts`) nor the model catalog carries, so no local state can
+  // decide it. The field is therefore opt-in per request via
+  // `provider_options.codex_access_programs_cyber` and stays absent unless a
+  // caller declares eligibility — the same convention
+  // `codex_prompt_cache_retention` uses for unverified passthroughs. A backend
+  // that does not know the field ignores it; ineligible accounts hard-fail
+  // because the adapter replays at most once, without the field.
+  const cyberAccessProgram =
+    request.provider_options?.[CODEX_ACCESS_PROGRAMS_CYBER_OPTION];
+  if (cyberAccessProgram === true || cyberAccessProgram === "true") {
+    payload["access_programs"] = { cyber: true };
   }
   // Generation controls (temperature, top_p, max_tokens, etc.) are not
   // accepted by the Codex Responses backend and must never leak upstream.

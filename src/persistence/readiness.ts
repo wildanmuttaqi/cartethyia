@@ -1,9 +1,9 @@
 // Boot readiness: cached probe over database connectivity, applied migrations, and Redis.
 import { sql } from "drizzle-orm";
-import { readMigrationLedgerStatus } from "./postgres";
-import type { CartethyiaDatabase } from "./postgres";
+import { readMigrationLedgerStatus } from "./migrate";
+import type { CartethyiaDatabase } from "./db-handle";
 import type { RedisBackend, RedisClient } from "./redis";
-import { withTimeout } from "../runtime/timeout";
+import { withTimeout } from "../boot/timeout";
 
 // ===== readiness memo =====
 /**

@@ -14,7 +14,7 @@
  * remains.
  */
 import { describe, expect, test } from "bun:test";
-import { maskClientIp } from "../../src/observability/redaction";
+import { maskClientIp, scrubSecrets } from "../../src/observability/redaction";
 
 describe("maskClientIp", () => {
   test("keeps the first three IPv4 octets", () => {
@@ -68,5 +68,33 @@ describe("maskClientIp", () => {
       expect(masked.endsWith(".xxx")).toBe(true);
       expect(masked).toBe(`${address.split(".").slice(0, 3).join(".")}.xxx`);
     }
+  });
+});
+
+describe("scrubSecrets", () => {
+  test("replaces a bearer token, a JWT, and a provider key", () => {
+    const input = [
+      "Authorization: Bearer eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ1MSJ9.signaturevalue",
+      "key sk-abc1234567890 leaked",
+      "aws AKIAIOSFODNN7EXAMPLE",
+    ].join(" ");
+    const out = scrubSecrets(input);
+    expect(out).not.toContain("eyJhbGci");
+    expect(out).not.toContain("sk-abc");
+    expect(out).not.toContain("AKIAIOSFODNN7EXAMPLE");
+    expect(out).toContain("[redacted]");
+  });
+
+  test("leaves ordinary prose alone", () => {
+    const input = "the model answered in 11148 ms and the account is healthy";
+    expect(scrubSecrets(input)).toBe(input);
+  });
+
+  test("replaces an inline base64 image so it cannot bury the log line", () => {
+    const input = "saw data:image/png;base64," + "A".repeat(40) + " end";
+    const out = scrubSecrets(input);
+    expect(out).not.toContain("AAAA");
+    expect(out).toContain("[redacted]");
+    expect(out).toContain("end");
   });
 });

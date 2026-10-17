@@ -56,6 +56,15 @@ async function workbuddyDesktopVersion(response: Response): Promise<string | nul
   }
 }
 
+async function kiroCaskVersion(response: Response): Promise<string | null> {
+  try {
+    const data = (await response.json()) as { version?: unknown };
+    return isSemverish(data.version) ? data.version.trim() : null;
+  } catch {
+    return null;
+  }
+}
+
 async function codeBuddyCnVersion(response: Response): Promise<string | null> {
   try {
     const data = (await response.json()) as { version?: unknown };
@@ -111,8 +120,8 @@ async function githubReleaseVersion(response: Response): Promise<string | null> 
  * value the client stamps.
  *
  * How to rediscover it — take it from the shipped build, never from guesswork:
- *   1. The IDE installer lives on the vendor's download feed, under a path that
- *      repeats the version:
+ *   1. The IDE installer is published on the vendor's download feed under a
+ *      path that repeats the version:
  *      `https://prod.download.desktop.kiro.dev/releases/stable/win32-x64/signed/<v>/kiro-ide-<v>-stable-win32-x64.exe`
  *   2. Unpack it. The exe's payload is an LZMA stream behind a 4-byte tag:
  *      `7z x` the exe, drop the 4-byte tag from the extracted `[0]`, then
@@ -158,7 +167,7 @@ const KIRO_NODE_VERSION = "24.18.0";
 export const VERSION_SOURCES = {
   antigravity: {
     key: "antigravity",
-    fallback: "2.19.1",
+    fallback: "2.24.0",
     sources: [
       {
         url: "https://antigravity-hub-auto-updater-974169037036.us-central1.run.app/manifest/latest-arm64-mac.yml",
@@ -168,7 +177,7 @@ export const VERSION_SOURCES = {
   },
   qoder: {
     key: "qoder",
-    fallback: "1.1.65",
+    fallback: "1.1.73",
     sources: [
       {
         url: "https://registry.npmjs.org/@qoder-ai/qodercli/latest",
@@ -178,17 +187,20 @@ export const VERSION_SOURCES = {
   },
   opencode: {
     key: "opencode",
-    fallback: "1.18.34",
-    sources: [{ url: "https://registry.npmjs.org/opencode-ai/latest" }],
+    // The v1 package (`opencode-ai`) stopped at 1.18. The v2 line publishes
+    // under `@opencode/cli`, and this feed is what its own installer reads.
+    fallback: "2.0.32",
+    minVersion: "2.0.0",
+    sources: [{ url: "https://opencode.ai/update/api/latest/cli/npm" }],
   },
   commandcode: {
     key: "commandcode",
-    fallback: "1.74.1",
+    fallback: "1.84.0",
     sources: [{ url: "https://registry.npmjs.org/command-code/latest" }],
   },
   grok: {
     key: "grok",
-    fallback: "1.0.46",
+    fallback: "1.0.62",
     sources: [
       { url: "https://storage.googleapis.com/grok-build-public-artifacts/cli/stable" },
       { url: "https://registry.npmjs.org/@xai-official/grok/latest" },
@@ -196,8 +208,8 @@ export const VERSION_SOURCES = {
   },
   clineClient: {
     key: "cline-client",
-    fallback: "4.1.22",
-    minVersion: "4.1.22",
+    fallback: "4.1.25",
+    minVersion: "4.1.23",
     sources: [
       {
         url: "https://raw.githubusercontent.com/cline/cline/main/apps/vscode/package.json",
@@ -207,17 +219,17 @@ export const VERSION_SOURCES = {
   },
   clineSdk: {
     key: "cline-sdk",
-    fallback: "0.0.90",
+    fallback: "0.0.95",
     sources: [{ url: "https://registry.npmjs.org/@cline/sdk/latest", extract: clineSdkVersion }],
   },
   codex: {
     key: "codex",
-    fallback: "0.160.0",
+    fallback: "0.163.0",
     sources: [{ url: "https://registry.npmjs.org/@openai/codex/latest" }],
   },
   workbuddyClient: {
     key: "workbuddy-client",
-    fallback: "5.6.2.39458645",
+    fallback: "5.8.4.41366630",
     sources: [
       {
         url: "https://www.workbuddy.ai/v2/update?platform=workbuddy-win32-x64-user",
@@ -229,9 +241,23 @@ export const VERSION_SOURCES = {
       },
     ],
   },
+  workbuddyCnClient: {
+    key: "workbuddy-cn-client",
+    fallback: "5.8.3.41334564",
+    sources: [
+      {
+        url: "https://www.workbuddy.cn/v2/update?platform=workbuddy-win32-x64-user",
+        extract: workbuddyDesktopVersion,
+      },
+      {
+        url: "https://www.workbuddy.cn/v2/update?platform=workbuddy-darwin-arm64",
+        extract: workbuddyDesktopVersion,
+      },
+    ],
+  },
   workbuddyCli: {
     key: "workbuddy",
-    fallback: "2.161.2",
+    fallback: "2.168.2",
     sources: [
       { url: "https://registry.npmjs.org/@tencent-ai/codebuddy-code/latest" },
       { url: "https://registry.npmmirror.com/@tencent-ai/codebuddy-code/latest" },
@@ -244,12 +270,21 @@ export const VERSION_SOURCES = {
   },
   kiro: {
     key: "kiro",
-    fallback: "1.2.4",
-    sources: [{ url: "https://kiro.dev/downloads/", extract: kiroVersion }],
+    fallback: "1.3.11",
+    sources: [
+      {
+        // Kiro's downloads page no longer exposes a stable version string.
+        // Homebrew tracks the official installer URL and exposes its version
+        // as JSON; keep the product page parser as a fallback.
+        url: "https://formulae.brew.sh/api/cask/kiro.json",
+        extract: kiroCaskVersion,
+      },
+      { url: "https://kiro.dev/downloads/", extract: kiroVersion },
+    ],
   },
   codebuddy: {
     key: "codebuddy",
-    fallback: "2.161.2",
+    fallback: "2.168.2",
     sources: [
       { url: "https://registry.npmjs.org/@tencent-ai/codebuddy-code/latest" },
       { url: "https://registry.npmmirror.com/@tencent-ai/codebuddy-code/latest" },
@@ -257,7 +292,7 @@ export const VERSION_SOURCES = {
   },
   codebuddyCn: {
     key: "codebuddy-cn",
-    fallback: "4.12.1.39217423",
+    fallback: "4.12.2.41207131",
     sources: [
       {
         // Official CN builds are listed by Homebrew's maintained cask feed;
@@ -272,7 +307,7 @@ export const VERSION_SOURCES = {
     // Current `@anthropic-ai/claude-code` release, so the billing
     // `cc_version=` suffix and the `claude-cli/` User-Agent stay on what
     // upstream ships.
-    fallback: "2.1.289",
+    fallback: "2.1.302",
     sources: [{ url: "https://registry.npmjs.org/@anthropic-ai/claude-code/latest" }],
   },
   claudeSdk: {
@@ -284,17 +319,8 @@ export const VERSION_SOURCES = {
     // discovered: it would advertise a version Claude Code never bundled. Bump
     // alongside the CLI. Read it from the shipped native binary, which defines
     // the version string the template interpolates — never from guesswork.
-    fallback: "0.127.0",
+    fallback: "0.128.0",
     sources: [],
-  },
-  devin: {
-    key: "devin",
-    // Tracks the Devin VS Code extension line. The pinned floor is the
-    // in-repo extension version: discovery moves forward only, so an
-    // upstream feed lagging behind can never silently downgrade the badge.
-    fallback: "1.49.2",
-    minVersion: "1.49.2",
-    sources: [{ url: "https://open-vsx.org/api/Codeium/codeium" }],
   },
   github: {
     key: "github-copilot-chat",
@@ -308,17 +334,12 @@ export const VERSION_SOURCES = {
   },
   kilo: {
     key: "kilo-code",
-    fallback: "7.8.3",
+    fallback: "7.8.14",
     sources: [{ url: "https://open-vsx.org/api/kilocode/kilo-code" }],
-  },
-  mimo: {
-    key: "mimo-cli",
-    fallback: "0.1.15",
-    sources: [{ url: "https://registry.npmjs.org/@mimo-ai/cli/latest" }],
   },
   muse: {
     key: "muse-code",
-    fallback: "1.4.2-R4684.1",
+    fallback: "1.4.10-R6427.1",
     sources: [{ url: "https://api.meta.ai/muse-code/channels/muse-stable" }],
   },
   zcode: {
@@ -334,52 +355,49 @@ export const VERSION_SOURCES = {
 } as const;
 
 const resolvers = {
-  antigravity: createClientVersionResolver(VERSION_SOURCES.antigravity),
-  qoder: createClientVersionResolver(VERSION_SOURCES.qoder),
-  opencode: createClientVersionResolver(VERSION_SOURCES.opencode),
-  commandcode: createClientVersionResolver(VERSION_SOURCES.commandcode),
-  grok: createClientVersionResolver(VERSION_SOURCES.grok),
-  clineClient: createClientVersionResolver(VERSION_SOURCES.clineClient),
-  clineSdk: createClientVersionResolver(VERSION_SOURCES.clineSdk),
-  codex: createClientVersionResolver(VERSION_SOURCES.codex),
-  workbuddyClient: createClientVersionResolver(VERSION_SOURCES.workbuddyClient),
-  workbuddyCli: createClientVersionResolver(VERSION_SOURCES.workbuddyCli),
-  kimiCli: createClientVersionResolver(VERSION_SOURCES.kimiCli),
-  codebuddy: createClientVersionResolver(VERSION_SOURCES.codebuddy),
-  codebuddyCn: createClientVersionResolver(VERSION_SOURCES.codebuddyCn),
-  claudeCli: createClientVersionResolver(VERSION_SOURCES.claudeCli),
-  claudeSdk: createClientVersionResolver(VERSION_SOURCES.claudeSdk),
-  kiro: createClientVersionResolver(VERSION_SOURCES.kiro),
-  devin: createClientVersionResolver(VERSION_SOURCES.devin),
-  github: createClientVersionResolver(VERSION_SOURCES.github),
-  kilo: createClientVersionResolver(VERSION_SOURCES.kilo),
-  mimo: createClientVersionResolver(VERSION_SOURCES.mimo),
-  muse: createClientVersionResolver(VERSION_SOURCES.muse),
-  zcode: createClientVersionResolver(VERSION_SOURCES.zcode),
+  antigravity: createClientVersionResolver({ ...VERSION_SOURCES.antigravity, client: "antigravity" }),
+  qoder: createClientVersionResolver({ ...VERSION_SOURCES.qoder, client: "qoder" }),
+  opencode: createClientVersionResolver({ ...VERSION_SOURCES.opencode, client: "opencode" }),
+  commandcode: createClientVersionResolver({ ...VERSION_SOURCES.commandcode, client: "command-code" }),
+  grok: createClientVersionResolver({ ...VERSION_SOURCES.grok, client: "grok" }),
+  clineClient: createClientVersionResolver({ ...VERSION_SOURCES.clineClient, client: "cline" }),
+  clineSdk: createClientVersionResolver({ ...VERSION_SOURCES.clineSdk, client: "cline-sdk" }),
+  codex: createClientVersionResolver({ ...VERSION_SOURCES.codex, client: "codex" }),
+  workbuddyClient: createClientVersionResolver({ ...VERSION_SOURCES.workbuddyClient, client: "workbuddy" }),
+  workbuddyCnClient: createClientVersionResolver({ ...VERSION_SOURCES.workbuddyCnClient, client: "workbuddy-cn" }),
+  workbuddyCli: createClientVersionResolver({ ...VERSION_SOURCES.workbuddyCli, client: "codebuddy" }),
+  kimiCli: createClientVersionResolver({ ...VERSION_SOURCES.kimiCli, client: "kimi" }),
+  codebuddy: createClientVersionResolver({ ...VERSION_SOURCES.codebuddy, client: "codebuddy" }),
+  codebuddyCn: createClientVersionResolver({ ...VERSION_SOURCES.codebuddyCn, client: "codebuddy" }),
+  claudeCli: createClientVersionResolver({ ...VERSION_SOURCES.claudeCli, client: "claude" }),
+  claudeSdk: createClientVersionResolver({ ...VERSION_SOURCES.claudeSdk, client: "claude-sdk" }),
+  kiro: createClientVersionResolver({ ...VERSION_SOURCES.kiro, client: "kiro" }),
+  github: createClientVersionResolver({ ...VERSION_SOURCES.github, client: "github-copilot" }),
+  kilo: createClientVersionResolver({ ...VERSION_SOURCES.kilo, client: "kilo" }),
+  muse: createClientVersionResolver({ ...VERSION_SOURCES.muse, client: "muse" }),
+  zcode: createClientVersionResolver({ ...VERSION_SOURCES.zcode, client: "zcode" }),
 } satisfies Record<keyof typeof VERSION_SOURCES, ClientVersionResolver>;
 const PROVIDER_VERSION_RESOLVERS: Readonly<Record<string, ClientVersionResolver>> = {
   antigravity: resolvers.antigravity,
   grok: resolvers.grok,
   xai: resolvers.grok,
   opencode: resolvers.opencode,
-  opencodeft: resolvers.opencode,
-  opencodezen: resolvers.opencode,
-  opencodego: resolvers.opencode,
+  "opencode-zen": resolvers.opencode,
+  "opencode-go": resolvers.opencode,
   cline: resolvers.clineClient,
   codex: resolvers.codex,
   qoder: resolvers.qoder,
   commandcode: resolvers.commandcode,
   workbuddy: resolvers.workbuddyClient,
+  workbuddycn: resolvers.workbuddyCnClient,
   cb: resolvers.codebuddy,
   cbcn: resolvers.codebuddyCn,
   kimi: resolvers.kimiCli,
   kiro: resolvers.kiro,
   anthropic: resolvers.claudeCli,
   claude: resolvers.claudeCli,
-  devin: resolvers.devin,
   github: resolvers.github,
   kilo: resolvers.kilo,
-  mimodesktop: resolvers.mimo,
   muse: resolvers.muse,
   zcode: resolvers.zcode,
 };
@@ -389,10 +407,56 @@ export function getProviderClientVersion(providerId: string): ClientVersionSnaps
   return PROVIDER_VERSION_RESOLVERS[providerId.trim().toLowerCase()]?.snapshot();
 }
 
+/** Live Codex and Claude CLI versions for route-identity choices. */
+export function getRouteIdentityVersions(): {
+  readonly codex: string;
+  readonly claude: string;
+} {
+  return { codex: getCodexVersion(), claude: getClaudeCliVersion() };
+}
+
 /** Refreshes every provider version resolver in parallel; failures keep fallbacks. */
 export async function refreshProviderClientVersions(): Promise<void> {
   const resolversToRefresh = [...new Set(Object.values(PROVIDER_VERSION_RESOLVERS))];
   await Promise.allSettled(resolversToRefresh.map((resolver) => resolver.ensure()));
+}
+
+/** One client identity still running on its pinned fallback. */
+export interface PinnedClientVersion {
+  readonly client: string;
+  /** The fallback in force, which is what every request is currently sending. */
+  readonly version: string;
+  /** The lowest version the upstream accepted when it last answered. */
+  readonly minVersion?: string;
+}
+
+/**
+ * Client identities whose version discovery has not succeeded.
+ *
+ * Every header this module builds is version-aware, and a provider that starts
+ * gating on it refuses with wording indistinguishable from a dead credential —
+ * Cline's is "please make sure you're using the latest version and
+ * re-authenticate". That makes a stuck fallback an operational fact an operator
+ * needs *before* it presents as an auth failure, and until now nothing could
+ * tell a pinned fallback from a discovered version: only the synchronous getter
+ * was exported, so the `source` the resolver already tracked was unreadable
+ * outside this module.
+ *
+ * Read-only and never fetched: this reports what is in force right now, for the
+ * same reason the getters never fetch. An empty list is the healthy answer.
+ */
+export function pinnedClientVersions(): readonly PinnedClientVersion[] {
+  const pinned: PinnedClientVersion[] = [];
+  for (const resolver of new Set(Object.values(PROVIDER_VERSION_RESOLVERS))) {
+    const snapshot = resolver.snapshot();
+    if (snapshot.source !== "fallback") continue;
+    pinned.push({
+      client: snapshot.client,
+      version: snapshot.version,
+      ...(resolver.minVersion === undefined ? {} : { minVersion: resolver.minVersion }),
+    });
+  }
+  return pinned;
 }
 
 /**
@@ -404,11 +468,15 @@ export async function refreshProviderClientVersions(): Promise<void> {
  */
 function accessor<K extends keyof typeof resolvers>(name: K): {
   readonly get: () => string;
+  readonly adopt: (version: string) => void;
   readonly reset: (version?: string | null) => void;
 } {
   const resolver = resolvers[name];
   return {
     get: () => resolver.get(),
+    adopt: (version: string) => {
+      resolver.adopt(version);
+    },
     reset: (version?: string | null) => {
       resolver.reset(version);
     },
@@ -416,18 +484,13 @@ function accessor<K extends keyof typeof resolvers>(name: K): {
 }
 
 export const getQoderVersion = accessor("qoder").get;
-export const _resetQoderVersion = accessor("qoder").reset;
 export const getAntigravityVersion = accessor("antigravity").get;
-export const _resetAntigravityVersion = accessor("antigravity").reset;
 
 export const getOpenCodeVersion = accessor("opencode").get;
-export const _resetOpenCodeVersion = accessor("opencode").reset;
 
 export const getCommandCodeVersion = accessor("commandcode").get;
-export const _resetCommandCodeVersion = accessor("commandcode").reset;
 
 export const getGrokVersion = accessor("grok").get;
-export const _resetGrokVersionCache = accessor("grok").reset;
 
 export function buildGrokUserAgent(version = getGrokVersion()): string {
   return buildGrokShellUserAgent(version);
@@ -440,13 +503,13 @@ export function buildGrokAuthUserAgent(version = getGrokVersion()): string {
 
 export const getClineClientVersion = accessor("clineClient").get;
 export const getClineSdkVersion = accessor("clineSdk").get;
-
-export const _resetWorkBuddyClientVersionCache = accessor("workbuddyClient").reset;
+export const _resetClineClientVersionCache = accessor("clineClient").reset;
+export const _resetClineSdkVersionCache = accessor("clineSdk").reset;
 
 export const getCodexVersion = accessor("codex").get;
-export const _resetCodexVersion = accessor("codex").reset;
 
 export const getWorkBuddyClientVersion = accessor("workbuddyClient").get;
+export const getWorkBuddyCnClientVersion = accessor("workbuddyCnClient").get;
 export const getWorkBuddyCliVersion = accessor("workbuddyCli").get;
 
 export function buildWorkBuddyUserAgent(
@@ -456,10 +519,9 @@ export function buildWorkBuddyUserAgent(
   return `WorkBuddy/${clientVersion} WorkBuddy AI/${clientVersion} CLI/${cliVersion}`;
 }
 
-export const _resetWorkBuddyVersionCache = accessor("workbuddyCli").reset;
+export const _resetWorkBuddyCnClientVersionCache = accessor("workbuddyCnClient").reset;
 
 export const getKimiCliVersion = accessor("kimiCli").get;
-export const _resetKimiCliVersion = accessor("kimiCli").reset;
 
 export const getCodeBuddyVersion = accessor("codebuddy").get;
 export const getCodeBuddyCnVersion = accessor("codebuddyCn").get;
@@ -474,15 +536,11 @@ export const _resetCodeBuddyVersionCache = accessor("codebuddy").reset;
 export const _resetCodeBuddyCnVersionCache = accessor("codebuddyCn").reset;
 
 export const getClaudeCliVersion = accessor("claudeCli").get;
+export const adoptClaudeCliVersion = accessor("claudeCli").adopt;
+export const _resetClaudeCliVersionCache = accessor("claudeCli").reset;
 export const getClaudeSdkVersion = accessor("claudeSdk").get;
 
-export function _resetClaudeVersionCache(version: string | null = null): void {
-  resolvers.claudeCli.reset(version);
-  resolvers.claudeSdk.reset(version);
-}
-
 export const getKiroVersion = accessor("kiro").get;
-export const _resetKiroVersion = accessor("kiro").reset;
 
 /**
  * Builds the `x-amz-user-agent` companion header for the generation surface.
@@ -531,23 +589,6 @@ export function buildKiroSsoUserAgent(): string {
     `os/${KIRO_SYSTEM_VERSION} lang/js md/nodejs#${KIRO_NODE_VERSION} ` +
     `api/sso-oidc#${KIRO_SSO_SDK_VERSION} m/E KiroIDE`
   );
-}
-
-/**
- * Builds the browser-shaped `user-agent` the vendor portal expects.
- *
- * The portal's approval endpoints are same-origin XHRs issued by the SSO start
- * page, so they are only ever reached by a browser.
- */
-export function buildKiroBrowserUserAgent(): string {
-  const platform = KIRO_SYSTEM_VERSION.split("#")[0];
-  const os =
-    platform === "darwin"
-      ? "Macintosh; Intel Mac OS X 10_15_7"
-      : platform === "linux"
-        ? "X11; Linux x86_64"
-        : "Windows NT 10.0; Win64; x64";
-  return `Mozilla/5.0 (${os}) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36`;
 }
 
 /**

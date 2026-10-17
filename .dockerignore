@@ -43,7 +43,7 @@ bin
 *.sql
 backups
 !migrations/
-!migrations/*.sql
+!migrations/**
 # Testing
 coverage
 .nyc_output

@@ -9,7 +9,7 @@ import { DataTable } from "./ui/layout";
 import { Inline } from "./ui/inline";
 import { EmptyState, ErrorState, LoadingState } from "./ui/state";
 import { useAccountHealthEvents, useRecoverAccount, useUpdateProviderAccount } from "../hooks/providers";
-import { toast } from "../shared/toast";
+import { toast } from "../lib/toast";
 /**
  * The account health & error log dialog shared by the Quota page and provider detail.
  */
@@ -80,30 +80,20 @@ export function HealthEventsModal({
 
   return (
     <Dialog open={true} onClose={onClose} title={`Health & Error Log — ${title}`} size="lg">
-      <div style={{ display: "flex", flexDirection: "column", gap: "14px", minWidth: 0 }}>
+      <div className="flex flex-col gap-7 min-w-0">
         <div
-          style={{
-            display: "flex",
-            flexWrap: "wrap",
-            alignItems: "center",
-            justifyContent: "space-between",
-            gap: "10px",
-            padding: "10px 14px",
-            borderRadius: "10px",
-            background: "var(--surface-2)",
-            border: "1px solid var(--inner-border)",
-          }}
+          className="flex flex-wrap items-center justify-between gap-5 rounded-control border border-inner-border bg-surface-2 py-5 px-7"
         >
-          <div style={{ minWidth: 0 }}>
-            <Inline gap="8px" style={{ flexWrap: "wrap" }}>
-              <span style={{ fontSize: "13px", fontWeight: 600 }}>Account status:</span>
+          <div className="min-w-0">
+            <Inline gap="8px" className="flex-wrap">
+              <span className="text-body font-semibold">Account status:</span>
               <Badge tone={statusTone(status)} dot>{status.toUpperCase()}</Badge>
               {errorCategory ? (
                 <Badge tone="warn" title={errorMessage ?? undefined}>{errorCategory}</Badge>
               ) : null}
             </Inline>
             {errorMessage ? (
-              <p style={{ fontSize: "11.5px", color: "var(--red)", marginTop: "4px", overflowWrap: "anywhere" }}>
+              <p className="text-badge text-red mt-2 wrap-anywhere">
                 {errorMessage}
               </p>
             ) : null}
@@ -123,20 +113,11 @@ export function HealthEventsModal({
 
         {canManageStaticMode ? (
           <div
-            style={{
-              display: "flex",
-              alignItems: "center",
-              justifyContent: "space-between",
-              gap: "12px",
-              padding: "10px 14px",
-              borderRadius: "10px",
-              background: "var(--surface-2)",
-              border: "1px solid var(--inner-border)",
-            }}
+            className="flex items-center justify-between gap-6 rounded-control border border-inner-border bg-surface-2 py-5 px-7"
           >
             <div>
-              <div style={{ fontSize: "12px", fontWeight: 600 }}>Credential management</div>
-              <div style={{ fontSize: "11px", color: "var(--text-tertiary)" }}>
+              <div className="text-caption font-semibold">Credential management</div>
+              <div className="text-badge text-text-tertiary">
                 {staticMode ? "Static mode: no refresh request will be sent." : "OAuth refresh is enabled for this account."}
               </div>
             </div>
@@ -146,18 +127,13 @@ export function HealthEventsModal({
               disabled={update.isPending}
               onClick={() => setStaticConfirm(!staticMode)}
             >
-              {staticMode ? "Static JWT · no refresh" : "Enable static mode"}
+              {staticMode ? "Static · no refresh" : "Enable static mode"}
             </Button>
           </div>
         ) : null}
-        <div style={{ minWidth: 0 }}>
+        <div className="min-w-0">
           <h4
-            style={{
-              fontSize: "12px",
-              fontWeight: 600,
-              color: "var(--text-secondary)",
-              marginBottom: "8px",
-            }}
+            className="text-caption font-semibold text-text-secondary mb-4"
           >
             Transition Events & Audit ({events.length})
           </h4>
@@ -168,33 +144,30 @@ export function HealthEventsModal({
           ) : events.length === 0 ? (
             <EmptyState title="No health events recorded" message={summary.emptyMessage} icon={<Activity size={20} />} />
           ) : (
-            <div
-              style={{
-                maxHeight: "min(55dvh, 480px)",
-                overflow: "auto",
-                border: "1px solid var(--inner-border)",
-                borderRadius: "8px",
-              }}
-            >
-              <DataTable headers={["Timestamp", "From → To", "Model", "Category", "Reason / Details"]}>
+            <div className="rounded-inset border border-inner-border">
+              <DataTable
+                maxHeight={480}
+                scrollRegion
+                headers={["Timestamp", "From → To", "Model", "Category", "Reason / Details"]}
+              >
                 {events.map((ev) => (
                   <tr key={ev.id}>
-                    <td style={{ fontSize: "11px", color: "var(--text-tertiary)", whiteSpace: "nowrap" }}>
+                    <td className="text-badge text-text-tertiary whitespace-nowrap">
                       {new Date(ev.createdAt).toLocaleString()}
                     </td>
-                    <td style={{ whiteSpace: "nowrap" }}>
-                      <span style={{ fontSize: "11px", color: "var(--text-secondary)" }}>
+                    <td className="whitespace-nowrap">
+                      <span className="text-badge text-text-secondary">
                         {ev.fromStatus ?? "new"} →{" "}
                       </span>
                       <Badge tone={statusTone(ev.toStatus)}>{ev.toStatus}</Badge>
                     </td>
-                    <td style={{ fontSize: "11px", fontFamily: "var(--font-mono)", color: "var(--text-secondary)", overflowWrap: "anywhere" }}>
+                    <td className="font-mono tabular-nums text-badge text-text-secondary wrap-anywhere">
                       {ev.modelId ?? "—"}
                     </td>
-                    <td style={{ fontSize: "11.5px", fontFamily: "var(--font-mono)", color: "var(--text-secondary)" }}>
+                    <td className="font-mono tabular-nums text-badge text-text-secondary">
                       {ev.errorCategory ?? "—"}
                     </td>
-                    <td style={{ fontSize: "11px", color: "var(--text-primary)", minWidth: "220px", maxWidth: "520px", overflowWrap: "anywhere" }}>
+                    <td className="text-badge text-text-primary min-w-110 max-w-260 wrap-anywhere">
                       {ev.reason ?? "—"}
                     </td>
                   </tr>

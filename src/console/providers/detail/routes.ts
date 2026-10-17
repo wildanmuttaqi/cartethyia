@@ -8,7 +8,11 @@ import {
   type UpdateProviderRoutingRequest,
 } from "../catalog/contracts";
 import type { AccountInflightReading, ProviderDetailConfig } from "./contracts";
-import { ROUTING_STRATEGIES } from "../../../transport/routing/route-model";
+import { providerRoutingStrategy } from "../../../persistence/schema";
+
+/** Provider-routing strategies, read from the persisted enum so the body
+ * schema and the database agree on the legal values. */
+const ROUTING_STRATEGIES = providerRoutingStrategy.enumValues;
 
 /**
  * Routing-tuning bounds, declared once because two layers enforce them: the
@@ -20,7 +24,10 @@ import { ROUTING_STRATEGIES } from "../../../transport/routing/route-model";
 const ROUTING_BOUNDS = {
   rotateCount: { min: 1, max: 1000 },
   maxInflight: PROVIDER_ROUTING_MAX_INFLIGHT_BOUNDS,
-  creditLimit: { min: 0, max: 1_000_000_000 },
+  /** A proxy pool's own concurrency is usually 10, so a per-provider share
+   * above this is almost certainly a typo. Same ceiling as the per-account
+   * field keeps the two sliders from disagreeing about what "large" means. */
+  maxInflightPerProxy: PROVIDER_ROUTING_MAX_INFLIGHT_BOUNDS,
 } as const;
 
 export function createProviderDetailOperations(deps: ProviderDetailConfig) {
@@ -67,25 +74,31 @@ export function createProviderDetailOperations(deps: ProviderDetailConfig) {
             `maxInflight must be an integer between ${maxInflight.min} and ${maxInflight.max}, or null`,
           );
       }
+      if (patch.maxInflightPerProxy !== undefined && patch.maxInflightPerProxy !== null) {
+        const bound = ROUTING_BOUNDS.maxInflightPerProxy;
+        if (
+          !Number.isInteger(patch.maxInflightPerProxy) ||
+          patch.maxInflightPerProxy < bound.min ||
+          patch.maxInflightPerProxy > bound.max
+        )
+          throw new ConsoleDomainError(
+            "invalid_max_inflight_per_proxy",
+            400,
+            `maxInflightPerProxy must be an integer between ${bound.min} and ${bound.max}, or null`,
+          );
+      }
+      if (patch.usageFloor !== undefined && patch.usageFloor !== null) {
+        if (!Number.isInteger(patch.usageFloor) || patch.usageFloor < 0 || patch.usageFloor > 1_000_000)
+          throw new ConsoleDomainError("invalid_usage_floor", 400, "usageFloor must be an integer from 0 to 1000000, or null");
+      }
+      if (patch.usageFloorUnit !== undefined && patch.usageFloorUnit !== "credit" && patch.usageFloorUnit !== "percent") {
+        throw new ConsoleDomainError("invalid_request", 400, "usageFloorUnit must be credit or percent");
+      }
       if (
         patch.userAgent !== undefined &&
-        (!patch.userAgent.trim() || patch.userAgent.length > 4096 || /[\u0000-\u001f\u007f]/.test(patch.userAgent))
+        (patch.userAgent.length > 4096 || /[\u0000-\u001f\u007f]/.test(patch.userAgent))
       ) {
-        throw new ConsoleDomainError("invalid_request", 400, "userAgent must be a non-empty header value up to 4096 characters");
-      }
-      if (patch.creditLimit !== undefined) {
-        const { creditLimit } = ROUTING_BOUNDS;
-        if (
-          !Number.isInteger(patch.creditLimit) ||
-          patch.creditLimit < creditLimit.min ||
-          patch.creditLimit > creditLimit.max
-        ) {
-          throw new ConsoleDomainError(
-            "invalid_credit_limit",
-            400,
-            `creditLimit must be an integer between ${creditLimit.min} and ${creditLimit.max}`,
-          );
-        }
+        throw new ConsoleDomainError("invalid_request", 400, "userAgent must be a header value up to 4096 characters");
       }
       const updated = await deps.store.updateRouting(providerId, a.tenantId, patch);
       await deps.auditSink?.record({
@@ -132,12 +145,18 @@ const updateRoutingBody = t.Object({
       t.Integer({ minimum: ROUTING_BOUNDS.maxInflight.min, maximum: ROUTING_BOUNDS.maxInflight.max }),
     ),
   ),
-  bypassProxy: t.Optional(t.Boolean()),
-  userAgent: t.Optional(t.String({ minLength: 1, maxLength: 4096 })),
-  creditLimitEnabled: t.Optional(t.Boolean()),
-  creditLimit: t.Optional(
-    t.Integer({ minimum: ROUTING_BOUNDS.creditLimit.min, maximum: ROUTING_BOUNDS.creditLimit.max }),
+  maxInflightPerProxy: t.Optional(
+    t.Nullable(
+      t.Integer({
+        minimum: ROUTING_BOUNDS.maxInflightPerProxy.min,
+        maximum: ROUTING_BOUNDS.maxInflightPerProxy.max,
+      }),
+    ),
   ),
+  usageFloor: t.Optional(t.Nullable(t.Integer({ minimum: 0, maximum: 1_000_000 }))),
+  usageFloorUnit: t.Optional(t.Union([t.Literal("credit"), t.Literal("percent")])),
+  skipProxy: t.Optional(t.Boolean()),
+  userAgent: t.Optional(t.String({ minLength: 0, maxLength: 4096 })),
 });
 
 

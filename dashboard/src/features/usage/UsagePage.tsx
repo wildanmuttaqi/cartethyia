@@ -1,18 +1,23 @@
-import { createContext, useContext, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { cn } from "../../lib/classnames";
+import { createContext, useContext, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { useSearchParams } from "react-router-dom";
 import {
   Activity,
   ArrowDown,
   ArrowUp,
   ArrowUpFromLine,
+  Ban,
   Check,
   CheckCircle2,
+  ChevronDown,
   Coins,
   Copy,
   Database,
   DollarSign,
+  Download,
   Eye,
   EyeOff,
+  Cog,
   Image as ImageIcon,
   LogIn,
   Maximize2,
@@ -34,6 +39,10 @@ import {
   YAxis,
 } from "recharts";
 import { Button } from "../../components/ui/button";
+import { useBanIp } from "../../hooks/model-bans";
+import { downloadTextFile } from "../../lib/download";
+import { toast } from "../../lib/toast";
+import { consoleRequest, getErrorMessage } from "../../data/api";
 import { Card, CardBody, CardHeader } from "../../components/ui/card";
 import { DataTable, StatCard } from "../../components/ui/layout";
 import { EmptyState, ErrorState, LoadingState } from "../../components/ui/state";
@@ -41,6 +50,7 @@ import { Drawer } from "../../components/ui/drawer";
 import { Select } from "../../components/ui/select";
 import { Inline } from "../../components/ui/inline";
 import { Stack } from "../../components/ui/stack";
+import { Banner } from "../../components/patterns/banner";
 import { useReducedMotion } from "../../hooks/use-reduced-motion";
 import {
   useUsageBy,
@@ -49,39 +59,42 @@ import {
   useUsageRequests,
   useUsageSummary,
 } from "../../hooks/system";
-import { requestProviderId } from "../../shared/request-provider";
-import { usageApiKeyLabel, usageClientLabel } from "../../shared/usage-labels";
+import { requestProviderId } from "./request-provider";
+import { usageApiKeyLabel, usageClientLabel } from "./usage-labels";
 
 import { useProviderAccounts, useProviders } from "../../hooks/providers";
 import { useInFlight, type InFlightState } from "../../hooks/live";
 import { useTrackedTimeout } from "../../hooks/use-timeout";
 import { USAGE_PERIODS, type UsagePeriod as Period } from "../../data/usage-periods";
-import { httpStatusLabel, httpStatusShortLabel, httpStatusTone } from "../../shared/http-status";
-import { USAGE_DIMENSIONS, type UsageDimension } from "../../data/contracts";
+import { httpStatusLabel, httpStatusShortLabel, httpStatusTone } from "./http-status";
+import { USAGE_DIMENSIONS, type UsageDimension, type UsageSummaryTotals } from "../../data/contracts";
 import {
   DEFAULT_TOKEN_SCALE,
   RAW_TOKEN_SCALE,
   TOKEN_SCALE_AUTO,
   TOKEN_SCALES,
-  formatBytes,
-  formatChartTick,
-  formatChartTooltip,
-  formatCredits,
-  formatDuration,
-  formatNumber,
   formatTokens,
   tokenScaleIndex,
   tokenScaleValue,
-} from "../../shared/format";
+} from "../../lib/format/tokens";
+import {
+  formatBytes,
+  formatCredits,
+  formatDuration,
+  formatNumber,
+} from "../../lib/format/numbers";
+import { formatChartTick, formatChartTooltip } from "../../lib/format/instants";
 
 type Metric = "requests" | "tokens" | "cached";
 /** Mirrors the backend `USAGE_DIMENSIONS`; keep in sync by hand. */
 type Dimension = UsageDimension;
 
-/** Breakdown rows visible before the list scrolls; the rest scrolls inside. */
-const BREAKDOWN_VISIBLE_ROWS = 5;
-/** Row box (12px + 12px padding, ~17px content) plus the 8px flex gap. */
-const BREAKDOWN_ROW_HEIGHT = 49;
+/** Breakdown rows the panel holds before it scrolls; the rest scrolls inside.
+ *  The body is locked to this height so the card keeps it when the list is
+ *  empty, loading, or short. */
+const BREAKDOWN_VISIBLE_ROWS = 6;
+/** Measured row box (39px) plus the 8px flex gap, minus the trailing gap. */
+const BREAKDOWN_LIST_HEIGHT = BREAKDOWN_VISIBLE_ROWS * 47 - 8;
 
 
 /**
@@ -128,6 +141,22 @@ const PERIOD_OPTIONS = USAGE_PERIODS.map((value) => ({
 
 function periodLabel(period: Period): string {
   return PERIOD_LABELS[period] ?? period;
+}
+
+/**
+ * The card headline. The period alone read as a label with nothing under it,
+ * so it carries what moved in the period: how many calls, how many tokens,
+ * and how long a call took on average.
+ */
+function usageHeadline(
+  period: Period,
+  pending: boolean,
+  totals: UsageSummaryTotals | undefined,
+): string {
+  const label = periodLabel(period);
+  if (pending || totals === undefined) return label;
+  const tokens = totals.inputTokens + totals.outputTokens;
+  return `${label} · ${formatNumber(totals.requests)} calls · ${formatTokens(tokens)} tokens · avg ${formatDuration(totals.avgDurationMs)}`;
 }
 
 function asPeriod(value: string | null): Period {
@@ -318,7 +347,7 @@ function StatusCodeWithExplainer({
   const code = statusCode(status, httpStatus);
   const explainer = statusExplainer(status, errorKind, httpStatus);
   return (
-    <span style={{ position: "relative", display: "inline-block" }}>
+    <span className="relative inline-block">
       <button
         type="button"
         onClick={() => setOpen((value) => !value)}
@@ -327,43 +356,18 @@ function StatusCodeWithExplainer({
         aria-expanded={open}
         aria-label={explainer}
         title={explainer}
-        style={{
-          fontFamily: "var(--font-mono)",
-          fontWeight: 700,
-          fontVariantNumeric: "tabular-nums",
-          color: STATUS_TONE_COLOR[code.tone],
-          background: "none",
-          border: "1px solid transparent",
-          borderRadius: "6px",
-          padding: "0 4px",
-          cursor: "pointer",
-          fontSize: "inherit",
-        }}
+        className={cn(
+          "font-mono font-bold tabular-nums bg-transparent border border-transparent",
+          "rounded-chip cursor-pointer px-2 py-0 text-[inherit]",
+        )}
+        style={{ color: STATUS_TONE_COLOR[code.tone] }}
       >
         {code.code}
       </button>
       {open ? (
         <span
           role="status"
-          style={{
-            position: "absolute",
-            zIndex: 30,
-            top: "calc(100% + 6px)",
-            left: 0,
-            whiteSpace: "normal",
-            minWidth: "220px",
-            maxWidth: "280px",
-            border: "1px solid var(--inner-border)",
-            borderRadius: "10px",
-            background: "var(--popover-bg)",
-            boxShadow: "0 12px 32px rgba(0,0,0,0.16)",
-            padding: "8px 10px",
-            fontFamily: "var(--font-sans, system-ui)",
-            fontWeight: 400,
-            fontSize: "11px",
-            lineHeight: 1.5,
-            color: "var(--text-secondary)",
-          }}
+          className="absolute top-full z-30 mt-1.5 left-0 whitespace-normal min-w-110 max-w-140 border border-inner-border rounded-control bg-popover-bg shadow-popout px-5 py-4 font-sans font-normal text-badge leading-snug text-text-secondary"
         >
           {explainer}
         </span>
@@ -474,7 +478,7 @@ function PillTabs<T extends string>({
     <div
       role="tablist"
       aria-label={ariaLabel}
-      style={{ display: "flex", flexWrap: "wrap", gap: "4px", minWidth: 0 }}
+      className="flex flex-wrap gap-2 min-w-0"
     >
       {options.map((option) => (
         <Button
@@ -524,6 +528,130 @@ function PanelWidthToggle({
   );
 }
 
+/** Statuses pinned as chips; everything else folds into the "More" menu. */
+const PINNED_STATUS = 200;
+
+function StatusFilterButton({
+  status,
+  count,
+  pressed,
+  onToggle,
+}: {
+  readonly status: number;
+  readonly count: number;
+  readonly pressed: boolean;
+  readonly onToggle: (status: number) => void;
+}): ReactNode {
+  const label = httpStatusLabel(status);
+  const tone = httpStatusTone(status);
+  return (
+    <button
+      type="button"
+      className={`inline-flex items-center gap-2.5 min-h-10.5 px-3 py-0.5 border rounded-chip bg-surface-1 font-sans text-micro font-semibold leading-none whitespace-nowrap cursor-pointer ${pressed ? "border-current" : "border-inner-border text-text-secondary hover:border-current"} ${tone === "ok" ? "text-green" : tone === "warn" ? "text-orange" : "text-red"} ${pressed ? "" : "hover:bg-surface-muted"}`}
+      data-tone={tone}
+      aria-pressed={pressed}
+      aria-label={`Filter ${label}: ${formatNumber(count)} requests`}
+      title={`Show ${formatNumber(count)} requests with HTTP ${label}`}
+      onClick={() => onToggle(status)}
+    >
+      <span>{label}</span>
+      <span className="font-mono tabular-nums opacity-65" aria-hidden="true">· {formatNumber(count)}</span>
+    </button>
+  );
+}
+
+/**
+ * HTTP status filters for the Requests table. `200 OK` stays a chip; the rest
+ * live in a menu so a period full of errors does not flood the header.
+ */
+function StatusFilters({
+  counts,
+  active,
+  onToggle,
+}: {
+  readonly counts: readonly { readonly status: number; readonly count: number }[];
+  readonly active: number | null;
+  readonly onToggle: (status: number) => void;
+}): ReactNode {
+  const [open, setOpen] = useState(false);
+  const rootRef = useRef<HTMLDivElement>(null);
+  const present = counts.filter((entry) => entry.count > 0);
+  const pinned = present.filter((entry) => entry.status === PINNED_STATUS);
+  const rest = present.filter((entry) => entry.status !== PINNED_STATUS);
+  const restTotal = rest.reduce((sum, entry) => sum + entry.count, 0);
+  const restActive = rest.some((entry) => entry.status === active);
+
+  useEffect(() => {
+    if (!open) return;
+    const onDown = (event: MouseEvent) => {
+      if (rootRef.current && !rootRef.current.contains(event.target as Node)) setOpen(false);
+    };
+    const onKey = (event: KeyboardEvent) => {
+      if (event.key === "Escape") setOpen(false);
+    };
+    document.addEventListener("mousedown", onDown);
+    document.addEventListener("keydown", onKey);
+    return () => {
+      document.removeEventListener("mousedown", onDown);
+      document.removeEventListener("keydown", onKey);
+    };
+  }, [open]);
+
+  if (present.length === 0) return null;
+  return (
+    <div className="inline-flex items-center flex-wrap gap-2" role="group" aria-label="Filter requests by HTTP status">
+      {pinned.map((entry) => (
+        <StatusFilterButton
+          key={entry.status}
+          status={entry.status}
+          count={entry.count}
+          pressed={active === entry.status}
+          onToggle={onToggle}
+        />
+      ))}
+      {rest.length > 0 ? (
+        <div ref={rootRef} className="relative">
+          <button
+            type="button"
+            className={`inline-flex items-center gap-2.5 min-h-10.5 px-3 py-0.5 border rounded-chip bg-surface-1 font-sans text-micro font-semibold leading-none whitespace-nowrap cursor-pointer ${restActive ? "border-current" : "border-inner-border text-text-secondary hover:border-current hover:bg-surface-muted"} ${restActive ? (httpStatusTone(active ?? 0) === "ok" ? "text-green" : httpStatusTone(active ?? 0) === "warn" ? "text-orange" : "text-red") : ""}`}
+            data-tone={restActive ? httpStatusTone(active ?? 0) : undefined}
+            aria-pressed={restActive}
+            aria-expanded={open}
+            aria-haspopup="menu"
+            aria-label={`More statuses: ${formatNumber(restTotal)} requests across ${rest.length}`}
+            onClick={() => setOpen((value) => !value)}
+          >
+            <span>More</span>
+            <span className="font-mono tabular-nums opacity-65" aria-hidden="true">· {formatNumber(restTotal)}</span>
+            <ChevronDown size={10} aria-hidden="true" className={cn("transition-transform", open && "rotate-180")} />
+          </button>
+          {open ? (
+            <div
+              role="menu"
+              aria-label="Other HTTP statuses"
+              className="absolute top-full z-50 mt-1 right-0 min-w-90 flex flex-col gap-1 border border-inner-border rounded-control bg-popover-bg shadow-popout p-2"
+            >
+              {rest.map((entry) => (
+                <div key={entry.status} role="none" className="[&>button]:w-full [&>button]:justify-between">
+                  <StatusFilterButton
+                    status={entry.status}
+                    count={entry.count}
+                    pressed={active === entry.status}
+                    onToggle={(status) => {
+                      onToggle(status);
+                      setOpen(false);
+                    }}
+                  />
+                </div>
+              ))}
+            </div>
+          ) : null}
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
 function ChartPanel({ period, metric }: { readonly period: Period; readonly metric: Metric }): ReactNode {
   const chartQuery = useUsageChart(period);
   const reducedMotion = useReducedMotion();
@@ -532,22 +660,26 @@ function ChartPanel({ period, metric }: { readonly period: Period; readonly metr
     [chartQuery.data],
   );
   const dataKey = metric === "requests" ? "requests" : metric === "cached" ? "cached" : "total";
-  if (chartQuery.isPending && buckets.length === 0) {
+  // The backend fills every bucket of the window, so an idle period arrives as
+  // a full series of zeroes rather than an empty array. A chart of that draws
+  // nothing — a blank strip — so it reads as empty instead.
+  const hasTraffic = buckets.some((bucket) => bucket[dataKey] > 0);
+  if (chartQuery.isPending && !hasTraffic) {
     return <LoadingState label="Loading chart…" />;
   }
-  if (chartQuery.isError && buckets.length === 0) {
+  if (chartQuery.isError && !hasTraffic) {
     return <ErrorState message="Failed to load chart data." onRetry={() => void chartQuery.refetch()} />;
   }
-  if (buckets.length === 0) {
+  if (!hasTraffic) {
     return (
       <EmptyState
-        title="No traffic in this window"
-        message="Route requests through the gateway to populate the chart."
+        title="No usage for this period"
+        message="Route requests to populate the usage."
       />
     );
   }
   return (
-    <div style={{ height: "224px" }}>
+    <div className="usage-panel-body h-113.5 w-full">
       <ResponsiveContainer width="100%" height="100%">
         <AreaChart data={buckets} margin={{ top: 8, right: 8, left: -14, bottom: 0 }}>
           <defs>
@@ -617,7 +749,9 @@ function BreakdownSnapshot({
     () => new Map((providersQuery.data ?? []).map((provider) => [provider.providerId, provider.label || provider.displayName])),
     [providersQuery.data],
   );
-  const rows = byQuery.data?.rows ?? [];
+  // A response that names another dimension is a tab the operator already left.
+  // Showing it would leave the list unchanged after the click.
+  const rows = byQuery.data?.dimension === dimension ? byQuery.data.rows : [];
   const maxTotal = rows.length > 0 ? Math.max(...rows.map((row) => row.total)) : 1;
   const totalRequests = rows.reduce((sum, row) => sum + row.requests, 0);
   const totalErrors = rows.reduce((sum, row) => sum + row.errors, 0);
@@ -630,7 +764,7 @@ function BreakdownSnapshot({
     return `${rows.length} ${plural} · ${formatNumber(totalRequests)} hits · ${pct}% ok`;
   })();
   return (
-    <Card className={wide ? "grid-span-full" : ""}>
+    <Card className={wide ? "col-span-full" : ""}>
       <CardHeader
         title="Breakdown"
         subtitle={breakdownSubtitle}
@@ -653,7 +787,7 @@ function BreakdownSnapshot({
           />
         }
       />
-      <CardBody>
+      <CardBody style={{ height: `${BREAKDOWN_LIST_HEIGHT}px` }}>
         {byQuery.isPending && rows.length === 0 ? (
           <LoadingState label="Loading breakdown…" />
         ) : byQuery.isError && rows.length === 0 ? (
@@ -662,14 +796,7 @@ function BreakdownSnapshot({
           <EmptyState title="No usage for this period" message="Route requests to populate the breakdown." />
         ) : (
           <div
-            className="scroll-region"
-            style={{
-              display: "flex",
-              flexDirection: "column",
-              gap: "8px",
-              maxHeight: `${BREAKDOWN_VISIBLE_ROWS * BREAKDOWN_ROW_HEIGHT}px`,
-              paddingRight: "2px",
-            }}
+            className="scroll-region flex h-full flex-col gap-4 pr-1"
           >
             {rows.map((row) => {
               const pct = maxTotal > 0 ? Math.max(2, (row.total / maxTotal) * 100) : 2;
@@ -684,55 +811,29 @@ function BreakdownSnapshot({
                 <div
                   key={row.name}
                   title={`${displayName} · ${formatNumber(row.requests)} hits · ${formatNumber(okCount)} ok · ${formatNumber(row.total)} tokens · ${formatUsd(row.costUsd)}`}
-                  style={{
-                    position: "relative",
-                    flexShrink: 0,
-                    overflow: "hidden",
-                    borderRadius: "10px",
-                    border: "1px solid var(--inner-border)",
-                    background: "var(--surface-2)",
-                  }}
+                  className="relative shrink-0 overflow-hidden rounded-control border border-inner-border bg-surface-2"
                 >
                   <div
                     aria-hidden="true"
-                    style={{
-                      position: "absolute",
-                      inset: 0,
-                      width: `${pct}%`,
-                      background:
-                        "linear-gradient(to right, color-mix(in srgb, var(--accent) 20%, transparent), transparent)",
-                    }}
+                    className="absolute inset-0 bg-[linear-gradient(to_right,color-mix(in_srgb,var(--accent)_20%,transparent),transparent)]"
+                    style={{ width: `${pct}%` }}
                   />
                   <div
-                    style={{
-                      position: "relative",
-                      display: "flex",
-                      alignItems: "center",
-                      justifyContent: "space-between",
-                      gap: "8px",
-                      padding: "10px 12px",
-                    }}
+                    className="relative flex items-center justify-between gap-4 px-6 py-5"
                   >
                     <span
-                      className="truncate"
-                      style={{ minWidth: 0, flex: 1, fontFamily: "var(--font-mono)", fontSize: "11px", fontWeight: 600 }}
+                      className="truncate font-mono tabular-nums min-w-0 flex-1 text-badge font-semibold"
                     >
                       {displayName}
-                    </span>
-                    <span
-                      style={{
-                        flexShrink: 0,
-                        fontSize: "10px",
-                        color: "var(--text-secondary)",
-                        fontVariantNumeric: "tabular-nums",
-                      }}
+                    </span>                    <span
+                      className="font-mono tabular-nums shrink-0 text-micro text-text-secondary"
                     >
                       {formatNumber(row.requests)} hit · {formatNumber(okCount)} ok
                     </span>
-                    <span style={{ flexShrink: 0, fontSize: "11px", fontWeight: 700, color: "var(--orange)" }}>
+                    <span className="shrink-0 text-badge font-bold text-orange">
                       {formatUsd(row.costUsd)}
                     </span>
-                    <span style={{ flexShrink: 0, fontSize: "11px", fontWeight: 700, color: "var(--purple)" }}>
+                    <span className="shrink-0 text-badge font-bold text-purple">
                       {formatTokens(row.total)}
                     </span>
                   </div>
@@ -763,16 +864,12 @@ function FlowNode({
   readonly last?: boolean;
 }): ReactNode {
   return (
-    <div style={{ display: "flex", gap: "10px", minWidth: 0 }}>
-      <div style={{ display: "flex", flexDirection: "column", alignItems: "center", flexShrink: 0 }}>
+    <div className="flex gap-5 min-w-0">
+      <div className="flex flex-col items-center shrink-0">
         <span
           aria-hidden="true"
+          className="grid place-items-center w-11 h-11 rounded-pill"
           style={{
-            display: "grid",
-            placeItems: "center",
-            width: "22px",
-            height: "22px",
-            borderRadius: "999px",
             color: tone ?? "var(--accent)",
             background: `color-mix(in srgb, ${tone ?? "var(--accent)"} 16%, var(--surface-2))`,
           }}
@@ -780,14 +877,13 @@ function FlowNode({
           {icon}
         </span>
         {last ? null : (
-          <span aria-hidden="true" style={{ width: "2px", flex: 1, minHeight: "14px", background: "var(--inner-border)" }} />
+          <span aria-hidden="true" className="w-1 flex-1 min-h-7 bg-inner-border" />
         )}
       </div>
-      <div style={{ minWidth: 0, flex: 1, paddingBottom: last ? 0 : "12px" }}>
-        <div style={{ fontSize: "12px", fontWeight: 700 }}>{title}</div>
+      <div className="min-w-0 flex-1" style={{ paddingBottom: last ? 0 : "12px" }}>
+        <div className="text-caption font-bold">{title}</div>
         <div
-          className="select-text"
-          style={{ marginTop: "2px", whiteSpace: "pre-line", fontSize: "11px", color: "var(--text-secondary)", overflowWrap: "anywhere", wordBreak: "break-word" }}
+          className="select-text mt-1 whitespace-pre-line text-badge text-text-secondary [overflow-wrap:anywhere] break-words"
         >
           {meta}
         </div>
@@ -817,6 +913,8 @@ function RequestDetailDrawer({
   const displayApiKeyName = isProbe ? "Probe" : apiKeyName;
   const [copiedRequestId, setCopiedRequestId] = useState(false);
   const [copiedPayload, setCopiedPayload] = useState<PayloadKind | null>(null);
+  const [downloading, setDownloading] = useState(false);
+  const banIp = useBanIp();
   const scheduleReset = useTrackedTimeout();
   const copyRequestId = () => {
     void navigator.clipboard?.writeText(detail?.requestId ?? "");
@@ -828,6 +926,33 @@ function RequestDetailDrawer({
     void navigator.clipboard?.writeText(text);
     setCopiedPayload(kind);
     scheduleReset(() => setCopiedPayload(null), 1500);
+  };
+  const downloadTelemetry = async () => {
+    if (!detail) return;
+    setDownloading(true);
+    try {
+      const telemetry = await consoleRequest<unknown>(
+        `/system/usage/requests/${encodeURIComponent(detail.requestId)}/download`,
+      );
+      downloadTextFile(
+        `telemetry-${detail.requestId}.json`,
+        JSON.stringify(telemetry, null, 2),
+        "application/json",
+      );
+    } catch (error) {
+      toast.error(getErrorMessage(error, "Could not download telemetry."));
+    } finally {
+      setDownloading(false);
+    }
+  };
+  const banThisUser = async () => {
+    if (!detail?.clientIp) return;
+    try {
+      await banIp.mutateAsync(detail.clientIp);
+      toast.success(`Banned ${detail.clientIp}.`);
+    } catch (error) {
+      toast.error(getErrorMessage(error, "Could not ban the address."));
+    }
   };
   const payloadViews = useMemo(
     () =>
@@ -850,26 +975,18 @@ function RequestDetailDrawer({
     <Drawer open={requestId !== null} onClose={onClose} title="Request Detail">
       {detailQuery.isPending ? (
         <Stack gap="12px">
-          <div className="animate-pulse" style={{ height: "24px", width: "66%", borderRadius: "8px", background: "var(--surface-2)" }} />
-          <div className="animate-pulse" style={{ height: "96px", borderRadius: "10px", background: "var(--surface-2)" }} />
-          <div className="animate-pulse" style={{ height: "96px", borderRadius: "10px", background: "var(--surface-2)" }} />
+          <div className="animate-pulse h-12 w-[66%] rounded-inset bg-surface-2" />
+          <div className="animate-pulse h-48 rounded-control bg-surface-2" />
+          <div className="animate-pulse h-48 rounded-control bg-surface-2" />
         </Stack>
       ) : detailQuery.isError || !detail ? (
         <ErrorState message="Failed to load request detail." onRetry={() => void detailQuery.refetch()} />
       ) : (
         <Stack gap="12px">
-          <div style={{ display: "flex", alignItems: "center", gap: "8px", borderRadius: "10px", border: "1px solid var(--inner-border)", background: "var(--surface-2)", padding: "8px 12px", minWidth: 0 }}>
+          <div className="flex items-center gap-4 rounded-control border border-inner-border bg-surface-2 px-6 py-4 min-w-0">
             <span
-              className="select-text"
+              className="select-text font-mono tabular-nums min-w-0 flex-1 [overflow-wrap:anywhere] break-words text-badge"
               title={detail.requestId}
-              style={{
-                minWidth: 0,
-                flex: 1,
-                overflowWrap: "anywhere",
-                wordBreak: "break-word",
-                fontFamily: "var(--font-mono)",
-                fontSize: "11.5px",
-              }}
             >
               request_id {detail.requestId}
             </span>
@@ -880,39 +997,49 @@ function RequestDetailDrawer({
               aria-label="Copy request ID"
               title="Copy request ID"
               onClick={copyRequestId}
-              style={{ flexShrink: 0, padding: "3px" }}
+              className="shrink-0 p-1.5"
             />
           </div>
-
+          <div className="grid grid-cols-2 gap-2">
+            <Button
+              variant="secondary"
+              size="sm"
+              icon={<Ban size={13} />}
+              disabled={!detail.clientIp || banIp.isPending}
+              title={detail.clientIp ? `Ban ${detail.clientIp}` : "No client IP recorded for this request"}
+              onClick={() => void banThisUser()}
+              className="w-full"
+            >
+              Banned User
+            </Button>
+            <Button
+              variant="secondary"
+              size="sm"
+              icon={<Download size={13} />}
+              disabled={downloading}
+              title="Download all captured telemetry for this request as JSON"
+              onClick={() => void downloadTelemetry()}
+              className="w-full"
+            >
+              Download telemetry
+            </Button>
+          </div>
 
           {detail.errorKind ? (
-            <div
-              role="alert"
-              style={{
-                display: "flex",
-                flexDirection: "column",
-                gap: "4px",
-                border: "1px solid color-mix(in srgb, var(--red) 35%, var(--inner-border))",
-                borderRadius: "10px",
-                background: "color-mix(in srgb, var(--red) 8%, var(--surface-2))",
-                padding: "10px 12px",
-                overflowWrap: "anywhere",
-                wordBreak: "break-word",
-              }}
-            >
-              <strong style={{ color: "var(--red)", fontSize: "12px" }}>
+            <Banner tone="danger" live="alert" className="flex flex-col gap-2 [overflow-wrap:anywhere] break-words">
+              <strong className="text-caption">
                 {errorLabel(detail.status, detail.errorKind, detail.errorOrigin, detail.httpStatus)}
               </strong>
-              <span style={{ color: "var(--text-tertiary)", fontFamily: "var(--font-mono)", fontSize: "10px", overflowWrap: "anywhere" }}>
+              <span className="font-mono tabular-nums text-text-tertiary text-micro [overflow-wrap:anywhere]">
                 {detail.errorKind}
               </span>
-            </div>
+            </Banner>
           ) : null}
-          <section style={{ border: "1px solid var(--inner-border)", borderRadius: "10px", overflow: "hidden" }}>
-            <div style={{ borderBottom: "1px solid var(--inner-border)", padding: "10px 12px", fontSize: "12.5px", fontWeight: 700 }}>
+          <section className="border border-inner-border rounded-control overflow-hidden">
+            <div className="border-b border-inner-border px-6 py-5 text-caption font-bold">
               Flow and Detail
             </div>
-            <div style={{ display: "flex", flexDirection: "column", padding: "12px" }}>
+            <div className="flex flex-col p-6">
               <FlowNode
                 icon={<LogIn size={13} />}
                 title="Client request in"
@@ -947,30 +1074,16 @@ function RequestDetailDrawer({
             return (
               <section
                 aria-label="Session signals"
-                style={{
-                  display: "grid",
-                  gridTemplateColumns: "repeat(auto-fit, minmax(110px, 1fr))",
-                  gap: "8px",
-                  border: "1px solid var(--inner-border)",
-                  borderRadius: "10px",
-                  padding: "10px",
-                  background: "var(--surface-2)",
-                }}
+                className="signal-grid grid gap-4 border border-inner-border rounded-control p-5 bg-surface-2"
               >
                 {signalItems.map(({ label, value, icon: Icon }) => (
                   <div
                     key={label}
-                    style={{
-                      display: "flex",
-                      alignItems: "center",
-                      gap: "7px",
-                      minWidth: 0,
-                      color: "var(--text-secondary)",
-                    }}
+                    className="flex items-center gap-3.5 min-w-0 text-text-secondary"
                   >
-                    <Icon size={14} aria-hidden="true" style={{ flexShrink: 0, color: "var(--accent)" }} />
-                    <span style={{ minWidth: 0, overflowWrap: "anywhere", fontSize: "11px" }}>
-                      {label}: <strong style={{ color: "var(--text-primary)" }}>{value}</strong>
+                    <Icon size={14} aria-hidden="true" className="shrink-0 text-accent" />
+                    <span className="min-w-0 [overflow-wrap:anywhere] text-badge">
+                      {label}: <strong className="text-text-primary">{value}</strong>
                     </span>
                   </div>
                 ))}
@@ -989,55 +1102,34 @@ function RequestDetailDrawer({
           ).map(([kind, label, payload, Icon]) => (
             <details
               key={kind}
-              style={{
-                borderRadius: "10px",
-                border: "1px solid var(--inner-border)",
-                background: "var(--surface-2)",
-                overflow: "hidden",
-              }}
+              className="rounded-control border border-inner-border bg-surface-2 overflow-hidden"
             >
               <summary
-                style={{
-                  display: "flex",
-                  alignItems: "center",
-                  justifyContent: "space-between",
-                  gap: "8px",
-                  cursor: "pointer",
-                  padding: "10px 12px",
-                  fontSize: "12px",
-                  fontWeight: 700,
-                }}
+                className="flex items-center justify-between gap-4 cursor-pointer px-6 py-5 text-caption font-bold"
               >
-                <span style={{ display: "inline-flex", alignItems: "center", gap: "7px", minWidth: 0 }}>
-                  <Icon size={14} style={{ flexShrink: 0, color: kind === "request" ? "var(--accent)" : "var(--green)" }} />
-                  <span style={{ overflowWrap: "anywhere", wordBreak: "break-word" }}>{label}</span>
+                <span className="inline-flex items-center gap-3.5 min-w-0">
+                  <Icon size={14} className={cn("shrink-0", kind === "request" ? "text-accent" : "text-green")} />
+                  <span className="[overflow-wrap:anywhere] break-words">{label}</span>
                 </span>
-                <span style={{ flexShrink: 0, color: "var(--text-tertiary)", fontFamily: "var(--font-mono)", fontSize: "10px", fontWeight: 500 }}>
+                <span className="font-mono tabular-nums shrink-0 text-text-tertiary text-micro font-medium">
                   {formatBytes(payloadView(kind).bytes)}
                 </span>
               </summary>
               {payload === undefined ? (
                 <div
-                  style={{
-                    display: "flex",
-                    alignItems: "flex-start",
-                    gap: "10px",
-                    borderTop: "1px solid var(--inner-border)",
-                    background: "var(--surface-1)",
-                    padding: "14px 12px",
-                  }}
+                  className="flex items-start gap-5 border-t border-inner-border bg-surface-1 px-6 py-7"
                 >
-                  <Database size={15} style={{ flexShrink: 0, color: "var(--text-tertiary)", marginTop: "1px" }} />
-                  <div style={{ minWidth: 0, display: "flex", flexDirection: "column", gap: "3px" }}>
-                    <strong style={{ fontSize: "12px", color: "var(--text-secondary)" }}>No payload captured</strong>
-                    <span style={{ fontSize: "11px", color: "var(--text-tertiary)", overflowWrap: "anywhere", wordBreak: "break-word" }}>
+                  <Database size={15} className="shrink-0 text-text-tertiary mt-0.5" />
+                  <div className="min-w-0 flex flex-col gap-1.5">
+                    <strong className="text-caption text-text-secondary">No payload captured</strong>
+                    <span className="text-badge text-text-tertiary [overflow-wrap:anywhere] break-words">
                       {label} is unavailable for this request.
                     </span>
                   </div>
                 </div>
               ) : (
                 <>
-                  <div style={{ display: "flex", justifyContent: "flex-end", borderTop: "1px solid var(--inner-border)", padding: "5px 8px 0" }}>
+                  <div className="flex justify-end border-t border-inner-border pt-2.5 px-4">
                     <Button
                       variant="ghost"
                       size="sm"
@@ -1045,24 +1137,11 @@ function RequestDetailDrawer({
                       aria-label={`Copy ${label}`}
                       title={`Copy ${label}`}
                       onClick={() => copyPayload(kind, payload)}
-                      style={{ padding: "2px" }}
+                      className="p-1"
                     />
                   </div>
                   <pre
-                    className="select-text"
-                    style={{
-                      maxHeight: "256px",
-                      overflow: "auto",
-                      whiteSpace: "pre-wrap",
-                      overflowWrap: "break-word",
-                      wordBreak: "break-word",
-                      margin: 0,
-                      borderTop: "1px solid var(--inner-border)",
-                      padding: "8px 12px 12px",
-                      fontFamily: "var(--font-mono)",
-                      fontSize: "10px",
-                      color: "var(--text-secondary)",
-                    }}
+                    className="select-text font-mono tabular-nums max-h-128 overflow-auto whitespace-pre-wrap [overflow-wrap:break-word] break-words m-0 border-t border-inner-border pt-4 px-6 pb-6 text-micro text-text-secondary"
                   >
                     {payloadView(kind).text}
                   </pre>
@@ -1092,39 +1171,29 @@ function InFlightPill({
   uniqueIps: number | null;
   live: boolean;
 }): ReactNode {
-  const active = count ?? 0;
-  const ips = uniqueIps ?? 0;
+  const active = count;
+  const ips = uniqueIps;
   const requestWord = active === 1 ? "request" : "requests";
   const ipWord = ips === 1 ? "IP" : "IPs";
+  let title: string;
+  if (!live) title = "Live feed disconnected — last seen value";
+  else if (active === null || ips === null) title = "Waiting for the first in-flight snapshot";
+  else title = `${active} ${requestWord} executing right now from ${ips} unique client ${ipWord} — all clients combined, not a summary of the table below`;
   return (
     <span
-      title={
-        live
-          ? `${active} ${requestWord} executing right now from ${ips} unique client ${ipWord} — all clients combined, not a summary of the table below`
-          : "Live feed disconnected — last seen value"
-      }
-      style={{
-        display: "inline-flex",
-        alignItems: "center",
-        gap: "6px",
-        fontSize: "11px",
-        color: "var(--text-secondary)",
-        whiteSpace: "nowrap",
-      }}
+      title={title}
+      className="inline-flex items-center gap-3 text-badge text-text-secondary whitespace-nowrap"
     >
       <span
         aria-hidden="true"
+        className="w-3.5 h-3.5 rounded-[50%] shrink-0"
         style={{
-          width: "7px",
-          height: "7px",
-          borderRadius: "50%",
           background: live ? "var(--success)" : "var(--text-tertiary)",
           boxShadow: live ? "0 0 6px var(--success)" : "none",
-          flexShrink: 0,
         }}
       />
-      <span style={{ fontFamily: "var(--font-mono)", fontWeight: 700, color: "var(--text-primary)" }}>
-        {active} in flight · {ips} {ipWord}
+      <span className="font-mono tabular-nums font-bold text-text-primary">
+        {active === null || ips === null ? "In-flight unavailable" : `${active} in flight · ${ips} ${ipWord}`}
       </span>
     </span>
   );
@@ -1164,20 +1233,120 @@ function LiveInFlightPill(): ReactNode {
 function RequestsStatCard({
   pending,
   requests,
-  period,
 }: {
   readonly pending: boolean;
   readonly requests: number | undefined;
-  readonly period: Period;
 }): ReactNode {
   const flight = useContext(InFlightContext);
   return (
     <StatCard
       label="Requests"
       value={pending ? "…" : formatNumber(requests)}
-      detail={`${periodLabel(period)} · ${flight.count ?? 0} in flight from ${flight.uniqueIps ?? 0} IPs`}
+      detail={
+        flight.count === null || flight.uniqueIps === null
+          ? "In-flight unavailable"
+          : `${flight.count} in flight from ${flight.uniqueIps} IPs`
+      }
       icon={<Activity size={13} />}
     />
+  );
+}
+
+/**
+ * Latency bar above the Requests table.
+ *
+ * Routing-average lives here (not in the top metric row) because the P50/P95/
+ * P99 chips overflowed their grid cell at narrow widths. A flex-wrap row
+ * inside the table's rounded panel gives the chips the horizontal room they
+ * need and keeps the per-request table right beside the figures that
+ * summarise it. Hidden while the summary is still loading so the panel does
+ * not flash a "—" row before real numbers arrive.
+ *
+ * One row, four figures of the same size: `RESOLVE 367 ms · P50 … · P95 … ·
+ * P99 …`. The average used to be larger and labelled "Route latency AVG",
+ * which read as a heading sitting on top of the percentiles, then "Latency" —
+ * which put it in the same series as the percentiles beside it when it is a
+ * different measurement entirely (pre-dispatch delay, not response time).
+ * "Resolve" says which one it is. It wraps rather than overflows when there is
+ * no room.
+ *
+ * Each figure carries a native `title` explaining the metric, the window, and
+ * how many requests it was computed from — a percentile over twenty requests
+ * and one over twenty thousand do not deserve the same confidence.
+ *
+ * It sits outside `DataTable`'s own scroll box, so it stays put while the
+ * rows scroll under it.
+ */
+function RoutingLatencyBar({
+  pending,
+  avgMs,
+  p50Ms,
+  p95Ms,
+  p99Ms,
+  latencySampleCount,
+  resolveSampleCount,
+  periodLabel: windowLabel,
+}: {
+  readonly pending: boolean;
+  readonly avgMs: number | undefined;
+  readonly p50Ms: number | undefined;
+  readonly p95Ms: number | undefined;
+  readonly p99Ms: number | undefined;
+  readonly latencySampleCount: number | undefined;
+  readonly resolveSampleCount: number | undefined;
+  readonly periodLabel: string;
+}): ReactNode {
+  // The summary is shared across the whole page; treat the first paint the
+  // same way the top tiles do (a "…") so a long load reads as one state,
+  // not a mix of numbers and placeholders.
+  if (pending) return null;
+
+  // The first tile is the pre-dispatch delay, not end-to-end latency —
+  // labelling it "Latency" put it in the same series as the percentiles
+  // beside it, and the two were read as one metric.
+  const resolveTitle =
+    `Resolve — average time from request arrival to just before the upstream is called ` +
+    `(credential, admission, pool slot, preparation). Not response latency. ` +
+    `${windowLabel} · ${formatNumber(resolveSampleCount ?? 0)} requests with a resolve measurement.`;
+  const percentileTitle = (name: string, percentile: string): string =>
+    `${name} — the ${percentile} of total request duration (arrival to final byte), nearest rank. ` +
+    `${windowLabel} · from ${formatNumber(latencySampleCount ?? 0)} requests.`;
+
+  const tiles: ReadonlyArray<{
+    readonly label: string;
+    readonly value: number | undefined;
+    readonly title: string;
+  }> = [
+    { label: "Resolve", value: avgMs, title: resolveTitle },
+    { label: "P50", value: p50Ms, title: percentileTitle("P50", "median") },
+    { label: "P95", value: p95Ms, title: percentileTitle("P95", "95th percentile") },
+    { label: "P99", value: p99Ms, title: percentileTitle("P99", "99th percentile") },
+  ];
+
+  return (
+    <div
+      role="group"
+      aria-label="Routing latency summary"
+      className="flex flex-wrap items-center gap-x-6 gap-y-3 border-b border-inner-border px-6 py-5 text-badge"
+    >
+      <Route size={12} aria-hidden="true" className="shrink-0 text-text-secondary" />
+      {tiles.map((tile) => (
+        <span
+          key={tile.label}
+          // Native title, matching the other hover hints on this page: the
+          // explanation costs no space until asked for.
+          title={tile.title}
+          className="inline-flex items-baseline gap-1.5 font-mono tabular-nums leading-none text-caption"
+        >
+          <span className="font-semibold tracking-label uppercase text-text-tertiary">
+            {tile.label}
+          </span>
+          <span className="font-semibold text-text-secondary">
+            {formatDuration(tile.value)}
+          </span>
+        </span>
+      ))}
+    </div>
   );
 }
 
@@ -1228,22 +1397,7 @@ function TokenScaleSwitch({
       aria-label={`${label}: currently ${currentName}, switch to ${nextName}`}
       title={`Show ${nextName}`}
       onClick={() => onChange(next)}
-      style={{
-        display: "inline-flex",
-        alignItems: "center",
-        gap: "4px",
-        padding: "3px 7px",
-        border: "1px solid var(--inner-border)",
-        borderRadius: "999px",
-        background: "var(--surface-2)",
-        color: "var(--text-secondary)",
-        cursor: "pointer",
-        fontFamily: "var(--font-mono)",
-        fontSize: "10px",
-        fontWeight: 700,
-        letterSpacing: "0.04em",
-        lineHeight: 1,
-      }}
+      className="font-mono tabular-nums inline-flex items-center gap-2 px-3.5 py-1.5 border border-inner-border rounded-pill bg-surface-2 text-text-secondary cursor-pointer text-micro font-bold tracking-[0.04em] leading-[1]"
     >
       <Scaling size={11} aria-hidden="true" />
       {currentName}
@@ -1323,6 +1477,27 @@ export default function Usage(): ReactNode {
       return next;
     });
   };
+  /**
+   * Whether the model the upstream reported is shown beside the one we asked
+   * for. Off by default: it is a diagnostic, and a third line on every row
+   * would bury the two that matter.
+   */
+  const [showReported, setShowReported] = useState(() => {
+    try {
+      return localStorage.getItem("cartethyia:usage:show-reported") === "true";
+    } catch {
+      return false;
+    }
+  });
+  const toggleShowReported = () => {
+    setShowReported((prev) => {
+      const next = !prev;
+      try {
+        localStorage.setItem("cartethyia:usage:show-reported", String(next));
+      } catch {}
+      return next;
+    });
+  };
   const summaryQuery = useUsageSummary(period);
   const providersQuery = useProviders();
   const providerNames = useMemo(
@@ -1332,6 +1507,8 @@ export default function Usage(): ReactNode {
   const [requestLimit, setRequestLimit] = useState(50);
   const [requestStatusFilter, setRequestStatusFilter] = useState<number | null>(null);
   const requestsQuery = useUsageRequests(period, requestLimit, requestStatusFilter);
+  /** Scroll offset of the Requests table, restored after each live refresh. */
+  const requestsScrollTopRef = useRef(0);
   const [requestSortKey, setRequestSortKey] = useState<"startedAt" | "model" | "status" | "tokens" | "tps" | "ttft" | "duration">("startedAt");
   const [requestSortDirection, setRequestSortDirection] = useState<"asc" | "desc">("desc");
   const toggleRequestSort = (key: typeof requestSortKey): void => {
@@ -1379,6 +1556,10 @@ export default function Usage(): ReactNode {
 
   const handleTableScroll = (e: React.UIEvent<HTMLDivElement>) => {
     const target = e.currentTarget;
+    // Recorded on every scroll so a live poll that replaces the rows can put
+    // the operator back where they were. `requestItems` is keyed by request id,
+    // so a refetch remounts the rows and the browser resets scrollTop to 0.
+    requestsScrollTopRef.current = target.scrollTop;
     if (target.scrollHeight - target.scrollTop - target.clientHeight < 40) {
       if (!requestsQuery.isFetching && requestItems.length >= requestLimit && requestLimit < 500) {
         setRequestLimit((prev) => prev + 50);
@@ -1417,7 +1598,29 @@ export default function Usage(): ReactNode {
     });
     return items;
   }, [requestsQuery.data?.items, requestSortKey, requestSortDirection]);
+
+  /**
+   * Puts the Requests table back at the offset it was scrolled to.
+   *
+   * The rows are keyed by request id, so a live poll that swaps the data
+   * replaces the `<tr>` elements and the browser resets the scroll container to
+   * 0 — the operator is thrown back to the newest row mid-read. Restore only
+   * when the row count changed, so an ordinary re-render with the same rows
+   * never fights the user's own scrolling. A deliberate reset (status filter,
+   * period change) clears the offset first via `resetRequestsScroll`.
+   */
+  useLayoutEffect(() => {
+    const scroller = document.getElementById("usage-requests-scroll");
+    if (scroller === null) return;
+    const target = Math.min(requestsScrollTopRef.current, scroller.scrollHeight);
+    scroller.scrollTop = target;
+  }, [requestItems.length]);
+
+  const resetRequestsScroll = () => {
+    requestsScrollTopRef.current = 0;
+  };
   const toggleRequestStatus = (status: number): void => {
+    resetRequestsScroll();
     setRequestLimit(50);
     setRequestStatusFilter((current) => (current === status ? null : status));
   };
@@ -1441,11 +1644,17 @@ export default function Usage(): ReactNode {
   return (
     <InFlightProvider>
       <Stack gap="16px">
-      <div className="metric-grid" style={{ gridTemplateColumns: "repeat(auto-fit, minmax(160px, 1fr))" }}>
+      <Card>
+        <CardHeader
+          title="Usage"
+          subtitle={usageHeadline(period, summaryQuery.isPending, summary)}
+          icon={<Activity size={16} />}
+        />
+        <CardBody className="flex flex-col gap-8">
+      <div className="metric-grid grid gap-7 w-full min-w-0">
         <RequestsStatCard
           pending={summaryQuery.isPending}
           requests={summary?.requests}
-          period={period}
         />
         <StatCard
           label="Input tokens"
@@ -1506,7 +1715,7 @@ export default function Usage(): ReactNode {
         />
       </div>
 
-      <div className="two-column-grid">
+      <div className="grid grid-cols-2 gap-8 w-full min-w-0 max-medium:grid-cols-1">
 
         <BreakdownSnapshot
           period={period}
@@ -1516,7 +1725,7 @@ export default function Usage(): ReactNode {
           onToggleWide={() => togglePanel(setWidePanels, "breakdown")}
         />
         <Card
-          className={widePanels.has("traffic") ? "grid-span-full" : ""}
+          className={widePanels.has("traffic") ? "col-span-full" : ""}
         >
           <CardHeader
             title="Traffic"
@@ -1530,7 +1739,7 @@ export default function Usage(): ReactNode {
               />
             }
             action={
-              <Inline gap="6px" style={{ flexWrap: "wrap" }}>
+              <Inline gap="6px" className="flex-wrap">
                 <PillTabs
                   ariaLabel="Traffic metric"
                   value={metric}
@@ -1545,7 +1754,7 @@ export default function Usage(): ReactNode {
                   aria-label="Period"
                   value={period}
                   size="sm"
-                  style={{ width: "auto", minWidth: "92px", flex: "0 0 auto" }}
+                  className="w-auto min-w-46 shrink-0 grow-0 basis-auto"
                   onValueChange={(value) => setParam("period", value)}
                   options={PERIOD_OPTIONS.map((option) => ({ value: option.value, label: option.label }))}
                 />
@@ -1558,64 +1767,62 @@ export default function Usage(): ReactNode {
         </Card>
       </div>
 
+        </CardBody>
+      </Card>
+
       <Card>
         <CardHeader
           title="Requests"
           subtitle={`Most recent first · ${requestItems.length} entries · open a row to inspect`}
           subtitleAddon={
-            <div className="usage-status-filters" role="group" aria-label="Filter requests by HTTP status">
-              {(summary?.statusCounts ?? [])
-                .filter((entry) => entry.count > 0)
-                .map((entry) => {
-                  const label = httpStatusLabel(entry.status);
-                  return (
-                    <button
-                      key={entry.status}
-                      type="button"
-                      className="usage-status-filter"
-                      data-tone={httpStatusTone(entry.status)}
-                      aria-pressed={requestStatusFilter === entry.status}
-                      aria-label={`Filter ${label}: ${formatNumber(entry.count)} requests`}
-                      title={`Show ${formatNumber(entry.count)} requests with HTTP ${label}`}
-                      onClick={() => toggleRequestStatus(entry.status)}
-                    >
-                      <span>{label}</span>
-                      <span className="usage-status-filter-count">
-                        {formatNumber(entry.count)}
-                      </span>
-                    </button>
-                  );
-                })}
-            </div>
+            <StatusFilters
+              counts={summary?.statusCounts ?? []}
+              active={requestStatusFilter}
+              onToggle={toggleRequestStatus}
+            />
           }
           icon={<Activity size={16} />}
           action={
-            <Inline gap="12px" align="center" style={{ flexWrap: "wrap" }}>
+            <Inline gap="12px" align="center" className="flex-wrap">
               <Button
                 variant="ghost"
                 size="sm"
                 icon={hideProviderName ? <EyeOff size={13} /> : <Eye size={13} />}
                 onClick={toggleHideProviderName}
                 title={hideProviderName ? "Show real provider names" : "Mask provider names as Mysterious"}
-                style={{ fontSize: "11px", height: "26px", padding: "0 8px", color: "var(--text-secondary)" }}
+                className="text-badge h-13 px-4 py-0 text-text-secondary"
               >
                 {hideProviderName ? "Provider masked" : "Mask provider"}
+              </Button>
+              <Button
+                variant="ghost"
+                size="sm"
+                icon={<Cog size={13} />}
+                onClick={toggleShowReported}
+                title={
+                  showReported
+                    ? "Hide the model each upstream reported"
+                    : "Show the model each upstream reported"
+                }
+                className={`text-badge h-13 px-4 py-0 ${showReported ? "text-accent" : "text-text-secondary"}`}
+              >
+                {showReported ? "Hide reported" : "Show reported"}
               </Button>
               <LiveInFlightPill />
             </Inline>
           }
         />
-        <CardBody style={{ padding: 0 }}>
+        <CardBody className="p-0">
           {requestsQuery.isPending && requestItems.length === 0 ? (
-            <div style={{ padding: "20px" }}>
+            <div className="p-10">
               <LoadingState label="Loading requests…" />
             </div>
           ) : requestsQuery.isError && requestItems.length === 0 ? (
-            <div style={{ padding: "20px" }}>
+            <div className="p-10">
               <ErrorState message="Could not load recent requests." onRetry={() => void requestsQuery.refetch()} />
             </div>
           ) : requestItems.length === 0 ? (
-            <div style={{ padding: "20px" }}>
+            <div className="p-10">
               <EmptyState
                 title="No requests recorded for this period"
                 message="Route requests through the gateway to populate the table."
@@ -1623,7 +1830,17 @@ export default function Usage(): ReactNode {
               />
             </div>
           ) : (
-            <div style={{ borderRadius: "10px", border: "1px solid var(--inner-border)" }}>
+            <div id="usage-requests-scroll" className="rounded-control border border-inner-border bg-surface-1">
+              <RoutingLatencyBar
+                pending={summaryQuery.isPending}
+                avgMs={summary?.avgResolveMs}
+                p50Ms={summary?.latencyP50Ms}
+                p95Ms={summary?.latencyP95Ms}
+                p99Ms={summary?.latencyP99Ms}
+                latencySampleCount={summary?.latencySampleCount}
+                resolveSampleCount={summary?.resolveSampleCount}
+                periodLabel={periodLabel(period)}
+              />
               <DataTable
                 maxHeight={445}
                 onScroll={handleTableScroll}
@@ -1652,71 +1869,58 @@ export default function Usage(): ReactNode {
                     <tr
                       key={row.requestId}
                       onClick={() => setSelectedId(row.requestId)}
+                      className="cursor-pointer transition-colors"
                       style={{
-                        cursor: "pointer",
                         background: isNew ? "color-mix(in srgb, var(--accent) 14%, transparent)" : undefined,
-                        transition: "background-color var(--dur-macro) var(--ease-spring)",
                       }}
                     >
-                    <td style={{ fontSize: "11.5px", color: "var(--text-tertiary)", whiteSpace: "nowrap" }}>
+                    <td className="text-badge text-text-tertiary whitespace-nowrap">
                       <div>{formatTime(row.startedAt)}</div>
-                      <div style={{ fontSize: "10.5px", marginTop: "1px" }}>{formatAgo(row.startedAt)}</div>
+                      <div className="text-micro mt-0.5">{formatAgo(row.startedAt)}</div>
                     </td>
-                    <td style={{ maxWidth: "210px" }}>
-                      <div style={{ display: "flex", alignItems: "center", gap: "6px", minWidth: 0 }}>
+                    <td className="max-w-105">
+                      <div className="flex items-center gap-3 min-w-0">
                         <span
-                          className="truncate"
+                          className="truncate text-caption font-semibold"
                           title={rowProviderId ?? "—"}
-                          style={{ fontSize: "12px", fontWeight: 600 }}
                         >
                           {hideProviderName ? "Mysterious" : rowProviderId ? (providerNames.get(rowProviderId) ?? rowProviderId) : "—"}
                         </span>
                       </div>
-                      <div
-                        className="truncate"
-                        title={row.model ?? "—"}
-                        style={{
-                          fontFamily: "var(--font-mono)",
-                          fontSize: "11px",
-                          color: "var(--text-tertiary)",
-                          marginTop: "1px",
-                        }}
-                      >
+                      <div className="truncate font-mono text-badge text-text-tertiary mt-px" title={row.model ?? "—"}>
                         {hideProviderName && row.model && row.model.includes("/")
                           ? row.model.slice(row.model.indexOf("/") + 1)
                           : row.model ?? "—"}
                       </div>
+                      {showReported && row.reportedModel ? (
+                        // Verbatim, exactly as the upstream wrote it: no prefix
+                        // stripping, no comparison. A provider answering with a
+                        // different model than the one asked for is the finding,
+                        // and normalising it would erase the only evidence.
+                        <div
+                          className="flex items-center gap-1.5 mt-px min-w-0 text-micro text-text-tertiary"
+                          title={`Reported by upstream: ${row.reportedModel}`}
+                        >
+                          <Cog size={10} aria-hidden="true" className="shrink-0" />
+                          <span className="truncate font-mono">{row.reportedModel}</span>
+                        </div>
+                      ) : null}
                     </td>
-                    <td style={{ maxWidth: "140px" }}>
+                    <td className="max-w-70">
                       <div
-                        className="truncate"
+                        className="truncate text-caption font-semibold"
                         title={usageApiKeyLabel(row)}
-                        style={{ fontSize: "12px", fontWeight: 600 }}
                       >
                         {usageApiKeyLabel(row)}
                       </div>
-                      <div
-                        className="truncate"
-                        title={usageClientLabel(row)}
-                        style={{
-                          fontFamily: "var(--font-mono)",
-                          fontSize: "11px",
-                          color: "var(--text-tertiary)",
-                          marginTop: "1px",
-                        }}
-                      >
+                      <div className="truncate font-mono text-badge text-text-tertiary mt-px" title={usageClientLabel(row)}>
                         {usageClientLabel(row)}
                       </div>
                     </td>
-                    <td style={{ whiteSpace: "nowrap", fontSize: "11px" }}>
+                    <td className="whitespace-nowrap text-badge">
                       <div>
                         <span
-                          style={{
-                            display: "inline-block",
-                            minWidth: "13ch",
-                            fontFamily: "var(--font-mono)",
-                            color: "var(--text-secondary)",
-                          }}
+                          className="font-mono tabular-nums inline-block min-w-[13ch] text-text-secondary"
                         >
                           {row.mode === "stream" ? "streaming" : "non-streaming"}
                         </span>
@@ -1727,42 +1931,32 @@ export default function Usage(): ReactNode {
                           httpStatus={row.httpStatus}
                         />
                       </div>
-                      <div
-                        className="truncate"
-                        title={surfaceFamilyLabel(row.surface)}
-                        style={{
-                          fontFamily: "var(--font-mono)",
-                          fontSize: "11px",
-                          color: "var(--text-tertiary)",
-                          marginTop: "1px",
-                          maxWidth: "220px",
-                        }}
-                      >
+                      <div className="truncate font-mono text-badge text-text-tertiary mt-px max-w-110" title={surfaceFamilyLabel(row.surface)}>
                         {surfaceFamilyLabel(row.surface)}
                       </div>
                     </td>
-                    <td style={{ fontFamily: "var(--font-mono)", fontSize: "11px", whiteSpace: "nowrap", textAlign: "right", fontVariantNumeric: "tabular-nums" }}>
-                      <div style={{ display: "flex", gap: "12px", justifyContent: "flex-end" }}>
-                        <span style={{ display: "inline-flex", alignItems: "center", gap: "4px", color: "var(--text-secondary)" }}>
+                    <td className="font-mono text-badge whitespace-nowrap text-right tabular-nums">
+                      <div className="flex gap-6 justify-end">
+                        <span className="inline-flex items-center gap-2 text-text-secondary">
                           <ArrowUp size={10} aria-label="Input tokens" /> IN {formatNumber(row.inputTokens)}
                         </span>
-                        <span style={{ display: "inline-flex", alignItems: "center", gap: "4px", color: "var(--text-secondary)" }}>
+                        <span className="inline-flex items-center gap-2 text-text-secondary">
                           <ArrowDown size={10} aria-label="Output tokens" /> OUT {formatNumber(row.outputTokens)}
                         </span>
                       </div>
                       <div
-                        style={{ display: "flex", gap: "12px", justifyContent: "flex-end", marginTop: "1px", color: "var(--text-tertiary)" }}
+                        className="flex gap-6 justify-end mt-0.5 text-text-tertiary"
                         title={row.estimatedCost === undefined ? "Unpriced model — no catalog rate" : undefined}
                       >
-                        <span style={{ display: "inline-flex", alignItems: "center", gap: "4px" }}>
+                        <span className="inline-flex items-center gap-2">
                           <Database size={10} aria-label="Cached tokens" /> CACHED {formatNumber(row.cachedTokens ?? 0)}
                         </span>
-                        <span style={{ display: "inline-flex", alignItems: "center", gap: "4px" }}>
+                        <span className="inline-flex items-center gap-2">
                           <DollarSign size={10} aria-label="Estimated cost" /> COST {costText}
                         </span>
                         {row.creditUsed !== undefined ? (
                           <span
-                            style={{ display: "inline-flex", alignItems: "center", gap: "4px" }}
+                            className="inline-flex items-center gap-2"
                             title="Provider-billed credits for this turn"
                           >
                             <Coins size={10} aria-label="Credits used" /> {formatCredit(row.creditUsed)}
@@ -1770,21 +1964,21 @@ export default function Usage(): ReactNode {
                         ) : null}
                       </div>
                     </td>
-                    <td style={{ fontFamily: "var(--font-mono)", fontSize: "11.5px", textAlign: "right", color: "var(--text-secondary)", whiteSpace: "nowrap" }}>
+                    <td className="font-mono text-caption text-right text-text-secondary whitespace-nowrap">
                       {formatSpeed(row.tokensPerSec)}
                     </td>
-                    <td style={{ fontFamily: "var(--font-mono)", fontSize: "11.5px", textAlign: "right", color: "var(--text-secondary)" }}>
+                    <td className="font-mono text-caption text-right text-text-secondary">
                       <div>{formatDuration(row.ttfbMs)}</div>
                       {row.resolveMs !== undefined ? (
                         <div
-                          style={{ fontSize: "10.5px", marginTop: "1px", color: "var(--text-tertiary)" }}
+                          className="text-micro mt-0.5 text-text-tertiary"
                           title="Gateway-side time before the upstream dispatch began"
                         >
                           ({formatDuration(row.resolveMs)})
                         </div>
                       ) : null}
                     </td>
-                    <td style={{ fontFamily: "var(--font-mono)", fontSize: "11.5px", textAlign: "right", color: "var(--text-secondary)" }}>
+                    <td className="font-mono text-caption text-right text-text-secondary">
                       {formatDuration(row.durationMs)}
                     </td>
                     </tr>

@@ -32,6 +32,8 @@ interface InMemoryReservation {
  * for recently finalized reservations.
  */
 const TERMINAL_RESERVATION_CAP = 10_000;
+/** Hard cap per bucketed counter map; oldest buckets evicted first. */
+const COUNTER_MAP_CAP = 20_000;
 
 
 /** Atomic single-process admission store used by tests and single-process development. */
@@ -44,6 +46,7 @@ export class InMemoryAdmissionCounterStore implements AdmissionCounterStore {
   private readonly tenantConcurrent = new Map<string, number>();
   private readonly reservations = new Map<string, InMemoryReservation>();
   private readonly terminalRing: string[] = []; // Ring buffer for terminal reservation IDs
+  private terminalRingStart = 0;
   private failing = false;
   private gate: Promise<void> = Promise.resolve();
 
@@ -149,15 +152,26 @@ export class InMemoryAdmissionCounterStore implements AdmissionCounterStore {
       )
         throw reasonToGatewayError("tenant-capacity-exhausted", { limit: request.tenantConcurrencyLimit });
       if (request.rpmLimit != null) rpm.push(request.now);
-      if (request.dailyLimit != null)
+      if (request.dailyLimit != null) {
         this.daily.set(dailyKey, daily + request.estimatedTokens);
-      if (request.monthlyLimit != null)
+        this.evictCounter(this.daily);
+      }
+      if (request.monthlyLimit != null) {
         this.monthly.set(monthlyKey, monthly + request.estimatedTokens);
-      if (request.lifetimeBudget != null)
+        this.evictCounter(this.monthly);
+      }
+      if (request.lifetimeBudget != null) {
         this.lifetime.set(request.apiKeyId, lifetime + request.estimatedTokens);
-      if (request.concurrencyLimit != null) this.concurrent.set(request.apiKeyId, concurrent + 1);
-      if (request.tenantConcurrencyLimit != null)
+        this.evictCounter(this.lifetime);
+      }
+      if (request.concurrencyLimit != null) {
+        this.concurrent.set(request.apiKeyId, concurrent + 1);
+        this.evictCounter(this.concurrent);
+      }
+      if (request.tenantConcurrencyLimit != null) {
         this.tenantConcurrent.set(request.tenantId, tenantConcurrent + 1);
+        this.evictCounter(this.tenantConcurrent);
+      }
       this.reservations.set(request.reservationId, {
         apiKeyId: request.apiKeyId,
         reserved: request.estimatedTokens,
@@ -260,6 +274,16 @@ export class InMemoryAdmissionCounterStore implements AdmissionCounterStore {
     }
   }
 
+  /** Caps a bucketed counter map; oldest-inserted buckets evicted first. */
+  private evictCounter(store: Map<string, number> | Map<string, number[]>): void {
+    if (store.size < COUNTER_MAP_CAP) return;
+    let toEvict = store.size - COUNTER_MAP_CAP + 1;
+    for (const key of store.keys()) {
+      if (toEvict-- <= 0) break;
+      store.delete(key);
+    }
+  }
+
   /** Applies release accounting to an active reservation and retires it. */
   private settleReservation(reservation: InMemoryReservation): void {
     this.adjust(this.daily, reservation.dailyKey, -reservation.reserved, reservation.tracksDaily);
@@ -293,9 +317,20 @@ export class InMemoryAdmissionCounterStore implements AdmissionCounterStore {
   }
   private pruneRpm(apiKeyId: string, now: number): number[] {
     const cutoff = now - (this.options.windowMs ?? 60_000);
-    const kept = (this.rpmTimestamps.get(apiKeyId) ?? []).filter((timestamp) => timestamp > cutoff);
-    this.rpmTimestamps.set(apiKeyId, kept);
-    return kept;
+    const existing = this.rpmTimestamps.get(apiKeyId);
+    if (!existing) {
+      const fresh: number[] = [];
+      this.rpmTimestamps.set(apiKeyId, fresh);
+      this.evictCounter(this.rpmTimestamps);
+      return fresh;
+    }
+    // In-place compaction: `.filter` allocated a new array per request.
+    let write = 0;
+    for (let read = 0; read < existing.length; read += 1) {
+      if (existing[read]! > cutoff) existing[write++] = existing[read]!;
+    }
+    existing.length = write;
+    return existing;
   }
   private requireReservation(
     apiKeyId: string,
@@ -313,11 +348,13 @@ export class InMemoryAdmissionCounterStore implements AdmissionCounterStore {
    * Adds a terminal (committed/released) reservation to the ring buffer.
    * If the ring is full, evicts the oldest terminal reservation to prevent
    * unbounded memory growth while preserving idempotency for recent operations.
+   * Index-pointer queue: no O(N) shift() memmove per eviction.
    */
   private addToTerminalRing(reservationId: string): void {
     this.terminalRing.push(reservationId);
-    if (this.terminalRing.length > TERMINAL_RESERVATION_CAP) {
-      const oldestId = this.terminalRing.shift();
+    if (this.terminalRing.length - this.terminalRingStart > TERMINAL_RESERVATION_CAP) {
+      const oldestId = this.terminalRing[this.terminalRingStart];
+      this.terminalRingStart += 1;
       if (oldestId) {
         const oldest = this.reservations.get(oldestId);
         // Only evict if it's still terminal (active reservations stay)
@@ -326,6 +363,10 @@ export class InMemoryAdmissionCounterStore implements AdmissionCounterStore {
         }
       }
     }
+    if (this.terminalRingStart > 1024 && this.terminalRingStart > this.terminalRing.length / 2) {
+      this.terminalRing.splice(0, this.terminalRingStart);
+      this.terminalRingStart = 0;
+    }
   }
   private adjust(store: Map<string, number>, key: string, delta: number, enabled: boolean): void {
     if (!enabled) return;
@@ -333,6 +374,7 @@ export class InMemoryAdmissionCounterStore implements AdmissionCounterStore {
     if (!finiteNonNegative(next))
       throw reasonToGatewayError("admission-unavailable", { reason: "corrupt_counter" });
     store.set(key, next);
+    this.evictCounter(store);
   }
   private decrement(store: Map<string, number>, key: string): void {
     const next = this.value(store, key) - 1;

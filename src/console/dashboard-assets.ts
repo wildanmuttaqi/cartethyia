@@ -45,6 +45,7 @@ export interface SocialMeta {
   title: string;
   description: string;
   image: string;
+  imageType: string;
   imageWidth: number;
   imageHeight: number;
   imageAlt: string;
@@ -55,7 +56,11 @@ export const SHARE_SOCIAL_META: SocialMeta = {
   title: "Cartethyia — Bansos Token",
   description:
     "Come and save your tokens 💖 Shared Cartethyia API key — Bansos Token with live quota, usage and model allowlist.",
-  image: "/og_bansos.webp",
+  image: "/assets/brand/og_bansos.webp",
+  imageType: "image/webp",
+  // Read from the file's own VP8 header, not carried over from the JPEG this
+  // replaced: og:image:width/height are what a crawler uses to allocate the
+  // card before the bytes arrive, so a copied size makes every preview crop.
   imageWidth: 1760,
   imageHeight: 576,
   imageAlt: "Cartethyia Bansos Token — Come and save your tokens",
@@ -86,7 +91,7 @@ function renderSocialMeta(meta: SocialMeta): string {
     `<meta property="og:title" content="${title}" />`,
     `<meta property="og:description" content="${description}" />`,
     `<meta property="og:image" content="${image}" />`,
-    '<meta property="og:image:type" content="image/webp" />',
+    `<meta property="og:image:type" content="${meta.imageType}" />`,
     `<meta property="og:image:width" content="${meta.imageWidth}" />`,
     `<meta property="og:image:height" content="${meta.imageHeight}" />`,
     `<meta property="og:image:alt" content="${imageAlt}" />`,

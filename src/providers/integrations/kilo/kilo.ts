@@ -16,17 +16,13 @@
  * Code publishes (`/api/openrouter/chat/completions`) and it is not derivable
  * from an origin plus a wire-family suffix.
  */
-import { defineModel } from "../../model-definition";
-import type { ModelDefinition } from "../../provider-registry";
-import type {
-  ProviderAdapter,
-  ProviderDispatchContext,
-  ProviderDispatchTarget,
-} from "../../provider-registry";
-import type { CanonicalRequest } from "../../../transport/canonical-model";
-import { OpenAICompatibleAdapter, withBearerAuthentication } from "../../compatible-adapter";
+import { defineModel } from "../../provider-model-definition";
+import type { ModelDefinition } from "../../provider-model-definition";
+import type { ProviderAdapter, ProviderDispatchContext, ProviderDispatchTarget } from "../../provider-contracts";
+import type { CanonicalRequest } from "../../../protocol/canonical-model";
+import { OpenAICompatibleAdapter, withBearerAuthentication } from "../../adapters/compatible-adapter";
 import { providerBaseUrl } from "../../provider-metadata";
-import { parseKiloCredential } from "./kilo-oauth";
+import { decodeKiloCredential } from "../../../security/credential-codec";
 
 export const KILO_PROVIDER_ID = "kilo" as const;
 export const KILO_BASE_URL = providerBaseUrl("kilo");
@@ -131,9 +127,9 @@ class KiloAdapter extends OpenAICompatibleAdapter {
     // A credential that does not decode is left as the factory sent it: the
     // request then fails closed at the upstream auth boundary, and the parse
     // error belongs to the credential boundary rather than to this hook.
-    let credential: ReturnType<typeof parseKiloCredential>;
+    let credential: ReturnType<typeof decodeKiloCredential>;
     try {
-      credential = parseKiloCredential(new TextDecoder().decode(secret));
+      credential = decodeKiloCredential(secret);
     } catch {
       return headers;
     }
@@ -148,7 +144,3 @@ class KiloAdapter extends OpenAICompatibleAdapter {
 /** Kilo Code provider adapter. */
 export const kiloAdapter: ProviderAdapter = new KiloAdapter();
 
-/** Factory for tests and custom egress. */
-export function createKiloAdapter(fetchImpl?: typeof fetch): ProviderAdapter {
-  return fetchImpl ? new KiloAdapter(fetchImpl) : kiloAdapter;
-}

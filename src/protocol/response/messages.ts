@@ -4,19 +4,19 @@
  * decoder. Pure data transformation — no network I/O (see
  * `../transport/messages.ts` for the executor).
  */
-import { canonicalTerminal } from "../../protocol/primitives";
-import { GatewayError } from "../../transport/gateway-error";
-import { type CanonicalEvent, type CanonicalRequest, type CanonicalStopReason, type ContentPart, type UsageRecord } from "../../transport/canonical-model";
-import { decodeSseEvents } from '../../transport/streaming';
-import { usageFromProvider } from '../../providers/usage';
-import { mapClaudeStreamError } from '../../protocol/messages-errors';
+import { canonicalTerminal } from "../codecs";
+import { GatewayError } from "../gateway-error";
+import { type CanonicalEvent, type CanonicalRequest, type CanonicalStopReason, type ContentPart, type UsageRecord } from "../canonical-model";
+import { decodeSseEvents } from "../sse-decoder";
+import { usageFromProvider } from '../../providers/provider-usage';
+import { mapClaudeStreamError } from '../messages-errors';
 import {
   finiteNumber,
   stringValue,
   unprefixClaudeToolName,
   type ClaudeWireObject,
   isRecord,
-} from '../primitives';
+} from '../codecs';
 
 export function mapClaudeStopReason(raw: string): CanonicalStopReason {
   switch (raw) {
@@ -118,6 +118,69 @@ export function responseUsage(value: unknown): UsageRecord | undefined {
   return usageFromProvider(value);
 }
 
+/**
+ * The upstream `usage.iterations[]` type that marks a turn answered by a
+ * fallback model rather than the requested primary.
+ *
+ * Donor-captured signal (the provider comparison research
+ * → "Claude response", citing `anthropic-wire.ts:1829-1838`). This value is
+ * named at the same level of confidence as the research states it, so it is
+ * compared literally; no other iteration type is interpreted.
+ */
+export const CLAUDE_FALLBACK_ITERATION_TYPE = "fallback_message";
+
+/**
+ * Capability alias a route must declare for the `server-side-fallback-2026-06-01`
+ * beta to be forwarded. Duplicated from the first alias in
+ * `ANTHROPIC_BETA_CAPABILITIES` so the beta and the chain can be named together;
+ * the test suite asserts the two still agree.
+ */
+export const CLAUDE_SERVED_BY_FALLBACK_CAPABILITY = "server_side_fallback";
+
+/**
+ * Canonical key carrying the served-by-fallback signal in a terminal event's
+ * `stop_details`. Unprefixed because it rides the provider-shaped bag that only
+ * the Claude decoder writes, so the plain name is unambiguous; named here
+ * because this string is the contract downstream accounting will read.
+ */
+export const CANONICAL_SERVED_BY_FALLBACK_KEY = "served_by_fallback";
+
+/**
+ * Reads the served-by-fallback signal out of a Claude `usage` object.
+ *
+ * Returns `true` only when `usage.iterations[]` carries an entry whose `type`
+ * is `"fallback_message"`. The entry itself is provider JSON, so a malformed
+ * or absent `iterations` is not an error — it simply means the primary
+ * answered.
+ */
+export function claudeServedByFallback(usage: unknown): boolean {
+  if (!isRecord(usage) || !Array.isArray(usage["iterations"])) return false;
+  return usage["iterations"].some(
+    (iteration: unknown) =>
+      isRecord(iteration) && iteration["type"] === CLAUDE_FALLBACK_ITERATION_TYPE,
+  );
+}
+
+/**
+ * Folds the served-by-fallback signal into a canonical terminal's stop details.
+ *
+ * `stop_details` is the one provider-shaped bag the terminal event already
+ * carries for Anthropic (refusal/sensitive details reach `terminalFailure`
+ * through it), so the signal rides there as
+ * `served_by_fallback: true` instead of widening `UsageRecord`. Nothing
+ * downstream switches on it yet — surfacing it is the whole of this change.
+ */
+export function withClaudeFallbackSignal(
+  stopDetails: Record<string, unknown> | undefined,
+  usage: unknown,
+): Record<string, unknown> | undefined {
+  if (!claudeServedByFallback(usage)) return stopDetails;
+  // Never overwrite an explicit upstream value: the provider's own detail wins.
+  if (isRecord(stopDetails) && stopDetails[CANONICAL_SERVED_BY_FALLBACK_KEY] !== undefined)
+    return stopDetails;
+  return { ...(stopDetails ?? {}), [CANONICAL_SERVED_BY_FALLBACK_KEY]: true };
+}
+
 export function eventContent(
   content: readonly ContentPart[],
   sequence: number,
@@ -202,7 +265,7 @@ export function claudeResponseToEvents(
       state: "complete",
       stopReason: reason === undefined ? undefined : mapClaudeStopReason(reason),
       providerStopReason: reason,
-      stopDetails: effectiveDetails,
+      stopDetails: withClaudeFallbackSignal(effectiveDetails, json.usage),
       usage,
     }),
   );
@@ -437,7 +500,9 @@ export async function* parseClaudeSseStream(
     stopReason:
       state.stop_reason === undefined ? undefined : mapClaudeStopReason(state.stop_reason),
     providerStopReason: state.stop_reason,
-    stopDetails: state.stop_details,
+    // `state.rawUsage` is the merged input-side + output-side usage, so an
+    // `iterations[]` reported on either frame is visible here.
+    stopDetails: withClaudeFallbackSignal(state.stop_details, state.rawUsage),
     usage: state.usage,
   });
 }

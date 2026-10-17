@@ -1,17 +1,69 @@
-import type { CanonicalEvent, CanonicalStopReason } from "../../canonical-model";
+import type { CanonicalEvent, CanonicalStopReason } from "../../../protocol/canonical-model";
 import { reasoningSummaryIdentity, reasoningSummarySeparator, type ReasoningSummaryIdentity } from "../reasoning-summary";
 import { eventText } from "../adapters";
-import { isRecord } from "../../../protocol/primitives";
+import { isRecord } from "../../../protocol/codecs";
 import {
   createToolCallTracker,
   trackToolCall,
   type ToolCallState,
-} from "../../tool-identity";
-import { usageToChatWire, type OpenAiUsage } from "../../../providers/usage";
-import { TEXT_ENCODER } from "../stream-frame";
-import { SurfaceStreamEncoder } from "../stream-base";
+} from "../../../protocol/tool-identity";
+import { usageToChatWire, type OpenAiUsage } from "../../../providers/provider-usage";
+import { chatFinishReason } from "../../../protocol/stop-reason";
+import { TEXT_ENCODER } from "../../../protocol/sse-frame";
+import { SurfaceStreamEncoder } from "../stream-frame";
 import type { ChatEncodeOptions, ChunkBase, JsonObject } from "./parse";
 
+/**
+ * Tool arguments the client can parse.
+ *
+ * Copilot (and other chat bridges) stream arguments that are not strict JSON:
+ * a raw control character inside a string, a trailing comma, an unquoted key.
+ * The client parses the assembled string with `JSON.parse` and, on failure,
+ * reports the call as `Tool <name> not found` with the parser's message
+ * (`Unexpected trailing characters`, `Invalid number`). The repair is the same
+ * one oh-my-pi applies before a tool runs: escape what strict JSON forbids,
+ * then drop a trailing comma. A value that still does not parse is returned
+ * unchanged — a half-repaired call is worse than the original error.
+ */
+export function repairToolArguments(raw: string): string {
+  if (raw.length === 0) return "{}";
+  const repaired = repairToolArgumentText(raw);
+  try {
+    JSON.parse(repaired);
+    return repaired;
+  } catch {
+    return raw;
+  }
+}
+
+function repairToolArgumentText(json: string): string {
+  const parts: string[] = [];
+  let last = 0;
+  let inString = false;
+  for (let i = 0; i < json.length; i++) {
+    const code = json.charCodeAt(i);
+    if (!inString) {
+      if (code === 0x22) inString = true;
+      continue;
+    }
+    if (code === 0x22) {
+      inString = false;
+      continue;
+    }
+    if (code === 0x5c) {
+      i++;
+      continue;
+    }
+    if (code < 0x20) {
+      const escape =
+        code === 0x0a ? "\\n" : code === 0x0d ? "\\r" : code === 0x09 ? "\\t" : `\\u${code.toString(16).padStart(4, "0")}`;
+      parts.push(json.slice(last, i), escape);
+      last = i + 1;
+    }
+  }
+  const escaped = parts.length === 0 ? json : parts.join("") + json.slice(last);
+  return escaped.replace(/,(\s*[}\]])/g, "$1");
+}
 export function bytesToString(value: string | Uint8Array): string {
   return typeof value === "string" ? value : new TextDecoder().decode(value);
 }
@@ -87,12 +139,9 @@ function mergedReasoningText(events: readonly CanonicalEvent[]): string {
     const text = eventReasoningText(event);
     if (text === undefined) continue;
     const identity = reasoningSummaryIdentity(event);
-    let separator = "";
-    if (previousText !== undefined && (previousIdentity === undefined || identity === undefined)) {
-      separator = "\n\n";
-    } else {
-      separator = reasoningSummarySeparator(previousIdentity, identity, previousText, text);
-    }
+    // Identity-less deltas are continuations of one part (same rule as the
+    // streaming path): join raw, never force a paragraph break per token.
+    const separator = reasoningSummarySeparator(previousIdentity, identity, previousText, text);
     chunks.push(separator, text);
     previousIdentity = identity;
     previousText = text;
@@ -100,41 +149,14 @@ function mergedReasoningText(events: readonly CanonicalEvent[]): string {
   return chunks.join("");
 }
 
+/**
+ * Chat's `finish_reason`. Chat has no "cancelled"/"error" vocabulary of its
+ * own: aborted streams are unread and failed streams carry their signal in the
+ * error frame/envelope, so the table's words cover both and no reason defaults
+ * to `stop`.
+ */
 export function finishReason(stopReason: CanonicalStopReason | undefined): string {
-  if (stopReason !== undefined) {
-    switch (stopReason) {
-      case "stop":
-        return "stop";
-      case "length":
-        return "length";
-      case "tool_use":
-        return "tool_calls";
-      case "content_filter":
-        return "content_filter";
-      case "refusal":
-        // Refusals are content filters on this wire, not normal stops:
-        // reporting "stop" hides a refusal as a usable completion.
-        return "content_filter";
-      case "error":
-        // Failed streams keep an explicit error reason (107 precedent):
-        // the failure is real and must survive into retry accounting.
-        return "error";
-      case "cancelled":
-        return "error";
-      case "pause_turn":
-        // OpenAI Chat has no pause_turn vocabulary; map to stop as closest graceful continuation signal.
-        // This preserves cross-provider routing without leaking unknown finish_reason.
-        return "stop";
-      default:
-        stopReason satisfies never;
-        return "stop";
-    }
-  }
-  // No "cancelled"/"error" on the Chat wire: aborted streams are unread and
-  // failed streams carry their signal in the error frame/envelope instead.
-  // (The explicit stop_reason branches above already handled every known
-  // reason; this default only fires when none was recorded.)
-  return "stop";
+  return chatFinishReason(stopReason);
 }
 export function eventToolCall(
   event: CanonicalEvent,
@@ -239,7 +261,7 @@ export function jsonCompletion(
         type: "function",
         // Zero-argument calls assemble as "{}": an empty string is not
         // valid JSON for the client's parser.
-        function: { name: tool.name!, arguments: tool.arguments.length > 0 ? tool.arguments : "{}" },
+        function: { name: tool.name!, arguments: repairToolArguments(tool.arguments) },
       }));
   }
   const audio = events.map(eventAudio).findLast((value) => value !== undefined);
@@ -427,6 +449,20 @@ export class ChatStreamEncoder extends SurfaceStreamEncoder<CanonicalEvent, Json
     }
     const tool = eventToolCall(event);
     if (tool) {
+      // Copilot streams one call as many events. Every event but the last
+      // carries a slice of the id and a slice of the arguments, and no name.
+      // The last carries the real id, the name, and the whole arguments.
+      // Forwarding the slices made one write into dozens of nameless calls.
+      //
+      // The discriminator is the tracker, not the id shape. Keying on a `call_`
+      // prefix dropped the argument continuations of every provider whose ids
+      // are shaped differently — Anthropic's `toolu_…`, the synthesized
+      // `call-N-frag` — so those calls reached the client with no arguments at
+      // all. A nameless delta is a slice only when its id is not already an
+      // established call; a continuation reuses the id the tracker holds.
+      if (tool.state.name === undefined && !this.tracker.states.has(tool.state.id)) {
+        return result;
+      }
       const tracked = trackToolCall(this.tracker, {
         id: tool.state.id,
         name: tool.state.name,

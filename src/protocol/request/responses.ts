@@ -1,22 +1,22 @@
 /**
  * [OpenAI]-compatible /v1/responses request encoder: canonical → wire body.
  */
-import type { CanonicalRequest } from "../../transport/canonical-model";
-import { isRecord } from "../primitives";
+import type { CanonicalRequest } from "../canonical-model";
+import { clampToolCallId, isRecord } from "../codecs";
 import { markLatestBreakpoint } from "../../transport/translation/cache-controls";
-import {
-  normalizeGenerationControls,
-  pickWireSupportedControls,
-} from "../../transport/translation/capabilities";
+import { pickWireSupportedControls } from "../../transport/translation/capabilities";
+import { normalizeGenerationControls } from "../../transport/translation/normalize";
 import { resolveWireMaxTokens } from "../../transport/translation/quirks";
 import {
   clampReasoningEffort,
   resolveSupportedReasoningEfforts,
 } from "../../transport/translation/thinking";
-import { isClaudeBillingHeaderText, resolveImageSource, resolveOutputVerbosity } from "../primitives";
+import { isClaudeBillingHeaderText, resolveImageSource, resolveOutputVerbosity } from "../codecs";
 import { resolvePromptCacheKey } from "../../providers/operations/session-resolution";
-import { reasoningEffortFromIntent } from "../../providers/reasoning";
-import { isWebSearchTool } from "../../transport/translation/capabilities";
+import { reasoningEffortFromIntent } from "../../providers/provider-reasoning";
+import { isWebSearchTool } from "../../transport/translation/search";
+import { parseResponsesResponseToEvents, decodeResponsesSseStream } from "../response/responses";
+import { repairToolArguments } from "../../transport/surface/chat/encode";
 
 const RESPONSES_CACHEABLE_BLOCK_TYPES: ReadonlySet<string> = new Set([
   "input_text",
@@ -60,8 +60,12 @@ function computerOutputForWire(content: unknown): Record<string, unknown> {
 
 export function canonicalToResponsesPayload(
   request: CanonicalRequest,
-  supportsPromptCaching = true,
+  options: {
+    readonly supportsPromptCaching?: boolean;
+    readonly promptCacheKey?: string;
+  } = {},
 ): Record<string, unknown> {
+  const supportsPromptCaching = options.supportsPromptCaching ?? true;
   const input: Array<Record<string, unknown>> = [];
   // `pending_safety_checks` have no canonical content-part representation, so
   // `parseResponsesRequest` retains them per-item in the scoped item-metadata
@@ -100,16 +104,21 @@ export function canonicalToResponsesPayload(
     for (const p of m.content) {
       if (p.kind === "toolCall") {
         flushMessage();
+        // Clamped here and in the result branch by the same helper, so a call
+        // and its output keep matching: OpenCode Zen rejects a `call_id` over
+        // 64 characters, and ids longer than that arrive from the client on
+        // every replay of the transcript.
+        const callId = clampToolCallId(p.call_id);
         if (p.call_kind === "computer") {
           const actions =
             isRecord(p.arguments) && Array.isArray(p.arguments["actions"])
               ? p.arguments["actions"]
               : [];
-          const checks = pendingSafetyChecks(p.call_id);
+          const checks = pendingSafetyChecks(callId);
           input.push({
             type: "computer_call",
             ...(p.item_id === undefined ? {} : { id: p.item_id }),
-            call_id: p.call_id,
+            call_id: callId,
             actions,
             ...(checks === undefined ? {} : { pending_safety_checks: checks }),
             status: "completed",
@@ -118,10 +127,12 @@ export function canonicalToResponsesPayload(
           input.push({
             type: "function_call",
             ...(p.item_id === undefined ? {} : { id: p.item_id }),
-            call_id: p.call_id,
+            call_id: callId,
             name: p.name,
-            arguments:
+            arguments: repairToolArguments(
               typeof p.arguments === "string" ? p.arguments : JSON.stringify(p.arguments),
+            ),
+            ...(p.namespace === undefined ? {} : { namespace: p.namespace }),
           });
         }
       } else if (p.kind === "toolResult") {
@@ -131,11 +142,12 @@ export function canonicalToResponsesPayload(
         // bare message — that is what made a Messages-session tool loop lose its
         // results when the target provider ran on the Responses wire.
         flushMessage();
+        const callId = clampToolCallId(p.call_id);
         if (p.call_kind === "computer") {
           input.push({
             type: "computer_call_output",
             ...(p.item_id === undefined ? {} : { id: p.item_id }),
-            call_id: p.call_id,
+            call_id: callId,
             output: computerOutputForWire(p.content),
             status: "completed",
           });
@@ -143,7 +155,7 @@ export function canonicalToResponsesPayload(
           input.push({
             type: "function_call_output",
             ...(p.item_id === undefined ? {} : { id: p.item_id }),
-            call_id: p.call_id,
+            call_id: callId,
             output: typeof p.content === "string" ? p.content : JSON.stringify(p.content),
           });
         }
@@ -234,7 +246,7 @@ export function canonicalToResponsesPayload(
     input,
     stream: request.stream,
   };
-  const responsesCacheKey = resolvePromptCacheKey(request);
+  const responsesCacheKey = options.promptCacheKey ?? resolvePromptCacheKey(request);
   if (supportsPromptCaching && responsesCacheKey !== undefined)
     payload.prompt_cache_key = responsesCacheKey;
   if (request.tools?.length) {
@@ -311,11 +323,15 @@ export function canonicalToResponsesPayload(
     if (Object.keys(reasoning).length > 0) payload.reasoning = reasoning;
   }
   const picked = pickWireSupportedControls(normalizeGenerationControls(request.generation_controls), "responses");
-  const requested = picked["max_output_tokens"];
-  if (typeof requested === "number" && Number.isFinite(requested)) {
-    const bounded = resolveWireMaxTokens("responses", { max_tokens: requested });
-    if (bounded !== undefined) picked["max_output_tokens"] = bounded;
-  }
+  const requested =
+    typeof picked["max_output_tokens"] === "number" && Number.isFinite(picked["max_output_tokens"])
+      ? (picked["max_output_tokens"] as number)
+      : undefined;
+  // Resolved unconditionally so the wire's `defaultMaxTokens` applies: an
+  // omitted limit must reach the upstream as a real number, not as an absent
+  // field (see the worked "wkwk" case in the WIRE_TOKEN_BOUNDS comment).
+  const bounded = resolveWireMaxTokens("responses", { max_tokens: requested });
+  if (bounded !== undefined) picked["max_output_tokens"] = bounded;
   Object.assign(payload, picked);
   // Responses top-level params carried as `extension:responses.<field>` and
   // forwarded verbatim. Fields with a canonical slot (prompt_cache_key,
@@ -338,6 +354,7 @@ export function canonicalToResponsesPayload(
     "user",
   ];
   for (const field of responsesPassthrough) {
+    if (!supportsPromptCaching && field.startsWith("prompt_cache_")) continue;
     // A bare `extension:<field>` fallback exists because the Chat parser files
     // shared top-level params (`store`, `user`, `moderation`, …) under the bare
     // key, and those have the same shape on every wire. `context_management`
@@ -374,3 +391,10 @@ export function canonicalToResponsesPayload(
   return payload;
 }
 
+
+export const responsesCodecModule = {
+  family: "responses" as const,
+  encodeWireRequest: canonicalToResponsesPayload,
+  decodeWireResponse: parseResponsesResponseToEvents,
+  decodeWireStream: decodeResponsesSseStream,
+} as const;

@@ -3,6 +3,7 @@ import { Elysia, t } from "elysia";
 import { consoleErrorHandler } from "../../shared/errors";
 import { literalUnion } from "../../shared/elysia-schema";
 import { RELAY_TARGETS, type RelayDeployRequest } from "./relay-deploy";
+import { RELAY_REGIONS } from "./relay-regions";
 import { SPEED_TEST_DEFAULT_BYTES } from "./speed-test-sizes";
 import {
   MAX_BATCH_PROBE_TARGETS,
@@ -27,12 +28,16 @@ const createPoolBody = t.Object({
   config: t.Optional(t.Record(t.String(), t.Unknown())),
   /** Egress allowance in bytes; `null` clears it back to unmetered. */
   quotaBytes: t.Optional(t.Union([t.Number({ minimum: 1 }), t.Null()])),
+  /** Operator-set family/tag naming which family this node belongs to. */
+  family: t.Optional(t.Union([t.String(), t.Null()])),
 });
 const deployRelayBody = t.Object({
   target: literalUnion(RELAY_TARGETS),
   token: t.String({ minLength: 1 }),
   accountId: t.Optional(t.String()),
   projectName: t.Optional(t.String()),
+  /** Vercel function region; ignored for targets that have no region control. */
+  region: t.Optional(literalUnion(RELAY_REGIONS)),
 });
 const testBatchBody = t.Object({
   targets: t.Array(createPoolBody, { minItems: 1, maxItems: MAX_BATCH_PROBE_TARGETS }),
@@ -71,6 +76,17 @@ export function createNetworkPoolRoutes(config: NetworkPoolConfig): Elysia {
     .post("/:poolId/recover", async ({ request, params }) => {
       return await factory.recoverPool(config.accessResolver(request), params.poolId);
 })
+    .post(
+      "/:poolId/provider-probe",
+      { body: t.Object({ providerId: t.String() }) },
+      async ({ request, params, body }) => {
+        return await factory.providerProbe(
+          config.accessResolver(request),
+          params.poolId,
+          body.providerId,
+        );
+      },
+    )
     .post("/:poolId/health-check", async ({ request, params }) => {
       return await factory.healthCheck(config.accessResolver(request), params.poolId);
 })
@@ -97,6 +113,22 @@ export function createNetworkPoolRoutes(config: NetworkPoolConfig): Elysia {
         body.targets as CreateNetworkPoolRequest[],
       );
 })
+    .post(
+      "/test-batch/provider",
+      {
+        body: t.Object({
+          providerId: t.String(),
+          targets: t.Array(createPoolBody, { minItems: 1, maxItems: MAX_BATCH_PROBE_TARGETS }),
+        }),
+      },
+      async ({ request, body }) => {
+        return await factory.probeAdHocProviderBatch(
+          config.accessResolver(request),
+          body.targets as CreateNetworkPoolRequest[],
+          body.providerId,
+        );
+      },
+    )
     .post(
       "/:poolId/cooldowns/clear",
       { body: t.Optional(t.Object({ providerId: t.Optional(t.String()) })) },

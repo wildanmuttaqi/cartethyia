@@ -1,74 +1,42 @@
-import { GatewayError, publicGatewayErrorBody } from "../gateway-error";
 // Attempt completion bookkeeping: one home for everything every dispatch attempt ends with.
-import type { ValidatedOutboundFetch } from "../../providers/provider-registry";
+import { readReportedModel } from "../../providers/operations/reported-model";
+import { GatewayError, publicGatewayErrorBody } from "../../protocol/gateway-error";
+import type { ValidatedOutboundFetch } from "../../providers/provider-contracts";
 import { reportAttemptOutcome } from "../../providers/operations/account-health-service";
-import type { UsageRecord } from "../canonical-model";
+import type { UsageRecord } from "../../protocol/canonical-model";
 import { classifyUpstreamFailure } from "../failure-policy";
 import type { AdmissionLease } from "../../security/admission/contracts";
-import type { CartethyiaDatabase } from "../../persistence/postgres";
+import type { CartethyiaDatabase } from "../../persistence/db-handle";
 import { TelemetryPayloadCapture } from "../../observability/payload-capture";
+import { payloadDirectory } from "../../observability/payload-store";
 import type { TelemetryBatchBuffer } from "../../observability/telemetry-buffer";
-import { CachedPreferencesReader, DrizzlePreferencesReader } from "../../persistence/tenant-preferences";
-import type { TelemetryPayloadDepth, TelemetryPayloadMode } from "../../console/settings/contracts";
+import type { TelemetryPayloadDepth } from "../../console/settings/contracts";
 import type { ProxyRequestOutcome, ProxyRequestState } from "../request/state";
-import { finalizeRequestTelemetry } from "../middleware/error-lifecycle";
+import type { PayloadCaptureState } from "../../observability/payload-capture";
+import { finalizeRequestTelemetry } from "../guards/error-lifecycle";
+import { debitCachedQuota, quotaLens } from "../../console/quota/cache";
+import { BUDDY_PROVIDER_IDS } from "../../providers/provider-metadata";
 import { log } from "../../observability/logger";
 import {
   disablePoolForProxyHttpStatus,
   recordPoolDispatchOutcome,
 } from "../../network/pool-health-machine";
-
-let preferencesCache: { db: CartethyiaDatabase; reader: CachedPreferencesReader } | undefined;
-
-export function preferencesReaderFor(db: CartethyiaDatabase): CachedPreferencesReader {
-  // Rebound when the db identity changes (tests use a different database
-  // per file); production passes the same singleton every request.
-  if (!preferencesCache || preferencesCache.db !== db) {
-    preferencesCache = {
-      db,
-      reader: new CachedPreferencesReader(new DrizzlePreferencesReader(db)),
-    };
-  }
-  return preferencesCache.reader;
-}
-
-export function clearConsoleSettingsCacheForTests(): void {
-  preferencesCache?.reader.clear();
-}
+import { ProxyConnectRefusalError } from "../../network/pool/agent";
+import {
+  payloadCaptureKeepsBodies,
+  resolvePayloadCapture,
+} from "../../observability/payload-capture";
 
 /**
- * Settings-gated payload capture. Request-event metadata is always retained;
- * tenants opt into drawer capture through Settings → Privacy: `metadata`
- * keeps only the Proxy→Provider request line, `full` keeps redacted bodies
- * at the tenant's chosen depth. Fail-closed on error.
+ * True when the tenant keeps response bodies (mode `full`). The dispatch
+ * path calls this once per attempt to decide whether the provider-response
+ * tee is worth its clone + bounded read; `none`/`metadata` skip the body.
  */
-async function resolvePayloadCapture(
+export async function shouldCaptureProviderBody(
   db: CartethyiaDatabase,
   tenantId: string | null,
-): Promise<{ mode: TelemetryPayloadMode; depth: TelemetryPayloadDepth }> {
-  if (!tenantId) return { mode: "none", depth: "minimum" };
-  try {
-    const prefs = await preferencesReaderFor(db).readPreferences(tenantId);
-    const mode = prefs?.telemetryPayloads;
-    const depth = prefs?.telemetryPayloadDepth;
-    return {
-      mode: mode === "full" || mode === "metadata" || mode === "none" ? mode : "metadata",
-      depth:
-        depth === "minimum" || depth === "moderate" || depth === "maximum"
-          ? depth
-          : depth === "medium"
-            ? "minimum"
-            : depth === "high"
-              ? "moderate"
-              : depth === "full"
-                ? "maximum"
-                : "minimum",
-    };
-  } catch {
-    // Preference read failure must not invent body capture; metadata is the
-    // safe default that still matches Settings → Privacy.
-    return { mode: "metadata", depth: "minimum" };
-  }
+): Promise<boolean> {
+  return payloadCaptureKeepsBodies(db, tenantId);
 }
 
 /**
@@ -80,8 +48,8 @@ async function resolvePayloadCapture(
  * active; minimum is light enough to leave on.
  */
 function captureDepthMaxBytes(depth: TelemetryPayloadDepth): number {
-  if (depth === "moderate") return 16 * 1024 * 1024;
-  if (depth === "maximum") return 32 * 1024 * 1024;
+  if (depth === "moderate") return 8 * 1024 * 1024;
+  if (depth === "maximum") return 16 * 1024 * 1024;
   return 1 * 1024 * 1024;
 }
 
@@ -128,17 +96,22 @@ async function readBoundedBody(response: Response, maxBytes: number): Promise<st
   if (!response.body) return "";
   const reader = response.body.getReader();
   const decoder = new TextDecoder();
-  let text = "";
+  // Collect decoded chunks and join once: `+=` per chunk reallocates the
+  // prefix (O(n^2)). Truncation stays at the same decoded-char boundary.
+  const parts: string[] = [];
+  let total = 0;
   try {
-    while (text.length < maxBytes) {
+    while (total < maxBytes) {
       const { done, value } = await reader.read();
       if (done) break;
       const chunk = decoder.decode(value, { stream: true });
-      if (text.length + chunk.length > maxBytes) {
-        text += chunk.slice(0, maxBytes - text.length);
+      if (total + chunk.length > maxBytes) {
+        parts.push(chunk.slice(0, maxBytes - total));
+        total = maxBytes;
         break;
       }
-      text += chunk;
+      parts.push(chunk);
+      total += chunk.length;
     }
   } catch {
     // Best-effort capture must never fail the request path.
@@ -149,12 +122,23 @@ async function readBoundedBody(response: Response, maxBytes: number): Promise<st
       // The clone branch is discarded either way.
     }
   }
-  return text;
+  return parts.join("");
 }
 
 export interface ProviderExchangeCapture {
   request: unknown;
   response: Promise<unknown>;
+  /**
+   * The model the upstream named in its own response, read from the raw bytes.
+   *
+   * Filled by `captureProviderExchange` — the one wrapper every provider's
+   * network call passes through — rather than by each adapter. Adapters were
+   * synthesizing their opening event with the model *we asked for*, so a
+   * provider answering a different one reported as if it had complied; reading
+   * the bytes here is the only place that sees what the upstream actually
+   * wrote, for every wire, without six adapters to keep in step.
+   */
+  reportedModel?: Promise<string | undefined>;
 }
 
 /**
@@ -167,6 +151,13 @@ export interface ProviderExchangeCapture {
  * provider bug reproducible after the fact.
  */
 const CAPTURED_REQUEST_HEADERS = [
+  "x-opencode-client",
+  "x-opencode-session",
+  "x-opencode-session-id",
+  "x-opencode-parent-session-id",
+  "x-opencode-request",
+  "x-opencode-project",
+  "x-session-affinity",
   "x-grok-session-id",
   "x-grok-conv-id",
   "x-grok-turn-idx",
@@ -176,10 +167,24 @@ const CAPTURED_REQUEST_HEADERS = [
   "x-grok-client-identifier",
   "x-grok-agent-id",
   "x-session-id",
+  "x-parent-session-id",
+  "traceparent",
+  "b3",
+  // The buddy channel check reads this family. A capture that kept only
+  // `x-session-id` could not show whether a `11-128 conversation id missing`
+  // refusal was a missing header or something else.
+  "x-conversation-id",
+  "x-conversation-request-id",
+  "x-conversation-message-id",
+  "x-root-request-id",
+  "x-request-id",
+  "x-trace-id",
+  "x-b3-traceid",
+  "x-b3-spanid",
+  "x-b3-sampled",
   "x-claude-code-session-id",
   "user-agent",
 ] as const;
-
 /** Copies only the allowlisted, non-empty headers from an outbound request. */
 function selectCapturedHeaders(init?: RequestInit): Record<string, string> | undefined {
   if (init?.headers === undefined) return undefined;
@@ -218,10 +223,18 @@ export function providerRequestMetadataOnly(request: unknown): unknown {
   return Object.keys(metadata).length === 0 ? null : metadata;
 }
 
-/** Wraps a validated outbound fetch to tee the provider request/response. */
+/**
+ * Wraps a validated outbound fetch to tee the provider request/response.
+ *
+ * `captureBody=false` records the request line but skips the response
+ * `clone()` + bounded read: tenants in `none`/`metadata` mode paid a full
+ * 256 KiB tee + decode + parse per attempt for bodies the terminal capture
+ * discarded. The request line is metadata-cheap and always kept.
+ */
 export function captureProviderExchange(
   inner: ValidatedOutboundFetch,
   sink: ProviderExchangeCapture,
+  captureBody = true,
 ): ValidatedOutboundFetch {
   return async (input, init) => {
     const url =
@@ -239,9 +252,14 @@ export function captureProviderExchange(
       ...(rawBody === null ? {} : { body: parseCapturedBody(rawBody) }),
     };
     const response = await inner(input, init);
-    sink.response = shouldCaptureProviderResponse(response)
-      ? readBoundedBody(response.clone(), PROVIDER_CAPTURE_MAX_BYTES).then(parseCapturedBody)
-      : Promise.resolve(null);
+    sink.response =
+      captureBody && shouldCaptureProviderResponse(response)
+        ? readBoundedBody(response.clone(), PROVIDER_CAPTURE_MAX_BYTES).then(parseCapturedBody)
+        : Promise.resolve(null);
+    // Read regardless of `captureBody`: this is metadata about the dispatch, not
+    // payload retention, so a tenant in `metadata` mode still records which
+    // model answered. It clones internally and reads only the head.
+    sink.reportedModel = readReportedModel(response).catch(() => undefined);
     return response;
   };
 }
@@ -250,11 +268,16 @@ async function resolvedProviderResponse(
   provider: ProviderExchangeCapture | undefined,
 ): Promise<unknown> {
   if (!provider) return null;
+  let timedOut = false;
   const settled = await Promise.race([
     provider.response,
-    new Promise<null>((resolve) => setTimeout(() => resolve(null), PROVIDER_CAPTURE_AWAIT_MS)),
+    new Promise<null>((resolve) => setTimeout(() => { timedOut = true; resolve(null); }, PROVIDER_CAPTURE_AWAIT_MS)),
   ]);
-  return settled ?? null;
+  if (settled === null || settled === undefined) {
+    // Distinguish "slow payload" from "no payload": a null used to mean both.
+    return timedOut ? { _truncated: true, _reason: "provider_capture_timeout" } : null;
+  }
+  return settled;
 }
 
 /**
@@ -263,6 +286,7 @@ async function resolvedProviderResponse(
  * request-detail endpoint cannot race the payload row and report a false miss.
  */
 async function captureTerminalPayload(
+  state: ProxyRequestState,
   db: CartethyiaDatabase,
   tenantId: string | null,
   requestId: string,
@@ -271,13 +295,34 @@ async function captureTerminalPayload(
   clientResponseBody?: string,
   providerCapture?: ProviderExchangeCapture,
 ): Promise<void> {
-  if (!tenantId) return;
+  // Every exit below records *why*. The drawer reads empty for all of them
+  // alike, so without this an operator debugging remotely — with no access to
+  // the server's logs — cannot distinguish "capture is off" from "capture is
+  // broken", and the four blank panels look like a bug either way.
+  const note = (reason: PayloadCaptureState): void => {
+    state.payloadCaptureState = reason;
+  };
+  if (!tenantId) {
+    note("skipped_no_tenant");
+    return;
+  }
   try {
-    const { mode, depth } = await resolvePayloadCapture(db, tenantId);
-    if (mode === "none") return;
+    const resolved = await resolvePayloadCapture(db, tenantId);
+    if (!resolved.ok) {
+      note("skipped_preference_read_failed");
+      return;
+    }
+    const { mode, depth } = resolved;
+    if (mode === "none") {
+      note("skipped_mode_none");
+      return;
+    }
     if (mode === "metadata") {
       const providerRequest = providerRequestMetadataOnly(providerCapture?.request ?? null);
-      if (providerRequest === null) return;
+      if (providerRequest === null) {
+        note("captured_metadata");
+        return;
+      }
       await new TelemetryPayloadCapture(db).capture({
         tenantId,
         requestId,
@@ -287,6 +332,7 @@ async function captureTerminalPayload(
         scope: "tenant",
         tenantOptIn: true,
       });
+      note("captured_metadata");
       return;
     }
     const maxBytes = captureDepthMaxBytes(depth);
@@ -304,7 +350,9 @@ async function captureTerminalPayload(
       scope: "tenant",
       tenantOptIn: true,
     });
+    note("captured");
   } catch (error) {
+    note("failed_write");
     reportCaptureFailure(error);
   }
 }
@@ -319,18 +367,13 @@ let captureFailureReported = false;
 export function reportCaptureFailure(error: unknown): void {
   if (captureFailureReported) return;
   captureFailureReported = true;
-  const directory = process.env.CARTETHYIA_TELEMETRY_PAYLOAD_DIR?.trim() || "./data/telemetry-payloads";
+  const directory = payloadDirectory();
   const reason = error instanceof Error ? error.message : String(error);
   log.warn(
     `[telemetry] payload capture is enabled for this tenant but the body was not stored ` +
       `(${reason}). Check that "${directory}" exists and is writable by the runtime user; ` +
       `a bind-mounted data directory is often owned by root while the container runs unprivileged.`,
   );
-}
-
-/** Test-only: allow a later failure to be reported again. */
-export function resetCaptureFailureReportForTests(): void {
-  captureFailureReported = false;
 }
 
 /**
@@ -352,7 +395,7 @@ export function terminalFailure(
     return new GatewayError(
       "transport_unavailable",
       502,
-      "upstream produced no terminal event",
+      "The upstream closed the response without reporting a result. Retry; if it keeps happening, the account or pool is unstable.",
       {},
       "upstream",
     );
@@ -429,6 +472,8 @@ export interface AttemptCompletion extends ProxyRequestOutcome {
   readonly firstContentDeltaAtMs?: number;
   /** Last event timestamp (for generation duration calculation). */
   readonly lastEventAtMs?: number;
+  /** The model the upstream reported in its own response, verbatim. */
+  readonly reportedModel?: string;
 }
 
 /**
@@ -485,6 +530,78 @@ export function completionContext(input: {
   };
 }
 
+/**
+ * Decides whether a failed attempt proves *the pool* is unusable, and which
+ * HTTP status that verdict rests on.
+ *
+ * Both a proxy and an upstream can answer 402, and the two mean opposite
+ * things: a proxy's 402 says this pool cannot carry traffic (disable it), while
+ * an upstream's 402 is that provider's billing verdict on the account that was
+ // dialed (cool the account down, leave the pool alone). The status alone
+ * cannot separate them, so the decision rides on who answered.
+ *
+ * A proxy that refuses the CONNECT handshake answers *before* any upstream is
+ * dialed, so its status is unambiguously the proxy's own. That refusal is not a
+ * `GatewayError` — it is a typed `ProxyConnectRefusalError` — so reading the
+ * status off `error.status` alone saw `undefined` here, the 402/407 check never
+ * fired, and a pool that had refused to tunnel stayed enabled and kept being
+ * selected.
+ */
+export function resolveProxyDisableDecision(completion: AttemptCompletion): {
+  readonly disableProxy: boolean;
+  readonly responseHttpStatus: number | undefined;
+} {
+  const proxyConnectStatus =
+    completion.error instanceof ProxyConnectRefusalError
+      ? completion.error.statusCode
+      : undefined;
+  const responseHttpStatus =
+    completion.error instanceof GatewayError
+      ? completion.error.status
+      : (proxyConnectStatus ?? completion.httpStatus);
+  // Only a proxy-origin payment/auth response proves the pool itself is unusable;
+  // an upstream provider's 402 is a quota/billing response for that provider.
+  const errorOrigin =
+    completion.error instanceof GatewayError
+      ? completion.error.origin
+      : proxyConnectStatus !== undefined
+        ? "network"
+        : completion.errorOrigin;
+  const disableProxy =
+    completion.networkPoolId !== undefined &&
+    completion.status !== "completed" &&
+    errorOrigin === "network" &&
+    (responseHttpStatus === 402 || responseHttpStatus === 407);
+  return { disableProxy, responseHttpStatus };
+}
+
+/**
+ * Reduces the account's cached pooled balance by the credits this request
+ * reported, so the next plan sees the spend instead of the balance the sweep
+ * last fetched.
+ *
+ * Scoped to the buddy family: `credit_used` there is buddy-meter credit, the
+ * same unit the cached windows store. Other providers report the field in
+ * their own unit, and debiting them would subtract the wrong thing. A missing
+ * cache entry, a failed last fetch, or a cache write that throws is left
+ * alone — the request already succeeded, and the floor keeps its previous
+ * reading until the sweep.
+ */
+async function debitBuddySpend(completion: AttemptCompletion): Promise<void> {
+  if (completion.status !== "completed") return;
+  const accountId = completion.accountId;
+  const providerId = completion.providerId;
+  const credits = completion.usage?.credit_used;
+  if (accountId === undefined || providerId === undefined) return;
+  if (!BUDDY_PROVIDER_IDS.has(providerId.toLowerCase())) return;
+  if (typeof credits !== "number" || !Number.isFinite(credits) || credits <= 0) return;
+  try {
+    await debitCachedQuota(quotaLens(completion.tenantId), accountId, credits, undefined);
+  } catch {
+    // Swallowed: the balance update is advisory. The sweep corrects it.
+  }
+}
+
 export async function completeAttempt(
   state: ProxyRequestState,
   completion: AttemptCompletion,
@@ -498,6 +615,16 @@ export async function completeAttempt(
   // health, then the terminal attempt records the real outcome and emits the
   // one telemetry row the request is owed.
   if (state.completed) return;
+  // Read before the outcome is frozen. The capture wrapper already started the
+  // read when the response arrived; awaiting it here costs nothing on the
+  // non-streaming path and only a bounded head-read on the streaming one.
+  // Absent means the upstream named no model — never backfilled from the
+  // request, which would report the ask as the answer.
+  const reportedModel =
+    completion.reportedModel ??
+    (completion.providerCapture?.reportedModel === undefined
+      ? undefined
+      : await completion.providerCapture.reportedModel.catch(() => undefined));
   state.outcome = {
     status: completion.status,
     httpStatus:
@@ -520,8 +647,10 @@ export async function completeAttempt(
     ...(completion.usage === undefined ? {} : { usage: completion.usage }),
     ...(completion.ttfbMs === undefined ? {} : { ttfbMs: completion.ttfbMs }),
     ...(completion.tokensPerSec === undefined ? {} : { tokensPerSec: completion.tokensPerSec }),
+    ...(reportedModel === undefined ? {} : { reportedModel }),
     ...(completion.firstContentDeltaAtMs === undefined ? {} : { firstContentDeltaAtMs: completion.firstContentDeltaAtMs }),
     ...(completion.lastEventAtMs === undefined ? {} : { lastEventAtMs: completion.lastEventAtMs }),
+    ...(completion.reportedModel === undefined ? {} : { reportedModel: completion.reportedModel }),
   };
   if (completion.terminal) state.completed = true;
   // Usage reconciliation is bookkeeping, and it is the last thing standing
@@ -539,19 +668,8 @@ export async function completeAttempt(
       // Swallowed: usage reconciliation is non-critical bookkeeping.
     }
   }
-  const responseHttpStatus =
-    completion.error instanceof GatewayError ? completion.error.status : completion.httpStatus;
-  // Only a proxy-origin payment/auth response proves the pool itself is unusable;
-  // an upstream provider's 402 is a quota/billing response for that provider.
-  const errorOrigin =
-    completion.error instanceof GatewayError
-      ? completion.error.origin
-      : completion.errorOrigin;
-  const disableProxy =
-    completion.networkPoolId !== undefined &&
-    completion.status !== "completed" &&
-    errorOrigin === "network" &&
-    (responseHttpStatus === 402 || responseHttpStatus === 407);
+  await debitBuddySpend(completion);
+  const { disableProxy, responseHttpStatus } = resolveProxyDisableDecision(completion);
   // Cancelled attempts write no health (client gone; outcome unknown) —
   // matches the historical `!cancelled` guards at every site. Health is
   // advisory: a failed report must never re-enter the retry path (a retry
@@ -590,10 +708,17 @@ export async function completeAttempt(
           completion.snapshotService,
         );
       } else {
+        const errorOrigin =
+          completion.errorOrigin ??
+          (completion.error instanceof ProxyConnectRefusalError ? "network" : undefined);
         await recordPoolDispatchOutcome(completion.db, completion.networkPoolId, {
           succeeded: completion.status === "completed",
           ...(completion.error === undefined ? {} : { error: completion.error }),
-          ...(completion.errorOrigin === undefined ? {} : { errorOrigin: completion.errorOrigin }),
+          // A CONNECT refusal is the proxy's own answer, given before any
+          // upstream was dialed, so it is a network fault even though the
+          // error carries no origin of its own. Without one the pool stays in
+          // rotation and the next probe dials the same front door.
+          ...(errorOrigin === undefined ? {} : { errorOrigin }),
           ...(completion.snapshotService === undefined
             ? {}
             : { snapshotInvalidator: completion.snapshotService }),
@@ -603,8 +728,18 @@ export async function completeAttempt(
       // Pool health is advisory; never fail or retry a completed request for it.
     }
   }
-  if (!completion.terminal) return;
+  if (!completion.terminal) {
+    // An intermediate failover attempt: the terminal attempt is the one that
+    // captures. Named rather than left blank so a request that never reached a
+    // terminal attempt is distinguishable from one that did and captured
+    // nothing.
+    if (state.payloadCaptureState === undefined) {
+      state.payloadCaptureState = "skipped_not_terminal";
+    }
+    return;
+  }
   await captureTerminalPayload(
+    state,
     completion.db,
     completion.tenantId,
     state.requestId,

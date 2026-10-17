@@ -19,9 +19,9 @@ import { createTestGateway, type TestGateway } from "../helpers/gateway";
 import { createWorld, type GatewayWorld } from "../helpers/fixtures";
 import { dbDescribe } from "../helpers/database";
 import { EligibilityEvaluator, RoutingEngine } from "../../src/transport/routing/router";
-import { GatewayError } from "../../src/transport/gateway-error";
+import { GatewayError } from "../../src/protocol/gateway-error";
 import type { RouteCandidate, RouteSnapshot } from "../../src/transport/routing/route-model";
-
+import { setCachedQuota, clearQuotaCacheForTests, debitCachedQuota } from "../../src/console/quota/cache";
 const CHAT_BODY = { model: "placeholder", messages: [{ role: "user", content: "hi" }], stream: false };
 
 /** A minimal candidate; only the fields the evaluator reads are meaningful. */
@@ -111,6 +111,41 @@ describe("RoutingEngine.plan cooldown classes", () => {
     });
   });
 
+  /**
+   * A model-scoped cooldown is a deadline the upstream stated ("this pair is
+   * exhausted until a named reset"), so an all-`model_cooldown` plan is a
+   * bounded refusal, not an outage — it must answer 429 the way an all-hard
+   * account cooldown does. It used to answer 503 `accounts_unavailable`, which
+   * reached the client as "the model is DOWN" while every account serving it
+   * was healthy and merely resting, and which invites a client to fail a health
+   * check instead of retrying after the reset.
+   */
+  test("every candidate model-cooled answers accounts_rate_limited, not 503", async () => {
+    const a = candidate({
+      provider_account_id: "a",
+      health_status: "model_cooldown",
+    });
+    const b = candidate({
+      provider_account_id: "b",
+      health_status: "model_cooldown",
+    });
+    await expect(engine.plan(qualified, snapshot([a, b]))).rejects.toMatchObject({
+      code: "accounts_rate_limited",
+      status: 429,
+    });
+  });
+
+  test("one model-cooled account still fails over to a healthy sibling", async () => {
+    const cooled = candidate({
+      provider_account_id: "model-cooled",
+      health_status: "model_cooldown",
+    });
+    const healthy = candidate({ provider_account_id: "healthy" });
+    const plan = await engine.plan(qualified, snapshot([cooled, healthy]));
+    expect(plan.candidates).toHaveLength(1);
+    expect(plan.candidates[0]?.provider_account_id).toBe("healthy");
+  });
+
   test("soft-cooled candidates stay eligible and are ordered after healthy ones", async () => {
     const coolA = candidate({
       provider_account_id: "cool-a",
@@ -126,90 +161,172 @@ describe("RoutingEngine.plan cooldown classes", () => {
       "cool-b",
     ]);
   });
+
+  test("a zero-balance account yields to a sibling with remaining quota", async () => {
+    const spent = candidate({ provider_account_id: "spent" });
+    const funded = candidate({ provider_account_id: "funded" });
+    await setCachedQuota("global", "spent", {
+      source: "test",
+      plan: null,
+      error: null,
+      windows: [{ kind: "credit", label: "credit", accounting: "pooled", usedPercent: 100, remainingPercent: 0, resetsAt: null, limit: 100, remaining: 0 }],
+    }, undefined);
+    await setCachedQuota("global", "funded", {
+      source: "test",
+      plan: null,
+      error: null,
+      windows: [{ kind: "credit", label: "credit", accounting: "pooled", usedPercent: 10, remainingPercent: 90, resetsAt: null, limit: 100, remaining: 90 }],
+    }, undefined);
+    try {
+      const plan = await engine.plan(qualified, snapshot([spent, funded]));
+      expect(plan.candidates.map((entry) => entry.provider_account_id)).toEqual(["funded"]);
+    } finally {
+      clearQuotaCacheForTests();
+    }
+  });
+
+  test("a debit that crosses the floor excludes the account on the next plan", async () => {
+    // Remaining 12 against a floor of 10 is still eligible. The request spends
+    // 3, and nothing but the debit tells the cache — the sweep is minutes
+    // away. The next plan must see 9 and move on.
+    const draining = candidate({ provider_account_id: "draining" });
+    const funded = candidate({ provider_account_id: "funded" });
+    const window = {
+      kind: "credit",
+      label: "credit",
+      accounting: "pooled" as const,
+      usedPercent: 0,
+      remainingPercent: 100,
+      resetsAt: null,
+      limit: 100,
+      remaining: 12,
+    };
+    await setCachedQuota("global", "draining", { source: "cb", plan: null, error: null, windows: [window] }, undefined);
+    await setCachedQuota("global", "funded", {
+      source: "cb",
+      plan: null,
+      error: null,
+      windows: [{ ...window, remaining: 90, usedPercent: 10, remainingPercent: 90 }],
+    }, undefined);
+    const withFloor = {
+      ...snapshot([draining, funded]),
+      providerRouting: { __global__: { p: { strategy: "fallback" as const, usageFloor: 10, usageFloorUnit: "credit" as const, enabled: false, rotateCount: 1, maxInflight: null, maxInflightPerProxy: null, skipProxy: false } } },
+    };
+    try {
+      await debitCachedQuota("global", "draining", 3, undefined);
+      const plan = await engine.plan(qualified, withFloor);
+      expect(plan.candidates.map((entry) => entry.provider_account_id)).toEqual(["funded"]);
+    } finally {
+      clearQuotaCacheForTests();
+    }
+  });
+
+  /**
+   * A usage-floor exclusion whose window states a refill is the same shape as a
+   * hard cooldown: the account is resting until a named instant, not broken. It
+   * used to fall through to 503, which reached the client as "the model is
+   * DOWN" while every account serving it was merely waiting for its window.
+   */
+  test("a usage floor with a stated refill answers 429, not 503", async () => {
+    const reset = new Date(Date.now() + 3 * 60 * 60 * 1000).toISOString();
+    const spent = candidate({ provider_account_id: "spent" });
+    await setCachedQuota("global", "spent", {
+      source: "test",
+      plan: null,
+      error: null,
+      windows: [{ kind: "credit", label: "credit", accounting: "pooled", usedPercent: 100, remainingPercent: 0, resetsAt: reset, limit: 100, remaining: 0 }],
+    }, undefined);
+    try {
+      await expect(engine.plan(qualified, snapshot([spent]))).rejects.toMatchObject({
+        code: "accounts_rate_limited",
+        status: 429,
+      });
+    } finally {
+      clearQuotaCacheForTests();
+    }
+  });
+
+  test("the usage-floor 429 reports the window's refill in retry-after", async () => {
+    const reset = new Date(Date.now() + 3 * 60 * 60 * 1000).toISOString();
+    const spent = candidate({ provider_account_id: "spent" });
+    await setCachedQuota("global", "spent", {
+      source: "test",
+      plan: null,
+      error: null,
+      windows: [{ kind: "credit", label: "credit", accounting: "pooled", usedPercent: 100, remainingPercent: 0, resetsAt: reset, limit: 100, remaining: 0 }],
+    }, undefined);
+    try {
+      const error = await engine.plan(qualified, snapshot([spent])).catch((thrown: unknown) => thrown);
+      expect(error).toBeInstanceOf(GatewayError);
+      expect((error as GatewayError).details.retryAfterMs).toBeGreaterThan(0);
+    } finally {
+      clearQuotaCacheForTests();
+    }
+  });
+
+  test("a usage floor with no stated refill stays unavailable", async () => {
+    // No reset means nothing to retry against yet, so 503 is the honest answer
+    // rather than a 429 quoting a deadline nobody measured.
+    const spent = candidate({ provider_account_id: "spent" });
+    await setCachedQuota("global", "spent", {
+      source: "test",
+      plan: null,
+      error: null,
+      windows: [{ kind: "credit", label: "credit", accounting: "pooled", usedPercent: 100, remainingPercent: 0, resetsAt: null, limit: 100, remaining: 0 }],
+    }, undefined);
+    try {
+      await expect(engine.plan(qualified, snapshot([spent]))).rejects.toMatchObject({
+        code: "accounts_unavailable",
+        status: 503,
+      });
+    } finally {
+      clearQuotaCacheForTests();
+    }
+  });
+
+  test("cached Buddy billing windows still aggregate refill and bonus balances", async () => {
+    const account = candidate({
+      provider_id: "cb",
+      model_id: "deepseek-v4.1-flash",
+      provider_account_id: "cached-buddy",
+    });
+    await setCachedQuota("global", "cached-buddy", {
+      source: "cb",
+      plan: "CodeBuddy",
+      error: null,
+      windows: [
+        {
+          kind: "quota:monthly",
+          label: "Monthly",
+          accounting: "pooled",
+          usedPercent: 50,
+          remainingPercent: 50,
+          resetsAt: null,
+          limit: 100,
+          used: 50,
+        },
+        {
+          kind: "bonus:1",
+          label: "Bonus Pack 1",
+          accounting: "pooled",
+          usedPercent: 100,
+          remainingPercent: 0,
+          resetsAt: null,
+          limit: 20,
+          used: 20,
+        },
+      ],
+    }, undefined);
+    try {
+      const plan = await engine.plan("cb/deepseek-v4.1-flash", snapshot([account]));
+      expect(plan.candidates.map((entry) => entry.provider_account_id)).toEqual(["cached-buddy"]);
+    } finally {
+      clearQuotaCacheForTests();
+    }
+  });
 });
-describe("EligibilityEvaluator global credit limit", () => {
-  const evaluator = new EligibilityEvaluator();
 
-  test("an account at or below the global limit is excluded", () => {
-    expect(
-      evaluator.evaluate(candidate({ credit_limit: 100, last_remaining_credit: 100 })),
-    ).toMatchObject({ eligible: false, reason: "credit_floor_reached" });
-    expect(
-      evaluator.evaluate(candidate({ credit_limit: 100, last_remaining_credit: 99 })),
-    ).toMatchObject({ eligible: false, reason: "credit_floor_reached" });
-  });
-
-  test("an account above the global limit stays eligible", () => {
-    expect(
-      evaluator.evaluate(candidate({ credit_limit: 100, last_remaining_credit: 101 })),
-    ).toMatchObject({ eligible: true, reason: "healthy" });
-  });
-
-  test("a disabled global limit never excludes, whatever the balance", () => {
-    expect(
-      evaluator.evaluate(
-        candidate({ credit_limit_enabled: false, credit_limit: 100, last_remaining_credit: 0 }),
-      ),
-    ).toMatchObject({ eligible: true, reason: "healthy" });
-    expect(
-      evaluator.evaluate(
-        candidate({ credit_limit_enabled: false, credit_limit: 100, last_remaining_percent: 0 }),
-      ),
-    ).toMatchObject({ eligible: true, reason: "healthy" });
-  });
-
-  test("a percent-quota account at or below the floor is excluded", () => {
-    expect(
-      evaluator.evaluate(candidate({ credit_limit: 60, last_remaining_percent: 60 })),
-    ).toMatchObject({ eligible: false, reason: "credit_floor_reached" });
-    expect(
-      evaluator.evaluate(candidate({ credit_limit: 60, last_remaining_percent: 12 })),
-    ).toMatchObject({ eligible: false, reason: "credit_floor_reached" });
-    expect(
-      evaluator.evaluate(candidate({ credit_limit: 60, last_remaining_percent: 61 })),
-    ).toMatchObject({ eligible: true, reason: "healthy" });
-  });
-
-  test("an absolute credit wins over percent on the same candidate", () => {
-    // An account reporting both compares in credits; the percent stamp is
-    // only the fallback for percent-only providers.
-    expect(
-      evaluator.evaluate(
-        candidate({ credit_limit: 100, last_remaining_credit: 500, last_remaining_percent: 5 }),
-      ),
-    ).toMatchObject({ eligible: true, reason: "healthy" });
-    expect(
-      evaluator.evaluate(
-        candidate({ credit_limit: 100, last_remaining_credit: 50, last_remaining_percent: 95 }),
-      ),
-    ).toMatchObject({ eligible: false, reason: "credit_floor_reached" });
-  });
-
-  test("a depleted account loses to a healthy sibling in plan()", async () => {
-    const engine = new RoutingEngine();
-    const depleted = candidate({
-      provider_account_id: "depleted",
-      credit_limit: 100,
-      last_remaining_credit: 80,
-    });
-    const healthy = candidate({ provider_account_id: "healthy" });
-    const plan = await engine.plan("p/m", snapshot([depleted, healthy]));
-    expect(plan.candidates.map((c) => c.provider_account_id)).toEqual(["healthy"]);
-  });
-
-  test("every account below the global limit answers accounts_unavailable", async () => {
-    const engine = new RoutingEngine();
-    const only = candidate({
-      provider_account_id: "only",
-      credit_limit: 100,
-      last_remaining_credit: 50,
-    });
-    await expect(engine.plan("p/m", snapshot([only]))).rejects.toMatchObject({
-      code: "accounts_unavailable",
-      status: 503,
-    });
-  });
-
+describe("combo member routing", () => {
   test("a combo routes its live member despite a dead member", async () => {
     const engine = new RoutingEngine();
     const live = candidate({ provider_id: "cline", model_id: "spark" });
@@ -253,11 +370,17 @@ describe("EligibilityEvaluator global credit limit", () => {
       },
       created_at: Date.now(),
     };
-    // The public message names only the request and the usable candidates —
-    // dead member ids stay server-side (server logs), never the envelope.
-    await expect(engine.plan("pool", snap, "t1")).rejects.toThrow(
-      "Model 'pool' has no available account (1 candidate(s) unusable: disabled)",
-    );
+    // The public message names only the request and the reason — dead member
+    // ids stay server-side (server logs), never the envelope. Asserted on the
+    // stable contract plus the non-leak, not on the exact wording: the sentence
+    // is free to be reworded for operators.
+    await expect(engine.plan("pool", snap, "t1")).rejects.toMatchObject({
+      code: "accounts_unavailable",
+      status: 503,
+    });
+    const thrown = await engine.plan("pool", snap, "t1").catch((error: unknown) => error);
+    expect(thrown).toBeInstanceOf(GatewayError);
+    expect((thrown as GatewayError).message).not.toContain("ghost-model");
   });
 });
 
@@ -438,5 +561,38 @@ dbDescribe("account failover", () => {
       if (previous === undefined) delete process.env.CARTETHYIA_ROUTE_MAX_ATTEMPTS;
       else process.env.CARTETHYIA_ROUTE_MAX_ATTEMPTS = previous;
     }
+  });
+
+  test("a failed combo member is not retried before its siblings", async () => {
+    const second = await world.addProvider({ modelId: "member-b" });
+    gateway.setRoutes(
+      [
+        { providerId: world.providerId, modelId: world.modelId, accountId: world.accountId },
+        { providerId: second.providerId, modelId: second.modelId, accountId: second.accountId },
+      ],
+      {
+        combos: {
+          [world.tenantId]: {
+            pool: {
+              members: [`${world.providerId}/${world.modelId}`, `${second.providerId}/${second.modelId}`],
+              strategy: "fallback",
+            },
+          },
+        },
+      },
+    );
+    gateway.adapter(world.providerId, {
+      failWith: () => new GatewayError("platform_unavailable", 503, "member unavailable"),
+    });
+    gateway.adapter(second.providerId);
+
+    const response = await gateway.json(
+      "/v1/chat/completions",
+      { ...CHAT_BODY, model: "pool" },
+      { token: world.token },
+    );
+    expect(response.status).toBe(200);
+    expect(gateway.adapters.get(world.providerId)?.dispatches).toHaveLength(1);
+    expect(gateway.adapters.get(second.providerId)?.dispatches).toHaveLength(1);
   });
 });

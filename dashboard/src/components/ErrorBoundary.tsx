@@ -38,35 +38,24 @@ export default class ErrorBoundary extends Component<ErrorBoundaryProps, ErrorBo
     if (this.state.error === null) return this.props.children;
     return (
       <main className="auth-viewport">
-        <div className="card-solid auth-window" style={{ border: "1px solid var(--red-soft)" }}>
+        <div className="card-solid auth-window border border-red-soft">
           <div className="auth-header">
             <h1 className="auth-title">Console view failed</h1>
             <p className="auth-desc">This view could not be rendered.</p>
           </div>
 
-          <div
-            style={{
-              padding: "14px",
-              borderRadius: "12px",
-              background: "var(--surface-2)",
-              border: "1px solid var(--inner-border)",
-              fontSize: "12.5px",
-              color: "var(--text-secondary)",
-              lineHeight: 1.5,
-            }}
-          >
-            <strong style={{ display: "block", color: "var(--text-primary)", marginBottom: "4px" }}>
+          <div className="rounded-panel border border-inner-border bg-surface-2 p-7 leading-normal text-caption text-text-secondary">
+            <strong className="block text-text-primary mb-2">
               Rendering error
             </strong>
-            <span className="select-text" style={{ wordBreak: "break-word" }}>
+            <span className="select-text break-words">
               {this.state.error.message}
             </span>
           </div>
 
           <button
             type="button"
-            className="btn btn-primary"
-            style={{ width: "100%", marginTop: "6px", height: "40px" }}
+            className="btn btn-primary inline-flex w-full items-center justify-center rounded-control bg-accent font-semibold text-accent-foreground mt-3 h-20 text-caption"
             onClick={() => window.location.reload()}
           >
             Reload console

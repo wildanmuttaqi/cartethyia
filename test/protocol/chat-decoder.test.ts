@@ -28,8 +28,8 @@ import {
   mapChatStopReason,
   parseChatResponseToEvents,
 } from "../../src/protocol/response/chat";
-import { GatewayError } from "../../src/transport/gateway-error";
-import type { CanonicalEvent, CanonicalRequest, UsageRecord } from "../../src/transport/canonical-model";
+import { GatewayError } from "../../src/protocol/gateway-error";
+import type { CanonicalEvent, CanonicalRequest, UsageRecord } from "../../src/protocol/canonical-model";
 
 /** A canonical request; the decoder reads only `model`. */
 function request(overrides: { model?: string } = {}): CanonicalRequest {
@@ -480,7 +480,11 @@ describe("decodeChatSseStream — truncation and failure", () => {
       sseStream(frame({ choices: [{ delta: { content: "half an ans" } }] })),
     );
     expect(terminal(events).state).toBe("failed");
-    expect(terminal(events).stop_reason).toBeUndefined();
+    // The chat wire falls back to `stop` when a terminal carries no stop
+    // reason, so a cut stream reached the client as a clean completion while
+    // telemetry recorded the 502. The failure now travels in the reason as
+    // well, which is what an OpenAI-shaped client reads.
+    expect(terminal(events).stop_reason).toBe("error");
   });
 
   test("an explicit finish_reason of error or failed is a failed terminal", async () => {
@@ -809,6 +813,8 @@ describe("decodeChatSseStream — tool-call fragment joining", () => {
     expect(typeof calls[0]?.call_id).toBe("string");
   });
 
+
+
   test("a tool call with no arguments emits an empty delta", async () => {
     const events = await collect(
       sseStream(
@@ -892,7 +898,29 @@ describe("decodeChatSseStream — reasoning deltas", () => {
     );
     expect(events.filter((event) => event.type === "content_delta")).toHaveLength(0);
   });
+  test("a think tag split across chunks stays one reasoning span", async () => {
+    const events = await collect(
+      sseStream(
+        frame({ choices: [{ delta: { content: "before<thi" } }] }) +
+          frame({ choices: [{ delta: { content: "nk>reason</think>after" } }] }) +
+          frame({ choices: [{ delta: {}, finish_reason: "stop" }] }) +
+          frame("[DONE]"),
+      ),
+    );
+    const parts = events.flatMap((event) => {
+      if (event.type !== "content_delta") return [];
+      const text =
+        event.content.kind === "reasoning"
+          ? (event.content.summary ?? "")
+          : event.content.kind === "text"
+            ? event.content.text
+            : "";
+      return [`${event.content.kind}:${text}`];
+    });
+    expect(parts).toEqual(["text:before", "reasoning:reason", "text:after"]);
+  });
 });
+
 
 describe("decodeChatSseStream — an empty body", () => {
   test("an empty body is a truncated stream", async () => {

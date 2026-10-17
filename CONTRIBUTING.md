@@ -27,8 +27,9 @@ migrations, and verification, use the single source of truth:
   names, routing policy, and dashboard mirrors.
 - Use concrete role filenames such as `contracts.ts`, `routes.ts`, `store.ts`,
   `service.ts`, and `errors.ts`. Avoid `index.ts` barrels.
-- Keep scripts organized by purpose under `scripts/commands`, `scripts/build`,
-  `scripts/generate`, `scripts/dev`, and `scripts/internal`.
+- Keep scripts organized by purpose under `scripts/cli`, `scripts/operations`,
+  `scripts/install`, `scripts/build`, `scripts/generate`, `scripts/dev`,
+  `scripts/test`, and `scripts/shared`.
 - Use strict TypeScript: no `any`, suppressions, needless assertions, or weakened
   compiler settings. Narrow `unknown` at boundaries and use `import type` for types.
 - Comments explain policy, security, protocol behavior, or non-obvious tradeoffs;
@@ -53,10 +54,12 @@ migrations, and verification, use the single source of truth:
 
 ## Verification
 
-The repository does not currently carry an active test suite. Use the gates in
-`documentation/getting-started.md`, then exercise the real boundary for behavior
-changes: a gateway request, browser surface, provider flow, or isolated database
-migration.
+The repository carries an active test suite (`test/`, `dashboard/test/`, run via
+`bun run test` / `test:backend` / `dashboard:test`). Database suites use the
+disposable `CARTETHYIA_TEST_DATABASE_URL` in the local `.env` or shell, never
+the dev database. Use the gates in `documentation/getting-started.md`, then
+exercise the real boundary for behavior changes: a gateway request, browser
+surface, provider flow, or isolated database migration.
 
 A typecheck is not runtime proof. Report the exact command, result, reproduction,
 real-boundary evidence, skipped checks, and remaining blockers.
@@ -66,6 +69,7 @@ real-boundary evidence, skipped checks, and remaining blockers.
 - Branch from `main` and keep the change focused.
 - Fill in `.github/pull_request_template.md` with the change, gates, and docs status.
 - Keep security boundaries fail-closed.
+- A provider, health, or streaming claim belongs in the owning skill and `documentation/reference/`. Do not leave a dashboard section or README claim behind the code.
 - Preserve intentional provider wire bytes, headers, and user-agent behavior.
 - Do not commit, push, deploy, alter production data, or discard unrelated working
   tree changes unless explicitly asked.

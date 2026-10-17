@@ -73,3 +73,92 @@ describe("buddy channel rejection 11128", () => {
     expect(c.mutatesAccount).toBe(false);
   });
 });
+
+describe("buddy credit exhaustion 14018", () => {
+  test("is a hard quota cooldown recovered by the twelve-hour sweep", () => {
+    const c = classify("Credits exhausted. Please visit the link below to purchase add-on packs", "14018", "cb");
+    expect(c.category).toBe("quota_exhausted");
+    expect(c.status).toBe("cooldown");
+    expect(c.mutatesAccount).toBe(true);
+    expect(c.cooldownMs).toBe(12 * 60 * 60 * 1000);
+    expect(c.retryAt!.getTime()).toBeGreaterThan(Date.now() + 11 * 60 * 60 * 1000);
+  });
+});
+
+/**
+ * The penalty's *size*, which the assertions above deliberately leave open.
+ *
+ * This block was a flat 6h here and 24h for the sibling `11140` content block,
+ * both applied on the first observation. Both codes are ambiguous from the
+ * response alone: `workbuddy/shared.ts` records that the wrong desktop
+ * `User-Agent` brand also answers `11140`, and a channel rejection is purely
+ * about the calling channel we built — neither says anything about the
+ * credential being unusable for a day.
+ *
+ * A flat day meant that after we fixed a header regression, every buddy account
+ * stayed dead for up to a further 24h. As a short base the consecutive-failure
+ * ladder decides instead, which is the evidence that actually separates the
+ * causes: an account the upstream genuinely refuses is refused again on its very
+ * next request and escalates to the cap within minutes, while one bad prompt or
+ * one bad header costs five minutes.
+ */
+describe("buddy policy/channel block — a base backoff, not a flat day", () => {
+  test("the first observation is a short backoff, not 6h or 24h", () => {
+    const channel = classify("Illegal API invocation from an unapproved channel", "11128", "cb");
+    expect(channel.cooldownMs).toBeLessThanOrEqual(5 * 60_000);
+    const policy = classify("request illegal: did not pass the safety review", "11140", "cb");
+    expect(policy.cooldownMs).toBeLessThanOrEqual(5 * 60_000);
+  });
+
+  test("both codes share one knob, so an operator can retune them together", () => {
+    // Same category, same control: splitting them would let the two halves of
+    // one upstream decision drift apart.
+    const channel = classify("Illegal API invocation from an unapproved channel", "11128", "cb");
+    const policy = classify("request illegal: did not pass the safety review", "11140", "cb");
+    expect(policy.cooldownMs).toBe(channel.cooldownMs);
+  });
+
+  test("it stays a cooldown with a deadline, so the sweep recovers it", () => {
+    // `disabled` is not an option here even at the cap: the credential is valid
+    // and the block clears on its own, so an operator must never have to
+    // re-enable the account by hand.
+    const c = classify("Illegal API invocation from an unapproved channel", "11128", "cb");
+    expect(c.status).toBe("cooldown");
+    expect(c.retryAt).toBeInstanceOf(Date);
+  });
+});
+
+describe("buddy request-scoped codes do not cool the account", () => {
+  // Each of these is a verdict on the body or the session, not the credential.
+  // Falling through to the generic 400 used to burn a cooldown on a healthy
+  // account for a request that fails the same way on every other account.
+  const cases = [
+    ["11148", "tool_call_sequence_broken"],
+    ["11135", "Please start a new conversation, replace the image, and try again."],
+    ["11133", "the request parameters were rejected by the model provider"],
+    ["11101", "Unmarshal chat params failed with error: unexpected EOF"],
+    ["12153", "Offline user session not found"],
+    ["14017", "The trial version is not yet activated"],
+  ] as const;
+
+  for (const [code, message] of cases) {
+    test(`${code} does not mutate the account`, () => {
+      const c = classify(message, code, "cb");
+      expect(c.mutatesAccount).toBe(false);
+      expect(c.cooldownMs).toBe(0);
+      expect(c.retryAt).toBeNull();
+    });
+  }
+
+  test("the same code on a non-buddy provider is left to the generic path", () => {
+    // The codes are a buddy-family contract. Applying the exemption everywhere
+    // would hide a real account fault on a provider that happens to reuse a number.
+    const c = classify("tool_call_sequence_broken", "11148", "anthropic");
+    expect(c.category).not.toBe("policy_blocked");
+  });
+
+  test("a message match is enough when the code is absent", () => {
+    const c = classify("Unmarshal chat params failed with error: unexpected EOF", "", "workbuddy");
+    expect(c.mutatesAccount).toBe(false);
+  });
+});

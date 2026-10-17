@@ -44,3 +44,40 @@ export function maskClientIp(value: string | null | undefined): string | null {
   }
   return "***";
 }
+
+/**
+ * Scrubs credential-shaped text before it is written to a log.
+ *
+ * Payload bodies stay verbatim — a redacted body is indistinguishable from a
+ * body the upstream actually received, which is why the payload redactor was
+ * removed. Logs are different: a drain failure that quotes a request line, or
+ * an error whose message echoes an `Authorization` header, lands in a file an
+ * operator shares. Those writes are scrubbed here, and nowhere else.
+ *
+ * The patterns are the ones a leaked credential actually has: an
+ * `Authorization` header value, a `Bearer`/`Basic` token, a JWT (`eyJ…`), and
+ * the provider prefixes `cb-`, `sk-`, `AIza`, `AKIA`, `ghp_`, `xoxb-`. An
+ * inline base64 image data URL is replaced too — it is not a secret, but it
+ * is large enough to bury the line it sits in.
+ */
+const SECRET_PATTERNS: readonly RegExp[] = [
+  /authorization\s*[:=]\s*\S+/gi,
+  /\b(?:bearer|basic)\s+[A-Za-z0-9._~+/-]+=*/gi,
+  /\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}/g,
+  /\b(?:cb|sk)-[A-Za-z0-9_-]{8,}/g,
+  /\bAIza[A-Za-z0-9_-]{20,}/g,
+  /\bAKIA[A-Z0-9]{16}/g,
+  /\bghp_[A-Za-z0-9]{20,}/g,
+  /\bxoxb-[A-Za-z0-9-]{10,}/g,
+  /data:image\/[A-Za-z0-9.+-]+;base64,[A-Za-z0-9+/=]{16,}/g,
+];
+
+/** Replaces credential-shaped runs with a fixed marker. Idempotent. */
+export function scrubSecrets(value: string): string {
+  let out = value;
+  for (const pattern of SECRET_PATTERNS) {
+    pattern.lastIndex = 0;
+    out = out.replace(pattern, "[redacted]");
+  }
+  return out;
+}

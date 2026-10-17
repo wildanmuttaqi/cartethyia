@@ -6,8 +6,8 @@ import { DataTable } from "./ui/layout";
 import { Inline } from "./ui/inline";
 import { EmptyState, ErrorState, LoadingState } from "./ui/state";
 import { ConfirmDialog } from "./ConfirmDialog";
-import { toast } from "../shared/toast";
-import { getErrorMessage } from "../shared/helpers";
+import { toast } from "../lib/toast";
+import { getErrorMessage } from "../data/api";
 import type { ModelAbuseBan } from "../data/contracts";
 import { useModelBans, useUnbanModel } from "../hooks/model-bans";
 
@@ -45,18 +45,13 @@ export function ModelBansDialog({ onClose }: { readonly onClose: () => void }): 
         open={true}
         onClose={onClose}
         title="Banned Users"
-        description="Client addresses banned for repeated invalid-model requests. Lifting a ban lets the address reach the gateway again."
+        description="A client address is banned after repeated invalid-model requests. The ban applies to every API key used from that address, not just one credential."
         size="lg"
       >
-        <div style={{ display: "flex", flexDirection: "column", gap: "14px", minWidth: 0 }}>
-          <div style={{ minWidth: 0 }}>
+        <div className="flex flex-col gap-7 min-w-0">
+          <div className="min-w-0">
             <h4
-              style={{
-                fontSize: "12px",
-                fontWeight: 600,
-                color: "var(--text-secondary)",
-                marginBottom: "8px",
-              }}
+              className="text-caption font-semibold text-text-secondary mb-4"
             >
               Active bans ({bans.length})
             </h4>
@@ -74,37 +69,31 @@ export function ModelBansDialog({ onClose }: { readonly onClose: () => void }): 
                 icon={<ShieldOff size={20} />}
               />
             ) : (
-              <div
-                style={{
-                  maxHeight: "min(55dvh, 480px)",
-                  overflow: "auto",
-                  border: "1px solid var(--inner-border)",
-                  borderRadius: "8px",
-                }}
-              >
-                <DataTable headers={["Client IP", "Lapses", ""]}>
+              <div className="rounded-inset border border-inner-border">
+                <DataTable
+                  maxHeight={480}
+                  scrollRegion
+                  headers={["Client IP", "Reason", "Applies to", "Lapses", ""]}
+                >
                   {bans.map((ban) => (
                     <tr key={ban.ip}>
-                      <td
-                        style={{
-                          fontFamily: "var(--font-mono)",
-                          fontSize: "11.5px",
-                          color: "var(--text-primary)",
-                          whiteSpace: "nowrap",
-                        }}
-                      >
+                      <td className="font-mono tabular-nums text-badge text-text-primary whitespace-nowrap">
                         {ban.ip}
                       </td>
+                      <td className="text-badge text-text-secondary">
+                        {ban.reason === "repeated_invalid_model_requests"
+                          ? "Repeated invalid-model requests"
+                          : ban.reason}
+                      </td>
+                      <td className="text-badge text-text-secondary whitespace-nowrap">
+                        All API keys from this IP
+                      </td>
                       <td
-                        style={{
-                          fontSize: "11px",
-                          color: "var(--text-secondary)",
-                          whiteSpace: "nowrap",
-                        }}
+                        className="text-badge text-text-secondary whitespace-nowrap"
                       >
                         {lapseLabel(ban.expiresAt)}
                       </td>
-                      <td style={{ textAlign: "right", whiteSpace: "nowrap" }}>
+                      <td className="text-right whitespace-nowrap">
                         <Button
                           variant="secondary"
                           size="sm"

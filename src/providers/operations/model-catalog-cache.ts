@@ -7,8 +7,10 @@
  * provider share a single load, and lets the dynamic catalog imports run once
  * per process. A rejected load is evicted so a later call can retry.
  */
-import type { ModelDefinition } from "../provider-registry";
+import type { ModelDefinition } from "../provider-model-definition";
 import { trackModelCatalogLoad } from "../../observability/performance-metrics";
+import { resolveRedisClient } from "../../persistence/redis";
+import { cachedRead } from "../../console/shared/read-through-cache";
 
 /**
  * Provider entries retained before the least-recently-used catalog is evicted.
@@ -16,6 +18,15 @@ import { trackModelCatalogLoad } from "../../observability/performance-metrics";
  * catalog for the process lifetime.
  */
 export const MODEL_CATALOG_CACHE_MAX_ENTRIES = 64;
+
+/**
+ * Cross-instance tier lifetime. Static provider catalogs change only on a
+ * deploy, so a short shared window keeps every instance from rebuilding the
+ * same expensive dynamic import. The key is versioned so a shape change is a
+ * new key rather than a stale read.
+ */
+const MODEL_CATALOG_TTL_SECONDS = 60;
+const MODEL_CATALOG_KEY_PREFIX = "catalog:v1:";
 
 const catalogCache = new Map<string, Promise<readonly ModelDefinition[]>>();
 
@@ -46,16 +57,23 @@ export function getCachedModels(
   }
   evictLeastRecentlyUsedCatalog(maxEntries);
   const startedAt = performance.now();
-  const task = loader()
-    .then((models) => {
+  // The in-memory entry holds the *promise*, so concurrent and repeated calls
+  // for one provider still share a single load — the shared tier only widens
+  // that deduplication to other instances.
+  const task = cachedRead<readonly ModelDefinition[]>(
+    resolveRedisClient(),
+    `${MODEL_CATALOG_KEY_PREFIX}${providerId}`,
+    async () => {
+      const models = await loader();
       trackModelCatalogLoad(providerId, performance.now() - startedAt);
       return models;
-    })
-    .catch((error: unknown) => {
-      // Never cache a failure: a transient import error must be retryable.
-      catalogCache.delete(providerId);
-      throw error;
-    });
+    },
+    MODEL_CATALOG_TTL_SECONDS,
+  ).catch((error: unknown) => {
+    // Never cache a failure: a transient import error must be retryable.
+    catalogCache.delete(providerId);
+    throw error;
+  });
   catalogCache.set(providerId, task);
   return task;
 }

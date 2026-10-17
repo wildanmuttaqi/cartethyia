@@ -1,103 +1,56 @@
 import { describe, expect, test } from "bun:test";
-import {
-  BUNDLED_PROVIDER_METADATA,
-  providerServiceKinds,
-  providerSupportsWebSearch,
-} from "../../src/providers/provider-metadata";
+import { BUNDLED_PROVIDER_METADATA, providerServiceKinds } from "../../src/providers/provider-metadata";
+import { buildCapabilityProfile } from "../../src/transport/routing/route-catalog";
 import { sanitizeProviderResponse } from "../../src/console/providers/catalog/provider-operations";
-import {
-  discoverOpenrouterModels,
-  OPENROUTER_MODELS,
-  OPENROUTER_SPEC,
-} from "../../src/providers/integrations/openrouter";
-import { discoveryPathsFor, staticEndpointForWire } from "../../src/providers/discovery/probe-wire";
-import { resolveProbeTarget } from "../../src/providers/discovery/probe-phases";
-import type { CartethyiaDatabase } from "../../src/persistence/postgres";
+import { createDefaultProviderRegistry } from "../../src/providers/default-registry";
 
-describe("static provider endpoints", () => {
-  test("does not route OpenRouter chat probes through the System One endpoint", () => {
-    const catalog = new Map([["openrouter", OPENROUTER_MODELS]]);
-
-    expect(staticEndpointForWire(catalog, "openrouter", "chat")).toBeUndefined();
-    expect(
-      staticEndpointForWire(catalog, "openrouter", "chat", "systemone"),
-    ).toBe("/systemone");
-    expect(discoveryPathsFor("openrouter")).toEqual({
-      chat: "/chat/completions",
-      responses: "/responses",
-    });
-    expect(OPENROUTER_SPEC.endpoint_paths_by_wire_family).toEqual(
-      discoveryPathsFor("openrouter"),
-    );
-  });
-
-  test("resolves LLM chat and native System One to separate OpenRouter paths", async () => {
-    const catalog = new Map([["openrouter", OPENROUTER_MODELS]]);
-    const shared = {
-      db: {} as unknown as CartethyiaDatabase,
-      bundledModelCatalog: catalog,
-      defaultEndpoints: {
-        chat: "/v1/chat/completions",
-        responses: "/v1/responses",
-        messages: "/v1/messages",
-      },
-      providerId: "openrouter",
-      providerWireRow: undefined,
-    };
-    const modelId = "apodex/apodex-1.1-mini:free";
-    const chat = await resolveProbeTarget({
-      ...shared,
-      modelId,
-      request: { modelId, wireFamily: "chat", serviceKind: "llm" },
-    });
-    const systemOne = await resolveProbeTarget({
-      ...shared,
-      modelId: "typesafe/jev-1.13",
-      request: {
-        modelId: "typesafe/jev-1.13",
-        wireFamily: "chat",
-        serviceKind: "systemone",
-      },
-    });
-
-    expect(chat.endpointPath).toBe("/chat/completions");
-    expect(systemOne.endpointPath).toBe("/systemone");
-  });
-
-  test("normalizes generic model-discovery routes to OpenRouter's API base", async () => {
-    const discovered = await discoverOpenrouterModels({
-      credential: "test-api-key",
-      fetcher: (async () =>
-        new Response(
-          JSON.stringify({ data: [{ id: "apodex/apodex-1.1-mini:free" }] }),
-          { headers: { "content-type": "application/json" } },
-        )) as unknown as typeof fetch,
-    });
-
-    expect(discovered?.[0]?.endpointPath).toBe("/chat/completions");
-  });
-});
-
+const registry = createDefaultProviderRegistry();
 describe("provider service taxonomy", () => {
-  test("defaults providers to LLM and declares real search surfaces", () => {
+  test("declares real search surfaces and keeps bundled providers explicit", () => {
     expect(providerServiceKinds("openai")).toEqual(["llm"]);
-    expect(providerServiceKinds("gemini")).toEqual(["llm", "websearch"]);
-    expect(providerServiceKinds("codex")).toEqual(["llm", "websearch"]);
+    expect(providerServiceKinds("gemini")).toEqual(["llm", "websearch", "imageGeneration"]);
+    expect(providerServiceKinds("codex")).toEqual(["llm", "websearch", "imageGeneration"]);
+    expect(providerServiceKinds("antigravity")).toEqual(["llm", "websearch", "imageGeneration"]);
     expect(providerServiceKinds("exa")).toEqual(["websearch"]);
-    expect(providerServiceKinds("custom-provider")).toEqual(["llm"]);
+    expect(providerServiceKinds("parallel")).toEqual(["websearch"]);
+    // A bundled provider without a declaration serves LLM only — the
+    // declaration is authoritative, so `llm` is not read as "everything".
+    expect(providerServiceKinds("cbcn")).toEqual(["llm"]);
+    expect(providerServiceKinds("workbuddycn")).toEqual(["llm", "imageGeneration", "videoGeneration"]);
     for (const provider of BUNDLED_PROVIDER_METADATA)
       expect(provider.serviceKinds).not.toContain("all");
   });
-  // Web search is a provider capability, not a per-model flag: the adapter
-  // either frames a hosted search tool or it does not.
-  test("search-capable providers are declared at the provider level", () => {
-    expect(providerSupportsWebSearch("claude")).toBe(true);
-    expect(providerSupportsWebSearch("gemini")).toBe(true);
-    expect(providerSupportsWebSearch("codex")).toBe(true);
-    expect(providerSupportsWebSearch("antigravity")).toBe(true);
-    // A pure search provider answers `/v1/search`, never a chat turn.
-    expect(providerSupportsWebSearch("exa")).toBe(false);
-    expect(providerSupportsWebSearch("cb")).toBe(false);
+
+  test("a custom provider may serve every media surface", () => {
+    // A BYOK provider has no manifest row. It is read as able to serve the
+    // generation surfaces too, because the operator chose its base URL and the
+    // upstream — not the gateway — is what decides whether it can answer. A
+    // bundled provider is still explicit: `llm` alone means LLM only.
+    expect(providerServiceKinds("custom-provider")).toEqual([
+      "llm",
+      "imageGeneration",
+      "videoGeneration",
+    ]);
+  });
+
+  test("WorkBuddy CN is wired through the provider composition root", async () => {
+    const adapter = await registry.resolve("workbuddycn");
+    const authentication = await registry.resolveAuthentication("workbuddycn");
+    const quotaCollector = await registry.resolveQuotaCollector("workbuddycn");
+
+    expect(adapter?.provider_id).toBe("workbuddycn");
+    expect(registry.hasModelDiscovery("workbuddycn")).toBe(true);
+    expect(authentication?.client).toBeDefined();
+    expect(authentication?.refresher).toBeDefined();
+    expect(quotaCollector).toBeDefined();
+  });
+  test("a chat model never advertises search", () => {
+    expect(buildCapabilityProfile({
+      modalities: undefined,
+      reasoning: true,
+      toolCall: true,
+      providerId: "codex",
+    }).webSearch).toBe(false);
   });
 
   test("sanitized custom provider responses never expose an all category", () => {
@@ -107,7 +60,14 @@ describe("provider service taxonomy", () => {
       isBuiltIn: false,
       requiresAccount: true,
     });
-    expect(response.serviceKinds).toEqual(["llm"]);
+    // The kinds are derived from the taxonomy, so a custom provider reports the
+    // media surfaces it may serve — never a literal "all", which would be an
+    // undeclared capability.
+    expect(response.serviceKinds).toEqual([
+      "llm",
+      "imageGeneration",
+      "videoGeneration",
+    ]);
     expect(response.serviceKinds).not.toContain("all");
   });
 });

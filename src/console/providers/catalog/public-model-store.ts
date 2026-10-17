@@ -1,3 +1,4 @@
+import { globalOrOwnedBy } from "../../../persistence/tenant-scope";
 /**
  * Public model catalog: the read-only `/v1/models` surface an API key sees.
  *
@@ -9,10 +10,11 @@
  * authorization snapshot.
  */
 import { and, eq, isNull, or } from "drizzle-orm";
-import type { CartethyiaDatabase } from "../../../persistence/postgres";
+import type { CartethyiaDatabase } from "../../../persistence/db-handle";
 import { modelAliases, modelCombos, models, providerAccounts, providers } from "../../../persistence/schema";
 import { isModelAllowed, listIncludes, type ApiKeyAuthorizationSnapshot } from "../../../security/api-key-auth";
-import { providerSupportsWebSearch } from "../../../providers/provider-metadata";
+import { modelsDevCatalog } from "../../../providers/discovery/models-dev-catalog";
+import { FALLBACK_CONTEXT_LIMIT, FALLBACK_OUTPUT_LIMIT } from "../../../providers/provider-model-definition";
 
 export interface AllowedModelEntry {
   id: string;
@@ -116,6 +118,12 @@ function matchesModelPrefix(
 export interface ModelMetadata {
   readonly contextLimit: number | null;
   readonly outputLimit: number | null;
+  /**
+   * True when the limits above are a placeholder because no catalog row filed
+   * this model. The surface marks them so an operator can tell a measured
+   * window from a stand-in.
+   */
+  readonly limitsEstimated?: boolean;
   readonly modalities: unknown;
   readonly reasoning: boolean;
   readonly toolCall: boolean;
@@ -159,9 +167,19 @@ export function resolveTargetIds(
 /**
  * The metadata a routing name advertises, given the ids it can reach.
  *
- * A pool may route to any member, so the conservative claim is the minimum
- * across them and only the modalities every member shares. `null` limits mean
- * "no catalog row described this id"; the caller substitutes the defaults.
+ * The first member that states its own metadata wins, wholesale — limits,
+ * capabilities, and cost together. Averaging across members made a pool read
+ * as its weakest member: an alias over a 1M/384k row and a 200k/64k row
+ * advertised 200k/64k and dropped vision, because the conservative rule
+ * (minimum limits, only capabilities every member shares) describes the worst
+ * route rather than the one the pool exists to serve.
+ *
+ * "States its own" carries as much weight as "first". A member whose limits are
+ * the estimated fallback is skipped, so a placeholder never outranks a real
+ * measurement merely by coming first in the member list.
+ *
+ * When no member states its own, the conservative aggregate is still the honest
+ * answer: every candidate is a placeholder, so there is no better one to prefer.
  */
 export function advertisedMetadata(
   ids: readonly string[],
@@ -181,13 +199,28 @@ export function advertisedMetadata(
       cost: undefined,
     };
   }
+  const filed = found.find((m) => m.limitsEstimated !== true && m.contextLimit !== null);
+  if (filed !== undefined) {
+    return {
+      contextLimit: filed.contextLimit,
+      outputLimit: filed.outputLimit,
+      modalities: filed.modalities,
+      reasoning: filed.reasoning,
+      toolCall: filed.toolCall,
+      webSearch: filed.webSearch,
+      cost: filed.cost,
+    };
+  }
   return {
     contextLimit: Math.min(...found.map((m) => m.contextLimit ?? DEFAULT_CONTEXT_LIMIT)),
     outputLimit: Math.min(...found.map((m) => m.outputLimit ?? DEFAULT_OUTPUT_LIMIT)),
+    // Estimated only when every target is unfiled: one measured target is
+    // enough to describe the alias.
+    ...(found.every((m) => m.limitsEstimated === true) ? { limitsEstimated: true } : {}),
     modalities: intersectModalities(found.map((m) => m.modalities).filter((m) => m != null)),
-    // A pool may route to any member, so a capability is claimed only when
-    // every member has it; a single member's rate is quoted only when all
-    // members bill alike.
+    // Every candidate here is a placeholder, so none is preferable: a
+    // capability is claimed only when all of them carry it, and a rate is
+    // quoted only when all bill alike.
     reasoning: found.every((m) => m.reasoning),
     toolCall: found.every((m) => m.toolCall),
     webSearch: found.every((m) => m.webSearch),
@@ -314,7 +347,7 @@ export class PublicModelCatalogStore {
     const providerScope =
       tenantId === null
         ? isNull(providers.tenantId)
-        : or(isNull(providers.tenantId), eq(providers.tenantId, tenantId));
+        : globalOrOwnedBy(providers.tenantId, tenantId);
     const rows = await this.db
       .select({
         providerId: models.providerId,
@@ -332,9 +365,9 @@ export class PublicModelCatalogStore {
       .innerJoin(providers, eq(models.providerId, providers.id))
       .where(and(eq(models.enabled, true), eq(providers.enabled, true), providerScope));
 
-    // Only expose models whose provider is either No-auth (requiresAccount=false,
-    // e.g. opencodefree) or has at least one active account for this tenant.
-    // This mirrors 21 beta's "No auth dan yang disetel apikey/oauth aja".
+    // A model is exposed only when its provider has an active account for this
+    // tenant. This matches the console model picker, so an API key never
+    // advertises a provider the operator has not configured.
     const activeProviderIds = new Set<string>();
     if (tenantId !== null) {
       const activeAccounts = await this.db
@@ -376,8 +409,11 @@ export class PublicModelCatalogStore {
 
     const modelEntries: AllowedModelEntry[] = rows
       .filter((row) => {
-        if (row.providerRequiresAccount === false) return true;
-        if (tenantId === null) return false;
+        // A provider is listed only when the tenant has an active account for
+        // it — the same rule the console model picker applies. A no-auth
+        // provider with nothing configured is not "set", so it stays hidden
+        // until the operator adds an account.
+        if (tenantId === null) return row.providerRequiresAccount === false;
         return activeProviderIds.has(row.providerId);
       })
       .filter((row) =>
@@ -490,7 +526,7 @@ export class PublicModelCatalogStore {
     }
     const out = new Map<string, ModelMetadata>();
     if (qualified.size === 0 && bare.size === 0) return out;
-    const providerScope = or(isNull(providers.tenantId), eq(providers.tenantId, tenantId));
+    const providerScope = globalOrOwnedBy(providers.tenantId, tenantId);
     const rows = await this.db
       .select({
         providerId: models.providerId,
@@ -521,13 +557,23 @@ export class PublicModelCatalogStore {
         ),
       );
     for (const row of rows) {
+      const filed =
+        row.contextLimit !== null ||
+        modelsDevCatalog.resolve(row.providerId, row.modelId) !== undefined ||
+        modelsDevCatalog.majorityFor(row.modelId) !== undefined;
       const metadata = {
-        contextLimit: row.contextLimit,
-        outputLimit: row.outputLimit,
+        // An unfiled model gets the shared fallback rather than `null`, so a
+        // routable model is not advertised as having no window at all. Matches
+        // the console catalog projection, which substitutes the same pair.
+        contextLimit: filed ? row.contextLimit : FALLBACK_CONTEXT_LIMIT,
+        outputLimit: filed ? row.outputLimit : FALLBACK_OUTPUT_LIMIT,
+        ...(filed ? {} : { limitsEstimated: true }),
         modalities: row.modalities,
         reasoning: row.reasoning,
         toolCall: row.toolCall,
-        webSearch: providerSupportsWebSearch(row.providerId),
+        // No model advertises search: a `websearch` row answers
+        // `POST /v1/search`. See the note in provider-metadata.ts.
+        webSearch: false,
         cost: row.cost,
       } satisfies ModelMetadata;
       out.set(`${row.providerId}/${row.modelId}`, metadata);
@@ -536,9 +582,28 @@ export class PublicModelCatalogStore {
       const matches = rows.filter((row) => row.modelId === id).map((row) => out.get(`${row.providerId}/${row.modelId}`));
       if (matches.length > 0 && matches.every((entry) => entry !== undefined)) {
         const found = matches.filter((entry): entry is ModelMetadata => entry !== undefined);
+        // Same intent as `advertisedMetadata`: describe the id by a row that
+        // states its own limits, not by the weakest provider carrying it. The
+        // tie-break differs because a bare id has no member order to defer to —
+        // there is no declared list, only whichever rows the query happened to
+        // return — so "first" would be whichever the database yielded. The
+        // largest filed window is chosen instead: among interchangeable
+        // providers it is the one the route can actually serve, and it is
+        // deterministic.
+        const filed = found.filter((entry) => entry.limitsEstimated !== true && entry.contextLimit !== null);
+        if (filed.length > 0) {
+          const best = filed.reduce((a, b) =>
+            (b.contextLimit ?? 0) > (a.contextLimit ?? 0) ? b : a,
+          );
+          out.set(id, best);
+          continue;
+        }
         out.set(id, {
           contextLimit: Math.min(...found.map((entry) => entry.contextLimit ?? DEFAULT_CONTEXT_LIMIT)),
           outputLimit: Math.min(...found.map((entry) => entry.outputLimit ?? DEFAULT_OUTPUT_LIMIT)),
+          // Estimated only when no member brought a filed limit: one measured
+          // member is enough to describe the pool.
+          ...(found.every((entry) => entry.limitsEstimated === true) ? { limitsEstimated: true } : {}),
           modalities: intersectModalities(found.map((entry) => entry.modalities).filter((value) => value != null)),
           reasoning: found.every((entry) => entry.reasoning),
           toolCall: found.every((entry) => entry.toolCall),

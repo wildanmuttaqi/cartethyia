@@ -18,7 +18,7 @@
  * so the caller gets an acknowledgement rather than a dropped connection.
  */
 import { timingSafeEqual } from "node:crypto";
-import { GatewayError } from "./gateway-error";
+import { GatewayError } from "../protocol/gateway-error";
 
 export interface DrainEndpointDeps {
   /** Shared secret; the route is registered only when this is set. */
@@ -34,7 +34,7 @@ export interface DrainEndpointDeps {
  * on Windows (`::ffff:127.0.0.1`) and the whole `127.0.0.0/8` block, so the
  * check matches however the socket reports a local caller.
  */
-function isLoopbackPeer(peer: string | null): boolean {
+export function isLoopbackPeer(peer: string | null): boolean {
   if (peer === null || peer.length === 0) return false;
   const normalized = peer.toLowerCase().split("%", 1)[0] ?? "";
   if (normalized === "::1") return true;
@@ -43,7 +43,7 @@ function isLoopbackPeer(peer: string | null): boolean {
 }
 
 /** Constant-time token comparison; length mismatch short-circuits safely. */
-function tokenMatches(provided: string | null, expected: string): boolean {
+export function tokenMatches(provided: string | null, expected: string): boolean {
   if (provided === null) return false;
   const a = Buffer.from(provided, "utf-8");
   const b = Buffer.from(expected, "utf-8");

@@ -9,10 +9,10 @@
  * emitting only whitespace tool-call-argument deltas would otherwise hang
  * the dispatch loop forever.
  */
-import { GatewayError } from "../../transport/gateway-error";
-import { type CanonicalEvent, type CanonicalRequest, type CanonicalStopReason } from "../../transport/canonical-model";
-import { usageFromProvider, readResponsesReasoningDelta } from '../../providers/usage';
-import { canonicalTerminal, decodeCodexToolCallId, isRecord, readOutputIndex } from '../primitives';
+import { GatewayError } from "../gateway-error";
+import { type CanonicalEvent, type CanonicalRequest, type CanonicalStopReason } from "../canonical-model";
+import { usageFromProvider, readResponsesReasoningDelta } from '../../providers/provider-usage';
+import { canonicalTerminal, decodeCodexToolCallId, isRecord, readOutputIndex } from '../codecs';
 import { gatewayErrorFromStreamError } from '../stream-error-frames';
 
 export function mapCodexStopReason(

@@ -1,8 +1,5 @@
-// Routing admission, reservations, and route planning.
+// Routing model resolution and route planning.
 import { log } from "../../observability/logger";
-import { metrics } from "../../observability/metrics";
-import { resolveInflightTtlSeconds } from "../../config";
-import { redisEvalNumber, type RedisClient } from "../../persistence/redis";
 import {
   accountsRateLimitedError,
   accountsUnavailableError,
@@ -11,7 +8,6 @@ import {
   capabilityUnsupportedError,
   modelNotFoundError,
   type AdmissionController,
-  type AdmissionDecision,
   type ComboDefinition,
   type ProviderRoutingSetting,
   type Reservation,
@@ -19,180 +15,18 @@ import {
   type RoutePlan,
   type EligibilityDecision,
   type RouteSnapshot,
-  type RoutingRevision,
 } from "./route-model";
 import {
   candidateSupportsRequest,
   type RequiredCapability,
 } from "../translation/capabilities";
-
-const SEARCH_PROVIDER_ORDER = ["exa", "gemini", "codex"] as const;
-const SEARCH_PROVIDER_RANK = new Map<string, number>(
-  SEARCH_PROVIDER_ORDER.map((provider, index) => [provider, index]),
-);
-
-
-/**
- * Admission bucket identity. Account-scoped so each account of a provider
- * enforces its own concurrency ceiling; candidates without an account id
- * (credential-less providers) fall back to the provider:model bucket.
- */
-function admissionKey(candidate: RouteCandidate): string {
-  const base = `${candidate.provider_id}:${candidate.model_id}`;
-  return candidate.provider_account_id === undefined
-    ? base
-    : `${base}:${candidate.provider_account_id}`;
-}
-
-/**
- * What one candidate's configured ceiling tells admission to do, before any
- * back end has looked at its counter.
- */
-type AdmissionDirective =
-  | { readonly kind: "unlimited" }
-  | { readonly kind: "reject" }
-  | { readonly kind: "bounded"; readonly limit: number };
-
-/**
- * The one admission policy, shared by both controllers.
- *
- * Both back ends must reach the same three-way decision for one candidate:
- * no configured ceiling (account and routing panel both empty) means the
- * account is UNLIMITED — still counted, so inflight stays observable, but
- * never rejected; a non-positive ceiling is a configured zero, so every
- * request is rejected; and reaching the ceiling rejects. Only the comparison
- * itself is back-end specific (a `Map` read here, an atomic Lua `GET`/`INCR`
- * for Redis), so the decision and the rejection it produces live in one
- * place and the two deployments cannot report different telemetry for the
- * same input.
- */
-function admissionDirective(candidate: RouteCandidate): AdmissionDirective {
-  const limit = candidate.max_inflight;
-  if (limit === undefined) return { kind: "unlimited" };
-  if (limit <= 0) return { kind: "reject" };
-  return { kind: "bounded", limit };
-}
-
-/** The one shape of an admission rejection: the metric, then the decision. */
-function capacityRejected(): AdmissionDecision {
-  metrics.proxy_admission_total.inc(1, { reason: "provider_capacity" });
-  return { admitted: false, reason: "capacity_exhausted" };
-}
-
-export class InMemoryAdmissionController implements AdmissionController {
-  private inflight = new Map<string, number>();
-  snapshotAccountInflight(): ReadonlyMap<string, number> {
-    return new Map(this.inflight);
-  }
-  async admit(candidate: RouteCandidate): Promise<AdmissionDecision> {
-    // Bucket per ACCOUNT, not per provider:model. A provider with N accounts
-    // holds N independent ceilings, so total inflight scales with the account
-    // count instead of every account sharing one pool-wide bucket (which made
-    // round-robin look "sticky": account 2+ was always admitted-rejected).
-    const key = admissionKey(candidate);
-    const directive = admissionDirective(candidate);
-    if (directive.kind === "reject") return capacityRejected();
-    const cur = this.inflight.get(key) ?? 0;
-    if (directive.kind === "bounded" && cur >= directive.limit) return capacityRejected();
-    this.inflight.set(key, cur + 1);
-    return { admitted: true };
-  }
-
-  async release(reservation: Reservation): Promise<void> {
-    const key = admissionKey(reservation.candidate);
-    const cur = this.inflight.get(key) ?? 1;
-    // Delete at zero rather than storing it: keys are per account/model and
-    // models churn, so retained zeroes would grow the map for the process
-    // lifetime. Absent reads as zero everywhere this map is consulted.
-    if (cur <= 1) this.inflight.delete(key);
-    else this.inflight.set(key, cur - 1);
-  }
-}
-
-/**
- * Redis-backed admission controller for routing inflight. Replaces the
- * in-memory controller so multi-instance deployments enforce one shared
- * per-account inflight bucket — mirroring the in-memory controller's
- * account-scoped ceiling. The TTL self-heals crash-orphaned increments without
- * the full lease machinery (over-inflating a route slot is bounded and less
- * harmful than corrupting quota counters).
- *
- * The TTL is the shared {@link resolveInflightTtlSeconds}, not a local
- * constant: it must exceed the longest legitimate slot hold, which is the
- * upstream deadline plus the stream stall budget. A fixed 60s expired a slot
- * mid-stream for any request running longer than a minute, so a second request
- * could admit against the freed slot and exceed the configured ceiling. The
- * pool selector holds its slot for the same request duration and derives the
- * same value, so both admit on one invariant.
- */
-const INFLIGHT_TTL_SECONDS = resolveInflightTtlSeconds();
-
-const ADMIT_SCRIPT = `
-local current = tonumber(redis.call('GET', KEYS[1]) or '0')
-if current >= tonumber(ARGV[1]) then return 0 end
-local next = redis.call('INCR', KEYS[1])
-redis.call('EXPIRE', KEYS[1], tonumber(ARGV[2]))
-return next
-`;
-
-/** Counts an admission without any ceiling (unlimited account). */
-const UNLIMITED_ADMIT_SCRIPT = `
-redis.call('INCR', KEYS[1])
-redis.call('EXPIRE', KEYS[1], tonumber(ARGV[1]))
-return 1
-`;
-const RELEASE_SCRIPT = `
-local current = tonumber(redis.call('GET', KEYS[1]) or '0')
-if current <= 0 then return 0 end
-local next = redis.call('DECR', KEYS[1])
-if next <= 0 then redis.call('DEL', KEYS[1]) end
-return next
-`;
-
-export class RedisAdmissionController implements AdmissionController {
-  constructor(private readonly redis: RedisClient) {}
-
-  private key(candidate: RouteCandidate): string {
-    return `admission:inflight:${admissionKey(candidate)}`;
-  }
-
-  async admit(candidate: RouteCandidate): Promise<AdmissionDecision> {
-    const directive = admissionDirective(candidate);
-    if (directive.kind === "reject") return capacityRejected();
-    // The unlimited path counts with the TTL self-heal but never compares
-    // against a ceiling, so no limit argument ever reaches the ceiling script.
-    const result = await redisEvalNumber(
-      this.redis,
-      directive.kind === "unlimited" ? UNLIMITED_ADMIT_SCRIPT : ADMIT_SCRIPT,
-      1,
-      this.key(candidate),
-      ...(directive.kind === "unlimited"
-        ? [INFLIGHT_TTL_SECONDS]
-        : [directive.limit, INFLIGHT_TTL_SECONDS]),
-    );
-    if (directive.kind === "bounded" && result === 0) return capacityRejected();
-    return { admitted: true };
-  }
-
-  async release(reservation: Reservation): Promise<void> {
-    await redisEvalNumber(this.redis, RELEASE_SCRIPT, 1, this.key(reservation.candidate));
-  }
-
-  async snapshotAccountInflight(): Promise<ReadonlyMap<string, number>> {
-    const keys = await this.redis.keys("admission:inflight:*");
-    if (keys.length === 0) return new Map();
-    const values = await this.redis.mget(...keys);
-    const snapshot = new Map<string, number>();
-    for (const [index, key] of keys.entries()) {
-      const value = Number(values[index] ?? 0);
-      if (Number.isFinite(value) && value > 0) {
-        snapshot.set(key.slice("admission:inflight:".length), value);
-      }
-    }
-    return snapshot;
-  }
-}
-
+import { InMemoryAdmissionController, admissionKey } from "./admission";
+import { ReservationManager } from "./reservations";
+import { getOrCreateRoundRobin, RoundRobinState } from "./round-robin";
+import { totalRemainingCredit, totalRemainingPercent, type ProviderQuotaWindow } from "../../providers/quota/quota-contracts";
+import { getCachedQuotaEntry, quotaLens } from "../../console/quota/cache";
+import type { RedisClient } from "../../persistence/redis";
+import { sharedClaudeSlowLanes } from "../../providers/integrations/claude/claude-slow-lane";
 
 function parseModel(model: string): { providerId: string | null; bare: string } {
   const slash = model.indexOf("/");
@@ -204,6 +38,36 @@ function candidateMatches(candidate: RouteCandidate, model: string): boolean {
   const parsed = parseModel(model);
   if (parsed.providerId === null) return candidate.model_id === parsed.bare;
   return candidate.model_id === parsed.bare && candidate.provider_id === parsed.providerId;
+}
+
+/**
+ * True when the account's remaining allowance is at or below its provider's
+ * floor. Credit mode sums the absolute remaining credit; percent mode uses the
+ * aggregate credit percentage and the lowest independent percentage window.
+ * No reading means unknown, which is not below the floor.
+ */
+function belowUsageFloor(state: {
+  readonly usage_floor?: number;
+  readonly usage_floor_unit?: "credit" | "percent";
+  readonly quota_windows?: readonly ProviderQuotaWindow[] | undefined;
+}): boolean {
+  const windows = state.quota_windows;
+  if (windows === undefined || windows.length === 0) return false;
+  const credit = totalRemainingCredit(windows);
+  const percent = totalRemainingPercent(windows);
+  const exhaustedIndependentWindow = windows.some(
+    (window) =>
+      window.accounting !== "pooled" &&
+      typeof window.remainingPercent === "number" &&
+      Number.isFinite(window.remainingPercent) &&
+      window.remainingPercent <= 0,
+  );
+  if ((credit !== null && credit <= 0) || exhaustedIndependentWindow) return true;
+  if (credit === null && percent !== null && percent <= 0) return true;
+  const floor = state.usage_floor;
+  if (floor === undefined) return false;
+  const remaining = state.usage_floor_unit === "credit" ? credit : percent;
+  return remaining !== null && remaining <= floor;
 }
 
 /**
@@ -326,6 +190,11 @@ function resolveAlias(
  * candidates eligible, because the ordering above is what the plan needs to
  * build the healthy-first list.
  *
+ * `model_cooldown` reaches that same 429 by a different route: the evaluator
+ * excludes it outright, so when it is the only reason nothing is eligible
+ * `plan()` reports it as a time-bounded refusal rather than 503
+ * `accounts_unavailable`. See the branch in `plan()`.
+ *
  * `model_cooldown` is the exception, and a hard exclusion. It is the snapshot's
  * marker for an *unexpired per-model* entry on the candidate whose model is
  * being planned — the upstream stated this exact (account, model) pair is
@@ -339,61 +208,136 @@ function resolveAlias(
  * `disabled` stays a hard exclusion: it is an operator decision, and only an
  * operator restores it.
  */
+/**
+ * Carries a cooling deadline onto a decision only when there is one.
+ *
+ * A spread rather than a bare field because `exactOptionalPropertyTypes` treats
+ * `cooldown_until: undefined` as a *present* property, which would assert a
+ * deadline exists for a candidate that has none.
+ */
+function spreadDeadline(cooldownUntil: number | undefined): { cooldown_until?: number } {
+  return cooldownUntil === undefined ? {} : { cooldown_until: cooldownUntil };
+}
+
+/**
+ * The soonest moment a quota window the caller is blocked on refills.
+ *
+ * A usage-floor exclusion is time-bounded by construction — the floor compares
+ * the *remaining* allowance, and the window states when that allowance resets —
+ * but the exclusion used to carry no deadline, so `plan()` could not tell a
+ * client how long to wait and `earliestResetMs` reported nothing. The minimum
+ * across windows, for the same reason `earliestResetMs` takes it: the account
+ * can serve again as soon as its first window refills, so quoting the slowest
+ * would hold the client off longer than necessary.
+ *
+ * `undefined` when no window states a reset, which is the honest answer and
+ * keeps the reason a plain 503 rather than a 429 with an unknown retry-after.
+ */
+function earliestWindowResetMs(
+  windows: readonly ProviderQuotaWindow[] | undefined,
+  nowMs: number,
+): number | undefined {
+  if (windows === undefined) return undefined;
+  let earliest: number | undefined;
+  for (const window of windows) {
+    if (typeof window.resetsAt !== "string" || window.resetsAt.length === 0) continue;
+    const at = Date.parse(window.resetsAt);
+    if (!Number.isFinite(at) || at <= nowMs) continue;
+    if (earliest === undefined || at < earliest) earliest = at;
+  }
+  return earliest;
+}
+
+/**
+ * The earliest instant any cooling candidate recovers, in epoch ms.
+ *
+ * `undefined` when no decision carries a deadline — which is the honest answer
+ * for a set whose exclusions have no reset (`disabled`, `locked`), and keeps
+ * `accountsRateLimitedError` from reporting a number nobody measured. The
+ * minimum, not the maximum: the client can be served as soon as the *first*
+ * account comes back, so quoting the slowest would hold it off longer than it
+ * has to wait.
+ */
+function earliestResetMs(decisions: readonly EligibilityDecision[]): number | undefined {
+  let earliest: number | undefined;
+  for (const decision of decisions) {
+    const until = decision.cooldown_until;
+    if (typeof until !== "number" || !Number.isFinite(until) || until <= Date.now()) continue;
+    if (earliest === undefined || until < earliest) earliest = until;
+  }
+  return earliest;
+}
+
+/**
+ * Stamps the slow lane onto candidates whose account is currently lane-active.
+ *
+ * Read at plan time from the live lane registry, exactly as `applyUsageFloor`
+ * reads live quota: lane state changes per response, so baking it into the
+ * snapshot would route on a stale observation. An account with no lane state
+ * is untouched, which keeps every non-Claude provider byte-identical here.
+ */
+function applySlowLane(
+  candidates: readonly RouteCandidate[],
+): readonly RouteCandidate[] {
+  let stamped = false;
+  const out = candidates.map((candidate) => {
+    const accountId = (
+      candidate as RouteCandidate & { readonly provider_account_id?: string }
+    ).provider_account_id;
+    if (accountId === undefined || !sharedClaudeSlowLanes.isActive(accountId))
+      return candidate;
+    stamped = true;
+    return { ...candidate, lane: "slow" as const };
+  });
+  return stamped ? out : candidates;
+}
+
 export class EligibilityEvaluator {
   evaluate(candidate: RouteCandidate): EligibilityDecision {
     const state = candidate as RouteCandidate & {
       readonly health_status?: string;
       readonly cooldown_kind?: "hard" | "soft";
+      readonly cooldown_until?: number;
       readonly account_locked?: boolean;
       readonly locked?: boolean;
-      readonly credit_limit_enabled?: boolean;
-      readonly credit_limit?: number;
-      readonly last_remaining_credit?: number | null;
-      readonly last_remaining_percent?: number | null;
+      readonly usage_floor?: number;
+      readonly usage_floor_unit?: "credit" | "percent";
+      readonly quota_windows?: readonly ProviderQuotaWindow[] | undefined;
+      /** Slow-lane stamp applied at plan time; see `applySlowLane`. */
+      readonly lane?: "slow";
     };
     if (state.account_locked || state.locked)
       return { eligible: false, reason: "locked", candidate };
     if (state.health_status === "disabled")
       return { eligible: false, reason: "disabled", candidate };
-    // Minimum balance: an account whose last fetched remaining balance is at
-    // or below the provider/tenant-wide floor is excluded until the next
-    // quota sweep reports a healthier figure, and failover moves to the next
-    // account. Compared in the unit the account reported — absolute credits
-    // when present, otherwise remaining percent — so one floor value serves
-    // both CodeBuddy-style credit pools and Codex-style percent quotas.
-    // Skipped entirely when the toggle is off or no balance has ever been
-    // fetched in either unit.
-    if (
-      state.credit_limit_enabled !== false &&
-      state.credit_limit !== undefined &&
-      state.credit_limit !== null
-    ) {
-      const credit = state.last_remaining_credit;
-      if (
-        credit !== undefined &&
-        credit !== null &&
-        Number.isFinite(credit) &&
-        credit <= state.credit_limit
-      )
-        return { eligible: false, reason: "credit_floor_reached", candidate };
-      const percent = state.last_remaining_percent;
-      if (
-        (credit === undefined || credit === null) &&
-        percent !== undefined &&
-        percent !== null &&
-        Number.isFinite(percent) &&
-        percent <= state.credit_limit
-      )
-        return { eligible: false, reason: "credit_floor_reached", candidate };
-    }
     if (state.health_status === "model_cooldown")
-      return { eligible: false, reason: "model_cooldown", candidate };
-    if (state.health_status === "credit_floor_reached")
-      return { eligible: false, reason: "credit_floor_reached", candidate };
+      return { eligible: false, reason: "model_cooldown", candidate, ...spreadDeadline(state.cooldown_until) };
     if (state.health_status === "cooldown" && state.cooldown_kind === "hard")
-      return { eligible: false, reason: "cooldown_hard", candidate };
+      return { eligible: false, reason: "cooldown_hard", candidate, ...spreadDeadline(state.cooldown_until) };
+    // The floor is checked here, not after selection: the old minimum-balance
+    // feature computed the number and never consulted it, so an account below
+    // its floor still won the route. An account with no reading is left
+    // eligible — a missing quota fetch is not proof the allowance is gone.
+    if (belowUsageFloor(state))
+      return {
+        eligible: false,
+        reason: "quota_exhausted",
+        candidate,
+        ...spreadDeadline(earliestWindowResetMs(state.quota_windows, Date.now())),
+      };
+    // A slow lane is orthogonal to cooldown, never a member of it: the account
+    // still serves on spare capacity when the request carries the slow usage
+    // limit, so excluding it would park a serving credential. It stays eligible
+    // and only orders behind fresh siblings (see the ordering below).
+    //
+    // Deliberately AFTER the floor gate: orthogonal means it does not add an
+    // exclusion, not that it overrides one. An account with no usable allowance
+    // is not rescued by the lane — the lane is a latency budget against spare
+    // capacity, and an account below its floor has none.
+    if (state.lane === "slow")
+      return { eligible: true, reason: "slow", candidate };
     if (state.health_status === "cooldown")
-      return { eligible: true, reason: "cooldown", candidate };
+      return { eligible: true, reason: "cooldown", candidate, ...spreadDeadline(state.cooldown_until) };
     return { eligible: true, reason: "healthy", candidate };
   }
 
@@ -405,105 +349,6 @@ export class EligibilityEvaluator {
   }
 }
 
-/**
- * In-memory reservation lease store with lazy TTL cleanup. The bounded sweep
- * runs before acquisition so abandoned local metadata cannot grow forever.
- */
-export class ReservationManager {
-  private leases = new Map<string, Reservation>();
-  private lastSweepAt = 0;
-  private static readonly SWEEP_INTERVAL_MS = 30_000;
-
-  private sweepExpired(now: number): void {
-    if (now - this.lastSweepAt < ReservationManager.SWEEP_INTERVAL_MS) return;
-    this.lastSweepAt = now;
-    for (const [leaseId, reservation] of this.leases) {
-      if (reservation.expires_at < now) this.leases.delete(leaseId);
-    }
-  }
-
-  acquire(candidate: RouteCandidate, _revision: RoutingRevision, ttlMs = 30_000): Reservation {
-    const now = Date.now();
-    this.sweepExpired(now);
-    const lease_id = `${candidate.provider_id}:${candidate.model_id}:${now}:${Math.random().toString(16).slice(2)}`;
-    const r: Reservation = {
-      candidate,
-      lease_id,
-      acquired_at: now,
-      expires_at: now + ttlMs,
-    };
-    this.leases.set(lease_id, r);
-    return r;
-  }
-
-  release(lease_id: string): void {
-    this.leases.delete(lease_id);
-  }
-
-  get(lease_id: string): Reservation | undefined {
-    const r = this.leases.get(lease_id);
-    if (!r) return undefined;
-    if (r.expires_at < Date.now()) {
-      this.leases.delete(lease_id);
-      return undefined;
-    }
-    return r;
-  }
-
-  /** Test/diagnostic seam: current lease count without triggering a sweep. */
-  size(): number {
-    return this.leases.size;
-  }
-}
-
-export class RoundRobinState {
-  private idx = 0;
-  private servedByCurrent = 0;
-  next(candidates: readonly RouteCandidate[], rotateCount: number): RouteCandidate | undefined {
-    if (candidates.length === 0) return undefined;
-    const safeCount = Math.max(1, Math.min(1000, Math.trunc(rotateCount)));
-    const c = candidates[this.idx % candidates.length];
-    this.servedByCurrent += 1;
-    if (this.servedByCurrent >= safeCount) {
-      this.idx = (this.idx + 1) % 1000000;
-      this.servedByCurrent = 0;
-    }
-    return c;
-  }
-}
-/**
- * Upper bound on per-key round-robin state. Keys are tenant/provider/model
- * combinations; without a cap, a deployment serving a long tail of unique
- * combinations would retain one entry forever. 1000 is far above the working
- * set of any real catalog, so eviction only ever targets genuinely cold keys.
- */
-const MAX_ROUND_ROBIN_ENTRIES = 1000;
-
-/**
- * Bounded LRU accessor for round-robin state: an existing key is refreshed to
- * the tail (most-recently-used), and inserting past the cap evicts the head
- * (least-recently-used). Keeps the hot routing working set while guaranteeing
- * the map cannot grow without bound.
- */
-function getOrCreateRoundRobin(
-  map: Map<string, RoundRobinState>,
-  key: string,
-): RoundRobinState {
-  const existing = map.get(key);
-  if (existing) {
-    map.delete(key);
-    map.set(key, existing);
-    return existing;
-  }
-  if (map.size >= MAX_ROUND_ROBIN_ENTRIES) {
-    const oldest = map.keys().next().value;
-    if (oldest !== undefined) map.delete(oldest);
-  }
-  const created = new RoundRobinState();
-  map.set(key, created);
-  return created;
-}
-
 export class RoutingEngine {
   private readonly _roundRobinByCombo = new Map<string, RoundRobinState>();
   private readonly _roundRobinByProvider = new Map<string, RoundRobinState>();
@@ -512,6 +357,7 @@ export class RoutingEngine {
 
   constructor(
     private readonly admission: AdmissionController = new InMemoryAdmissionController(),
+    private readonly redis?: RedisClient,
   ) {}
 
   private getRoundRobin(key: string): RoundRobinState {
@@ -532,6 +378,40 @@ export class RoutingEngine {
     // Both controllers hand back a fresh map, so no defensive copy here —
     // this feeds an admin read, not a mutation site.
     return (await this.admission.snapshotAccountInflight?.()) ?? new Map();
+  }
+
+  /**
+   * Which candidates are already at their concurrency ceiling.
+   *
+   * The admission controller already holds these counters and will refuse the
+   * account the moment it is asked; reading them here lets the plan *order*
+   * use the same fact, so the first attempt goes to an account with room
+   * instead of to one that is certain to answer 429.
+   *
+   * A counter read is a snapshot, so it can be a little stale — a slot freed
+   * between here and `admit()` only costs a retry, which is the behavior
+   * today anyway. A candidate with no configured ceiling is never saturated:
+   * admission treats it as unlimited.
+   */
+  private async saturatedCandidates(
+    candidates: readonly RouteCandidate[],
+  ): Promise<ReadonlySet<RouteCandidate>> {
+    const bounded = candidates.filter(
+      (candidate) => typeof candidate.max_inflight === "number" && candidate.max_inflight > 0,
+    );
+    if (bounded.length === 0) return new Set();
+    const snapshot = await this.accountInflightSnapshot().catch(() => new Map<string, number>());
+    if (snapshot.size === 0) return new Set();
+    const saturated = new Set<RouteCandidate>();
+    for (const candidate of bounded) {
+      const limit = candidate.max_inflight;
+      if (limit === undefined) continue;
+      const inflight = snapshot.get(admissionKey(candidate));
+      if (inflight !== undefined && inflight >= limit) {
+        saturated.add(candidate);
+      }
+    }
+    return saturated;
   }
 
   private resolveProviderRouting(
@@ -600,35 +480,41 @@ export class RoutingEngine {
     }
     return result;
   }
-  private searchFallbackCandidates(
+  /**
+   * Stamps each account with its provider's usage floor and the quota reading
+   * the console last fetched, so eligibility can reject an account that has
+   * spent down to the floor. The reading is the live cache, not the route
+   * snapshot: a snapshot rebuilt every few minutes would route on a stale
+   * balance, which is how the old floor let a spent account through.
+   */
+  private async applyUsageFloor(
+    candidates: readonly RouteCandidate[],
     snapshot: RouteSnapshot,
     tenantId: string | null,
-  ): RouteCandidate[] {
-    const ranked = snapshot.candidates
-      .filter(
-        (candidate) =>
-          candidate.service_kind === "websearch" &&
-          (candidate.tenant_id == null || candidate.tenant_id === tenantId),
-      )
-      .sort((left, right) => {
-        const leftRank =
-          SEARCH_PROVIDER_RANK.get(left.provider_id.toLowerCase()) ?? SEARCH_PROVIDER_ORDER.length;
-        const rightRank =
-          SEARCH_PROVIDER_RANK.get(right.provider_id.toLowerCase()) ?? SEARCH_PROVIDER_ORDER.length;
-        return leftRank - rightRank;
-      });
-    const decisions = ranked
-      .map((candidate) => this.eligibility.evaluate(candidate))
-      .filter((decision) => decision.eligible);
-    const ordered = this.applyProviderRouting(
-      [
-        ...decisions.filter((decision) => decision.reason !== "cooldown").map((decision) => decision.candidate),
-        ...decisions.filter((decision) => decision.reason === "cooldown").map((decision) => decision.candidate),
-      ],
-      snapshot,
-      tenantId,
-    );
-    return ordered.map((candidate) => ({ ...candidate, search_route: "fallback" as const }));
+  ): Promise<readonly RouteCandidate[]> {
+    const readings = new Map<string, Promise<readonly ProviderQuotaWindow[]>>();
+    return Promise.all(candidates.map(async (candidate) => {
+      const accountId = candidate.provider_account_id;
+      if (accountId === undefined) return candidate;
+      const setting = this.resolveProviderRouting(snapshot, candidate.provider_id, candidate.tenant_id ?? tenantId);
+      let windows = readings.get(accountId);
+      if (windows === undefined) {
+        windows = getCachedQuotaEntry(
+          quotaLens(candidate.tenant_id ?? tenantId),
+          accountId,
+          this.redis,
+        ).then((cached) => cached?.quota.windows ?? []);
+        readings.set(accountId, windows);
+      }
+      const quotaWindows = await windows;
+      return {
+        ...candidate,
+        ...(setting?.usageFloor == null
+          ? {}
+          : { usage_floor: setting.usageFloor, usage_floor_unit: setting.usageFloorUnit }),
+        quota_windows: quotaWindows,
+      };
+    }));
   }
 
 
@@ -639,10 +525,9 @@ export class RoutingEngine {
     requiredCapabilities?: readonly RequiredCapability[],
     allowCliMappings = false,
     keyId?: string,
-    webSearch = false,
   ): Promise<RoutePlan> {
     const tid = tenantId ?? null;
-    const { resolved, matching, unmatchedMembers, fusion } = this.resolveMatchingCandidates(
+    const { resolved, matching, unmatchedMembers } = this.resolveMatchingCandidates(
       requestedModel,
       snapshot,
       tid,
@@ -652,12 +537,37 @@ export class RoutingEngine {
     // `matching` non-empty but nothing eligible means every account serving
     // this model is currently unusable — NOT a missing model. Distinct from
     // the `matching.length === 0` throw in the resolver, which is a genuine 404.
-    const decisions = matching.map((candidate) => this.eligibility.evaluate(candidate));
+    const gated = await this.applyUsageFloor(matching, snapshot, tid);
+    const laned = applySlowLane(gated);
+    const decisions = laned.map((candidate) => this.eligibility.evaluate(candidate));
     let eligible = decisions.filter((d) => d.eligible).map((d) => d.candidate);
     if (eligible.length === 0) {
-      const hardCooling = decisions.some((d) => d.reason === "cooldown_hard");
-      if (hardCooling) {
-        throw accountsRateLimitedError(requestedModel, resolved.model);
+      // A time-bounded exclusion answers 429, not 503. Both reasons here carry
+      // a deadline the upstream itself stated, so the request is not
+      // "unavailable" — it is "not until the reset", and the client is owed an
+      // answer it can retry against. `model_cooldown` belongs in the same
+      // bucket as `cooldown_hard` for exactly the reason the evaluator's own
+      // comment gives: the upstream said this (account, model) pair is
+      // exhausted until a named reset, so dialing it can only reproduce the
+      // refusal. Answering 503 there told the client the model was down when
+      // every account serving it was merely resting, which is the "503 DOWN
+      // while the model is allowed" report — and 503 invites a client to give
+      // up or fail a health check, where 429 says retry later.
+      const rateLimited = decisions.some(
+        (d) =>
+          d.reason === "cooldown_hard" ||
+          d.reason === "model_cooldown" ||
+          // A usage-floor exclusion whose window states a reset is the same
+          // shape as the two above: the account is resting until a named
+          // instant, not broken. It used to fall through to 503, which told
+          // the client the model was down while every account serving it was
+          // merely waiting for its window to refill — the "503 DOWN while the
+          // model is allowed" report again. Only a floor with *no* stated
+          // reset stays unavailable: there is nothing to retry against yet.
+          (d.reason === "quota_exhausted" && typeof d.cooldown_until === "number"),
+      );
+      if (rateLimited) {
+        throw accountsRateLimitedError(requestedModel, resolved.model, earliestResetMs(decisions));
       }
       // Combo members without any routable candidate never reach the client
       // envelope — but the operator needs them to fix the combo, so they go
@@ -682,17 +592,36 @@ export class RoutingEngine {
     // the gateway "still hit a cooled-down account" instead of answering the
     // client honestly. Answer 429 (rate limited) so the client retries after
     // the reset rather than 503 capacity that is merely resting.
+    // A slow-lane account still serves on spare capacity, so it counts as
+    // servable: an all-slow pool must plan and dial rather than answer 429
+    // while capacity sits idle.
     const healthyCount = decisions.filter(
-      (d) => d.eligible && d.reason !== "cooldown",
+      (d) => d.eligible && (d.reason === "healthy" || d.reason === "slow"),
     ).length;
     if (healthyCount === 0) {
-      throw accountsRateLimitedError(requestedModel, resolved.model);
+      throw accountsRateLimitedError(requestedModel, resolved.model, earliestResetMs(decisions));
     }
     // Cooling accounts are eligible but tried last: a healthy candidate that
     // can serve the request must win, while a deployment whose only account is
     // cooling still routes instead of failing. Sorted on the evaluator's reason
     // so the ordering and the eligibility rule cannot disagree about which
     // candidates are cooling.
+    // Slow-lane accounts are eligible but tried behind fresh siblings, and
+    // ahead of cooling ones: fresh → slow → cooling → saturated. A slow account
+    // serves on spare capacity, so it must be reached when no fresh candidate
+    // remains, but it should not absorb traffic a fresh account could take
+    // without the lane's latency.
+    const slow = new Set(
+      decisions
+        .filter((decision) => decision.eligible && decision.reason === "slow")
+        .map((decision) => decision.candidate),
+    );
+    if (slow.size > 0 && slow.size < eligible.length) {
+      eligible = [
+        ...eligible.filter((candidate) => !slow.has(candidate)),
+        ...eligible.filter((candidate) => slow.has(candidate)),
+      ];
+    }
     const cooling = new Set(
       decisions
         .filter((decision) => decision.eligible && decision.reason === "cooldown")
@@ -704,6 +633,24 @@ export class RoutingEngine {
         ...eligible.filter((candidate) => cooling.has(candidate)),
       ];
     }
+    // Accounts already at their concurrency ceiling go last, for the same
+    // reason cooling ones do. Without this the plan order put a saturated
+    // account first and the first attempt was spent learning it was full —
+    // an admission 429, a retry, and only then the sibling that had room. The
+    // caller paid a round-trip to be told something the gateway already knew
+    // from its own inflight counters.
+    //
+    // Deprioritized, not dropped: when every account is genuinely saturated
+    // the request must still be dialed somewhere and answered 429, rather than
+    // reading as "no account available" (503) for a deployment that is merely
+    // busy.
+    const saturated = await this.saturatedCandidates(eligible);
+    if (saturated.size > 0 && saturated.size < eligible.length) {
+      eligible = [
+        ...eligible.filter((candidate) => !saturated.has(candidate)),
+        ...eligible.filter((candidate) => saturated.has(candidate)),
+      ];
+    }
     // Capability-aware routing: filter against snapshot capability profiles
     // (shared predicate with the planner). Empty here means no candidate
     // supports the variant — the planner catches this code and re-plans a
@@ -712,7 +659,7 @@ export class RoutingEngine {
       eligible = eligible.filter((candidate) =>
         candidateSupportsRequest(candidate, requiredCapabilities),
       );
-      // No fusion and no silent model switch. The requested model cannot serve
+      // No silent model switch. The requested model cannot serve
       // this requirement set, so the planner degrades it in place (media becomes
       // a placeholder, controls are dropped) and re-plans. When nothing
       // degradable remains, the request fails as `capability_unsupported`
@@ -733,18 +680,6 @@ export class RoutingEngine {
         ...eligible.filter((candidate) => cooling.has(candidate)),
       ];
     }
-    if (webSearch) {
-      const searchCandidates = eligible.map((candidate) =>
-        (candidate.service_kind ?? "llm") === "llm" &&
-        candidate.capability_profile.webSearch === true
-          ? { ...candidate, search_route: "native" as const }
-          : candidate,
-      );
-      eligible = [
-        ...searchCandidates,
-        ...this.searchFallbackCandidates(snapshot, tid),
-      ];
-    }
     const chosen = eligible[0]!;
     return {
       revision: snapshot.revision,
@@ -752,7 +687,6 @@ export class RoutingEngine {
       requested_model: requestedModel,
       resolved_model: resolved.model,
       provider_id: chosen.provider_id,
-      ...(fusion === undefined ? {} : { fusion }),
     };
   }
 
@@ -780,7 +714,6 @@ export class RoutingEngine {
      * connection-less members the operator should fix, surfaced on errors
      * instead of failing opaquely on whichever member happened to route. */
     unmatchedMembers: readonly string[];
-    fusion?: { readonly panel: readonly string[]; readonly judge: string };
   } {
     const safeResolve = (name: string) => {
       try {
@@ -836,17 +769,7 @@ export class RoutingEngine {
     const owners = [...new Set(matching.map((candidate) => candidate.provider_id))];
     if (owners.length > 1 && !resolved.model.includes("/") && !combo)
       throw ambiguousModelError(requestedModel, owners);
-    // A fusion combo runs every resolved member as a panel and uses the first
-    // member as the judge. The plan still carries the flattened candidates (so
-    // admission/leases are unchanged), but the proxy handler reads this field
-    // and runs the panel/judge fan-out instead of a single dispatch. A
-    // single-member fusion has nothing to fuse; leave it as a plain plan so it
-    // degrades to a normal dispatch rather than a one-model panel.
-    const fusion =
-      combo?.strategy === "fusion" && modelIds.length > 1
-        ? { panel: [...modelIds], judge: modelIds[0]! }
-        : undefined;
-    return { resolved, combo, matching, unmatchedMembers, ...(fusion === undefined ? {} : { fusion }) };
+    return { resolved, combo, matching, unmatchedMembers };
   }
 
   async reserve(plan: RoutePlan): Promise<Reservation> {
@@ -861,4 +784,3 @@ export class RoutingEngine {
     this.reservations.release(reservation.lease_id);
   }
 }
-

@@ -1,8 +1,8 @@
 // API-key authentication and authorization snapshots: token extraction, hashing, lookup, and admission identity.
 
-import type { CartethyiaDatabase } from "../persistence/postgres";
-import { DrizzleApiKeyStore } from "../persistence/api-key-store";
-import { GatewayError } from "../transport/gateway-error";
+import type { CartethyiaDatabase } from "../persistence/db-handle";
+import { DrizzleApiKeyStore } from "../persistence/stores/api-key-store";
+import { GatewayError } from "../protocol/gateway-error";
 import { hashSecret } from "./crypto";
 import type { AccessScope } from "./access-control";
 import type { ApiKeyModelAccessMode } from "../persistence/schema";
@@ -24,21 +24,64 @@ import type { ApiKeyModelAccessMode } from "../persistence/schema";
  */
 const AUTH_CACHE_TTL_MS = 3_000;
 const AUTH_CACHE_MAX_ENTRIES = 10_000;
+/** Negative-result TTL: unknown/revoked tokens miss the DB at most this often. */
+const AUTH_NEGATIVE_CACHE_TTL_MS = 1_500;
 
 interface AuthCacheEntry {
   readonly at: number;
   readonly value: ResolvedApiKey;
+  /** Owner of `value`; the reverse-index key this entry is registered under. */
+  readonly keyId: string;
 }
 
 const authCache = new Map<string, AuthCacheEntry>();
 /** Reverse index: keyId → set of token hashes that resolved to it. */
 const authCacheByKeyId = new Map<string, Set<string>>();
+/** Unknown/revoked token HMACs with their miss time; cleared on any key mutation. */
+const authNegativeCache = new Map<string, number>();
+/**
+ * Negative-result fast path. Unknown/revoked tokens previously hit the DB on
+ * every request; now a repeat miss within 1.5 s costs one HMAC + one map
+ * lookup and no query. Keyed by the full HMAC: a cheap pre-hash would let a
+ * crafted collision reject someone else's valid key, while the HMAC key can
+ * only match its own token. Bound below beside the positive cache.
+ */
 
+/**
+ * Drops the oldest entries until `authCache` is within budget. Every removal
+ * must also unregister the hash from `authCacheByKeyId`, otherwise the reverse
+ * index keeps referencing hashes that no longer exist and grows without bound
+ * (one dead hash per eviction, forever).
+ */
 function evictAuthCacheOldest(): void {
   while (authCache.size > AUTH_CACHE_MAX_ENTRIES) {
     const oldest = authCache.keys().next().value;
     if (oldest === undefined) return;
+    const entry = authCache.get(oldest);
     authCache.delete(oldest);
+    if (entry === undefined) continue;
+    const hashes = authCacheByKeyId.get(entry.keyId);
+    if (hashes === undefined) continue;
+    hashes.delete(oldest);
+    if (hashes.size === 0) authCacheByKeyId.delete(entry.keyId);
+  }
+}
+
+/** Registers a resolved hash in both the cache and the keyId reverse index. */
+function indexAuthCache(hash: string, entry: AuthCacheEntry): void {
+  authCache.set(hash, entry);
+  authNegativeCache.delete(hash);
+  const hashes = authCacheByKeyId.get(entry.keyId) ?? new Set<string>();
+  hashes.add(hash);
+  authCacheByKeyId.set(entry.keyId, hashes);
+}
+
+/** Bounds the negative cache; same oldest-first rule as the positive cache. */
+function evictAuthNegativeOldest(): void {
+  while (authNegativeCache.size > AUTH_CACHE_MAX_ENTRIES) {
+    const oldest = authNegativeCache.keys().next().value;
+    if (oldest === undefined) return;
+    authNegativeCache.delete(oldest);
   }
 }
 
@@ -48,6 +91,9 @@ function evictAuthCacheOldest(): void {
  * mutation that changes a key's scopes, limits, or revoked state.
  */
 export function invalidateApiKeyCache(keyId?: string): void {
+  // A mutation may mint the previously-unknown token, so negative entries
+  // must go with the positive ones.
+  authNegativeCache.clear();
   if (keyId === undefined) {
     authCache.clear();
     authCacheByKeyId.clear();
@@ -219,12 +265,12 @@ export function requestToken(headers: Headers | Record<string, string>): string 
     // *different* credentials stay a conflict — accepting whichever came first
     // would silently decide the request's identity.
     if (bearerMatch?.[1] === apiKey) return apiKey;
-    throw new GatewayError("invalid_request", 400, "conflicting credential headers");
+    throw new GatewayError("invalid_request", 400, "The request sends two different credentials. Send exactly one key, either as Authorization: Bearer <key> or as the api-key header.");
   }
   if (hasApiKey) return apiKey;
   const token = bearerMatch?.[1];
   if (token === undefined)
-    throw new GatewayError("invalid_request", 401, "missing or malformed Authorization header");
+    throw new GatewayError("invalid_request", 401, "The request carries no usable credential. Send the key as: Authorization: Bearer <key>.");
   return token;
 }
 
@@ -237,12 +283,22 @@ export async function resolveApiKeyAuthorization(
   db: CartethyiaDatabase,
   token: string,
 ): Promise<ResolvedApiKey | undefined> {
+  const now = Date.now();
   const hash = hashSecret(token);
+  const negativeAt = authNegativeCache.get(hash);
+  if (negativeAt !== undefined) {
+    if (now - negativeAt < AUTH_NEGATIVE_CACHE_TTL_MS) return undefined;
+    authNegativeCache.delete(hash);
+  }
   const cached = authCache.get(hash);
-  if (cached && Date.now() - cached.at < AUTH_CACHE_TTL_MS) return cached.value;
+  if (cached && now - cached.at < AUTH_CACHE_TTL_MS) return cached.value;
   const store = new DrizzleApiKeyStore(db);
   const row = await store.findActiveByHash(hash);
-  if (!row) return undefined;
+  if (!row) {
+    authNegativeCache.set(hash, now);
+    evictAuthNegativeOldest();
+    return undefined;
+  }
   // A child (shared) key consumes against its parent's quota, not just its
   // own: the parent's budget is the operator's global cap across all
   // recipients. Without this the parent's lifetime budget never moves no
@@ -291,10 +347,7 @@ export async function resolveApiKeyAuthorization(
     ...(policy.modelPrefix ? { modelPrefix: policy.modelPrefix } : {}),
     ...(parent?.keyMode === "share" ? { cliMappingOwnerId: parent.id } : {}),
   };
-  authCache.set(hash, { at: Date.now(), value });
-  const hashes = authCacheByKeyId.get(value.id) ?? new Set<string>();
-  hashes.add(hash);
-  authCacheByKeyId.set(value.id, hashes);
+  indexAuthCache(hash, { at: Date.now(), value, keyId: value.id });
   evictAuthCacheOldest();
   return value;
 }

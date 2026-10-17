@@ -38,8 +38,8 @@ import {
   usageToMessagesWire,
   usageToResponsesWire,
   type OpenAiUsage,
-} from "../../src/providers/usage";
-import type { UsageRecord } from "../../src/transport/canonical-model";
+} from "../../src/providers/provider-usage";
+import type { UsageRecord } from "../../src/protocol/canonical-model";
 
 describe("normalizeUsage: the OpenAI shape", () => {
   test("reads prompt and completion tokens", () => {
@@ -114,6 +114,18 @@ describe("normalizeUsage: the Anthropic shape", () => {
     const usage = normalizeUsage({ input_tokens: 10, cache_read_input_tokens: 90 });
     expect(usage.input_tokens).toBe(100);
     expect(usage.cache_write_tokens).toBe("unavailable");
+  });
+
+  test("an inclusive total is not inflated when a bridge reuses the Anthropic cache field", () => {
+    const usage = normalizeUsage({
+      input_tokens: 178_479,
+      output_tokens: 142,
+      total_tokens: 178_621,
+      cache_read_input_tokens: 178_304,
+    });
+    expect(usage.input_tokens).toBe(178_479);
+    expect(usage.cached_input_tokens).toBe(178_304);
+    expect(usage.uncached_input_tokens).toBe(175);
   });
 
   test("a write-only report records the write but leaves the total alone", () => {
@@ -547,3 +559,4 @@ describe("the round trip through a wire builder keeps the canonical totals", () 
     expect(messagesTotal).toBe(130);
   });
 });
+

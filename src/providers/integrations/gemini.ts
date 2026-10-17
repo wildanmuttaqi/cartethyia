@@ -1,17 +1,19 @@
 // Factory-blocked (Phase C4): Gemini native generateContent RPC envelope
 // (per-model `:generateContent`/`:streamGenerateContent` paths, `contents`/
 // `candidates` shapes, `x-goog-api-key`) — non-OpenAI wire; stays bespoke.
-import { GatewayError } from "../../transport/gateway-error";
+import { GatewayError } from "../../protocol/gateway-error";
 import { mapUpstreamHttpError } from "../../transport/failure-policy";
-import type { CanonicalEvent, CanonicalRequest, CanonicalStopReason } from "../../transport/canonical-model";
-import { decodeSseEvents } from "../../transport/streaming";
-import { usageFromProvider } from "../usage";
-import { readCredentialSecret, type ProviderDispatchTarget, type ModelDefinition, type ProviderAdapter, type ProviderDispatchContext, type WebSearchOutcome, type WebSearchResult } from "../provider-registry";
+import type { CanonicalEvent, CanonicalRequest, CanonicalStopReason } from "../../protocol/canonical-model";
+import { decodeSseEvents } from "../../protocol/sse-decoder";
+import { usageFromProvider } from "../provider-usage";
+import { readCredentialSecret, type ImageGenerationOutcome, type ProviderDispatchTarget, type ProviderAdapter, type ProviderDispatchContext, type WebSearchOutcome, type WebSearchResult } from "../provider-contracts";
+import type { ModelDefinition } from "../provider-model-definition";
 import { fetchOpenAICompatibleModels } from "../discovery/openai-model-discovery";
-import { isRecord } from "../../protocol/primitives";
+import { isRecord } from "../../protocol/codecs";
 import { providerBaseUrl } from "../provider-metadata";
 import { abortGatewayError, createUpstreamDeadlineLifecycle } from "../operations/upstream-deadline";
 import { geminiModelUrl, buildGeminiPayload } from "../../protocol/request/gemini";
+import { geminiInlineImages, imageCreatedSeconds, imagePrompt } from "../../protocol/image-generation";
 import {
   decodeGeminiStreamEvent,
   geminiCandidate,
@@ -28,23 +30,86 @@ export const GEMINI_SEARCH_MODEL = "gemini-2.5-flash" as const;
 
 
 
-import { defineModel } from "../model-definition";
+import { defineModel } from "../provider-model-definition";
 
 export const GEMINI_MODELS: readonly ModelDefinition[] = [
-  "gemini-3.1-pro-preview",
-  "gemini-3.1-flash-lite-preview",
-  "gemini-3-flash-preview",
-  "gemini-2.5-pro",
+  ...[
+    "gemini-3.1-pro-preview",
+    "gemini-3.1-flash-lite-preview",
+    "gemini-3-flash-preview",
+    "gemini-2.5-pro",
+    "gemini-2.5-flash",
+    "gemini-2.0-flash",
+  ].map((id) =>
+    defineModel({
+      id,
+      endpoint: "/v1beta/models",
+      ctx: 1_000_000,
+      out: 32768,
+      vision: true,
+      reasoning: true,
+    }),
+  ),
+  // Image-generation models answer `:generateContent` with `inlineData`, not
+  // the chat text path.
+  ...[
+    "gemini-3.1-flash-image-preview",
+    "gemini-3-pro-image-preview",
+    "gemini-2.5-flash-image",
+  ].map((id) =>
+    defineModel({
+      id,
+      endpoint: "/v1beta/models",
+      ctx: 1_000_000,
+      out: 32_768,
+      vision: true,
+      serviceKind: "imageGeneration",
+      output: ["image"],
+      toolCall: false,
+    }),
+  ),
+];
+
+/**
+ * Gemini's Google Search grounding rows, served by `POST /v1/search`.
+ *
+ * The chat catalog above already declares `gemini-2.5-flash` as an ordinary
+ * `llm` row, and that is what `GEMINI_SEARCH_MODEL` falls back to — but a
+ * `serviceKind: "llm"` row is not a search route, so `POST /v1/search` had no
+ * resolvable target and the Search tab listed nothing for Gemini despite the
+ * provider serving hosted grounding. These rows declare the same models on the
+ * `websearch` service kind, which is the dimension the search route resolves
+ * against. The chat rows stay: the same model serves both surfaces, and one
+ * model id cannot carry two service kinds.
+ *
+ * `gemini-2.5-flash` is the documented default and the one the adapter falls
+ * back to when a caller sends no model. `gemini-3-flash` is the newer generation
+ * on the same grounding support.
+ *
+ * The endpoint differs from the chat row's `/v1beta/models` on purpose: the
+ * unique key on a catalog row is `(provider, model, endpoint)`, so a search
+ * row sharing the chat row's endpoint would upsert over it and lose the
+ * service kind — the provider would keep one `llm` row and the Search tab
+ * would list nothing. Grounding posts to the per-model `:generateContent`
+ * path, which is the route it actually takes.
+ */
+export const GEMINI_SEARCH_MODELS: readonly ModelDefinition[] = [
   "gemini-2.5-flash",
-  "gemini-2.0-flash",
+  "gemini-3-flash-preview",
 ].map((id) =>
   defineModel({
     id,
-    endpoint: "/v1beta/models",
+    providerId: GEMINI_PROVIDER_ID,
+    serviceKind: "websearch",
+    wireFamily: "chat",
+    endpoint: `/v1beta/models/${id}:generateContent`,
     ctx: 1_000_000,
-    out: 32768,
+    out: 32_768,
     vision: true,
     reasoning: true,
+    // Grounding is a hosted Google Search tool, not a function the gateway
+    // declares on the caller's behalf, so the row exposes no tool calls.
+    toolCall: false,
   }),
 );
 
@@ -276,10 +341,12 @@ class GeminiAdapter implements ProviderAdapter {
         ? Math.min(Math.max(1, Math.floor(rawMax)), 50)
         : 10;
     const apiKey = readCredentialSecret(context.credential, "Gemini API key is required");
+    const requested = typeof body.model === "string" ? body.model.trim() : "";
+    const model = requested.length > 0 && requested !== "gemini" ? requested : GEMINI_SEARCH_MODEL;
     const outboundFetch = context.outbound_fetch ?? this.fetchFn;
     let response: Response;
     try {
-      response = await outboundFetch(geminiModelUrl(this.baseUrl, GEMINI_SEARCH_MODEL, "generateContent"), {
+      response = await outboundFetch(geminiModelUrl(this.baseUrl, model, "generateContent"), {
         method: "POST",
         headers: {
           "content-type": "application/json",
@@ -310,6 +377,61 @@ class GeminiAdapter implements ProviderAdapter {
     if (results.length === 0)
       throw new GatewayError("platform_unavailable", 502, "Gemini search returned no grounded results");
     return { results, total_results: results.length };
+  }
+
+  async generateImage(
+    body: Record<string, unknown>,
+    candidate: ProviderDispatchTarget,
+    context: ProviderDispatchContext,
+  ): Promise<ImageGenerationOutcome> {
+    const prompt = imagePrompt(body);
+    const model = candidate.model_id.length > 0 ? candidate.model_id : typeof body.model === "string" ? body.model : "";
+    if (model.length === 0) throw new GatewayError("invalid_request", 400, "model is required");
+    const apiKey = readCredentialSecret(context.credential, "Gemini API key is required");
+    const outboundFetch = context.outbound_fetch ?? this.fetchFn;
+    const lifecycle = createUpstreamDeadlineLifecycle(context);
+    let response: Response;
+    try {
+      // the reference client's Gemini image client asks for IMAGE only. TEXT+IMAGE lets
+      // the model answer in prose and skip the inline image part.
+      response = await outboundFetch(geminiModelUrl(this.baseUrl, model, "generateContent"), {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          accept: "application/json",
+          "x-goog-api-key": apiKey,
+        },
+        body: JSON.stringify({
+          contents: [{ role: "user", parts: [{ text: prompt }] }],
+          generationConfig: { responseModalities: ["IMAGE"] },
+        }),
+        signal: lifecycle.signal,
+      });
+    } catch (error: unknown) {
+      const abortError = abortGatewayError(lifecycle, error, context.abort_signal);
+      if (abortError) throw abortError;
+      throw new GatewayError(
+        "platform_unavailable",
+        502,
+        `Gemini image generation unreachable: ${error instanceof Error ? error.message : String(error)}`,
+        {},
+        "upstream",
+      );
+    } finally {
+      lifecycle.release();
+    }
+    if (!response.ok) throw await mapUpstreamHttpError(response, "gemini");
+    let data: unknown;
+    try {
+      data = await response.json();
+    } catch {
+      throw new GatewayError("platform_unavailable", 502, "Gemini image generation returned invalid JSON", {}, "upstream");
+    }
+    const images = geminiInlineImages(data);
+    if (images.length === 0) {
+      throw new GatewayError("platform_unavailable", 502, "Gemini image generation returned no image", {}, "upstream");
+    }
+    return { created: imageCreatedSeconds(), data: images };
   }
 
 }

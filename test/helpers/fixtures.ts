@@ -13,7 +13,7 @@
  */
 import { randomUUID } from "node:crypto";
 import type { PoolClient } from "pg";
-import { getTestPool, createRunId, withRollback } from "./database";
+import { getTestPool, createRunId } from "./database";
 import { encryptCredential, hashSecret } from "../../src/security/crypto";
 import { TENANT_KEY_SCOPES } from "../../src/security/access-control";
 import { invalidateApiKeyCache } from "../../src/security/api-key-auth";
@@ -192,6 +192,8 @@ export interface ApiKeyFixtureOptions {
   readonly keyMode?: string;
   readonly parentKeyId?: string | null;
   readonly issuedClientIp?: string | null;
+  /** Marks the row as the tenant's mandatory gateway key. */
+  readonly isDefault?: boolean;
 }
 
 export interface ApiKeyFixture {
@@ -218,8 +220,8 @@ export async function createApiKey(
        (tenant_id, key_hash, key_mode, parent_key_id, issued_client_ip, label, scopes,
         requests_per_minute, daily_token_limit, monthly_token_limit, lifetime_token_budget,
         max_concurrent_requests, model_access_mode, model_list, client_router_denylist,
-        revoked_at)
-     values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
+        revoked_at, is_default)
+     values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
      returning id`,
     [
       options.tenantId,
@@ -240,6 +242,7 @@ export async function createApiKey(
         ? null
         : JSON.stringify(options.clientRouterDenylist),
       options.revokedAt ?? null,
+      options.isDefault ?? false,
     ],
   );
   const id = result.rows[0]!.id;
@@ -456,11 +459,10 @@ export async function createWorld(options: CreateWorldOptions = {}): Promise<Gat
 export async function readTelemetry(
   tenantId: string,
 ): Promise<readonly Record<string, unknown>[]> {
-  return withRollback(async (client) => {
-    const result = await client.query(
-      "select * from telemetry_events where tenant_id = $1 order by created_at desc",
-      [tenantId],
-    );
-    return result.rows;
-  });
+  // Per-request events are written to the file log, not the table.
+  const { readTelemetryEvents } = await import("../../src/observability/event-log");
+  const events = await readTelemetryEvents();
+  return events
+    .filter((event) => event.tenantId === tenantId)
+    .map((event) => ({ ...event }));
 }

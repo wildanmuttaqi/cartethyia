@@ -2,26 +2,27 @@
 
 `dashboard/` is the React/Vite client for the landing page, authenticated
 `/console` surface, and public `/share/:token` enrollment app. One `index.html`
-dispatches by pathname. Every app loads the same `src/styles/base.css`
-(Tailwind, theme tokens, resets, and shared UI primitives) followed by one
-direct, app-specific extension import: `console.css`, `landing.css`, or
-`share.css`. There is no CSS barrel or duplicate global theme source.
-Console-only shell and route styles stay in `console.css`; Landing's dark
-story and manual chapter navigation stay in `landing.css`; Share's public HUD
-stays in `share.css`, without a decorative background and with the same
-`console-theme` preference as Console. Landing's GitHub badge sits immediately
+dispatches by pathname. Every app loads the same stylesheets: `src/styles/base.css`
+(Tailwind import, theme tokens, reset and shared element defaults) plus `src/styles/app.css`
+(the shell frame and the rules a utility cannot express). There are no per-app
+stylesheets and no CSS barrel; a page styles through the one dialect,
+**token → utility → primitive**, so a change in `src/styles/tokens.css` restyles
+every surface. Landing's dark story, Share's public HUD (same `console-theme`
+preference as Console) with document-level backdrop art, and Console's shell are
+composed from `components/ui/` atoms, `components/patterns/` blocks, and Tailwind
+utilities. Landing's GitHub badge sits immediately
 before All view and links the repository with live star and fork counts; the
 badge images come from external hosts admitted only under `img-src`; share-popup
 images are HTTPS-only. `connect-src` remains same-origin, so the dashboard cannot
 call arbitrary third-party APIs. Chapter auto-scroll is disabled.
-- Public share links may include an owner-configured donation or information popup, click-opened from the Base URL card. `share.css` provides the responsive dialog layout for desktop and mobile.
+- Public share links may include an owner-configured donation or information popup, click-opened from the Base URL card; its responsive dialog layout is utilities, not a stylesheet.
 Production serves the built files from `dist/dashboard`.
 
 ## Verification
 
 `src/` is production browser code only. `bun run dashboard:typecheck` typechecks
-it (and the root `bun run typecheck` covers the backend); the repository does not
-currently carry a test suite.
+it (and the root `bun run typecheck` covers the backend). Dashboard suites live
+in `dashboard/test/` and run with `bun run dashboard:test`.
 
 ## Route map
 
@@ -39,13 +40,14 @@ chunks:
 | `/combos` | `Combos` | `console/routing/model` |
 | `/quota` | `features/quota/QuotaPage` | `console/quota` |
 | `/proxy` | `Proxy` | `network/pool` and routing |
-| `/model-lab` | `Studio` | `console/domains/studio` |
+| `/model-lab` | `Studio` | `console/studio` |
 | `/cli-tools`, `/cli-tools/:toolId` | `CliTools`, `CliToolDetail` | `console/cli-tools` |
 | `/console-log` | `features/logs/ConsoleLogPage` | `console/observability` and SSE |
+| `/customization` | `features/customization/CustomizationPage` | browser only — `localStorage` settings and an IndexedDB background blob, no backend |
 | `/settings` | `Settings` | `console/settings` |
-| Overview `API Credentials` row → share | `ShareManagementDialog` | `console/domains/api-keys` and `console/share` |
-| Overview `API Credentials` header → `Banned Users` (platform admin only) | `ModelBansDialog` | `console/domains/model-abuse` |
-| Overview `API Credentials` create / rotate / share-regenerate | `ApiKeySecretDialog` | `console/domains/api-keys` (one-time secret reveal) |
+| Overview `API Credentials` row → share | `ShareManagementDialog` | `console/api-keys` and `console/share` |
+| Overview `API Credentials` header → `Banned Users` (platform admin only) | `ModelBansDialog` | `console/admin/model-abuse` |
+| Overview `API Credentials` create / rotate / share-regenerate | `ApiKeySecretDialog` | `console/api-keys` (one-time secret reveal) |
 | `/share/:token` (public root route) | `apps/share/page.tsx` | public key enrollment (`/data`, `/issue`) and personal handoff (`/handoff`) via `src/console/share/share-router.ts` |
 Landing's Console links point to `/console`, not `/console/login`: that
 protected entry checks the same-origin session cookie and only routes to Login

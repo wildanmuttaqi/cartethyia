@@ -1,23 +1,27 @@
 // Provider credentials: decrypts stored account rows into dispatchable ResolvedCredentials.
 import { eq } from "drizzle-orm";
 
-import type { CartethyiaDatabase } from "../../persistence/postgres";
+import type { CartethyiaDatabase } from "../../persistence/db-handle";
 import { providerAccounts, providerOauthStates } from "../../persistence/schema";
 import { decryptCredentialToString } from "../../security/crypto";
-import { GatewayError } from "../../transport/gateway-error";
+import { GatewayError } from "../../protocol/gateway-error";
 import type { OAuthRefreshService, OAuthTokenRefresher } from "../authentication/oauth-refresh-service";
-import { CredentialResolver, parseProviderId, type CredentialAlternative, type CredentialKind } from "../provider-registry";
-import type { ResolvedCredential } from "../provider-registry";
+import { CredentialResolver, type CredentialAlternative } from "../provider-credential-resolver";
+import { parseProviderId, type CredentialKind } from "../provider-contracts";
+import type { ResolvedCredential } from "../provider-contracts";
 import { record } from "../authentication/oauth-flow-store";
 import { refreshLeadMs } from "./oauth-refresh-lead";
 
 // ── Credential cache ─────────────────────────────────────────────────────────
 /**
- * TTL-based cache for `resolveCredentialForAccount`, keyed by accountId.
- * Avoids a Postgres SELECT + AES-GCM decrypt on every attempt. The TTL is
- * short enough that credential rotation is picked up almost immediately;
- * `invalidateCredentialCache` provides explicit invalidation for the
- * credential-rotation mutation points.
+ * TTL-based cache for `resolveCredentialForAccount`, keyed by
+ * `providerId:accountId`. The provider must be part of the key: an accountId
+ * reused across providers (e.g. a routing search candidate sharing the
+ * selected route's account id) would otherwise resolve to the other
+ * provider's credential. Avoids a Postgres SELECT + AES-GCM decrypt on every
+ * attempt. The TTL is short enough that credential rotation is picked up
+ * almost immediately; `invalidateCredentialCache` provides explicit
+ * invalidation for the credential-rotation mutation points.
  */
 const CRED_CACHE_TTL_MS = 5_000;
 const CRED_CACHE_MAX_ENTRIES = 2_000;
@@ -28,6 +32,18 @@ interface CredCacheEntry {
 }
 
 const credCache = new Map<string, CredCacheEntry>();
+
+/**
+ * Cache key combining the provider identity with the account id. The provider
+ * must participate: a routing candidate can reuse another provider's account
+ * id (e.g. a combo member borrowing a sibling's account), and an
+ * accountId-only key would hand back the other provider's credential.
+ * The separator cannot appear in a provider id (lowercase slug grammar), so
+ * distinct pairs never collide.
+ */
+function credCacheKey(providerId: string, accountId: string): string {
+  return `${providerId}:${accountId}`;
+}
 
 function evictCredCacheOldest(): void {
   while (credCache.size > CRED_CACHE_MAX_ENTRIES) {
@@ -40,13 +56,18 @@ function evictCredCacheOldest(): void {
 /**
  * Invalidates one account's cached credential (or the entire cache).
  * Call after credential rotation, account deletion, or account disable.
+ * Account ids are globally unique, so a suffix match removes every entry
+ * for that account regardless of which provider resolved it.
  */
 export function invalidateCredentialCache(accountId?: string): void {
   if (accountId === undefined) {
     credCache.clear();
     return;
   }
-  credCache.delete(accountId);
+  const suffix = `:${accountId}`;
+  for (const key of credCache.keys()) {
+    if (key.endsWith(suffix)) credCache.delete(key);
+  }
 }
 
 const resolver = new CredentialResolver();
@@ -137,7 +158,7 @@ export async function resolveCredentialForAccount(
   // Don't cache OAuth credentials whose token is due for refresh soon —
   // the cached value would contain a soon-to-expire secret.
   const now = Date.now();
-  const cached = credCache.get(accountId);
+  const cached = credCache.get(credCacheKey(providerId, accountId));
   if (cached && now - cached.at < CRED_CACHE_TTL_MS) {
     const kind = (cached.value as { credential_kind?: string }).credential_kind;
     if (kind !== "oauth") return cached.value;
@@ -146,7 +167,7 @@ export async function resolveCredentialForAccount(
   const parsedProviderId = parseProviderId(providerId);
   const account = await loadAccountWithFreshness(db, accountId);
   if (!account) {
-    throw new GatewayError("admission_unavailable", 503, "provider account no longer exists", {
+    throw new GatewayError("admission_unavailable", 503, "This provider account no longer exists, so its credential cannot be read. Re-select the account, or point the route at a live one.", {
       provider_id: providerId,
       account_id: accountId,
     });
@@ -191,7 +212,7 @@ export async function resolveCredentialForAccount(
   const isOAuth = row.credentialKind === "oauth";
   const safeToCache = !isOAuth || (dueAt !== undefined && dueAt > now + CRED_CACHE_TTL_MS);
   if (safeToCache) {
-    credCache.set(accountId, { at: now, value });
+    credCache.set(credCacheKey(providerId, accountId), { at: now, value });
     evictCredCacheOldest();
   }
   return value;
@@ -216,7 +237,7 @@ export async function resolveAccountCredentialsForExport(
 ): Promise<{ readonly accessToken: string; readonly refreshToken?: string }> {
   let account = await loadAccountWithFreshness(db, accountId);
   if (!account) {
-    throw new GatewayError("admission_unavailable", 503, "provider account no longer exists", {
+    throw new GatewayError("admission_unavailable", 503, "This provider account no longer exists, so its credential cannot be read. Re-select the account, or point the route at a live one.", {
       provider_id: providerId,
       account_id: accountId,
     });
@@ -233,7 +254,7 @@ export async function resolveAccountCredentialsForExport(
       await oauth.refreshService.ensureFreshAccessToken(accountId, refresher);
       account = await loadAccountWithFreshness(db, accountId);
       if (!account) {
-        throw new GatewayError("admission_unavailable", 503, "provider account no longer exists", {
+        throw new GatewayError("admission_unavailable", 503, "This provider account no longer exists, so its credential cannot be read. Re-select the account, or point the route at a live one.", {
           provider_id: providerId,
           account_id: accountId,
         });

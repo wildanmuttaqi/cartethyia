@@ -1,18 +1,24 @@
 // Account health: error classification, failure/success recording, recovery and cooldown sweeps.
-import { and, desc, eq, inArray, isNotNull, lte, sql } from "drizzle-orm";
-import type { CartethyiaDatabase } from "../../persistence/postgres";
-import { isRecord } from "../../protocol/primitives";
+import { and, desc, eq, inArray, isNotNull, lte, or, sql } from "drizzle-orm";
+import { affectedRows, pruneExpiredCooldowns } from "../../persistence/dialect";
+import type { CartethyiaDatabase } from "../../persistence/db-handle";
+import { isRecord } from "../../protocol/codecs";
+import { GatewayError } from "../../protocol/gateway-error";
 import { BUDDY_PROVIDER_IDS } from "../provider-metadata";
 import { healthEvents, providerAccounts } from "../../persistence/schema";
 
 import { parseProviderResetDuration, parseUpstreamBackoff } from "../../transport/failure-policy";
 import {
+  resolveAccountAuthRejectedCooldownMs,
+  resolveAccountCooldownEscalationMaxMs,
+  resolveAccountDisabledRecoveryMs,
   resolveAccountModelCapacityCooldownMs,
+  resolveAccountPolicyBlockCooldownMs,
   resolveAccountQuotaCooldownMs,
   resolveAccountRateLimitCooldownMs,
   resolveAccountTransientCooldownMs,
   resolveAccountUnclassifiedCooldownMs,
-} from "../../config";
+} from "../../config/cooldowns";
 // ===== health/constants.ts =====
 /**
  * Account status is authoritative for routing: `disabled` is a hard exclusion
@@ -23,7 +29,7 @@ import {
  *
  * Every delay below is a *fallback*: an upstream `Retry-After`/reset header or
  * a duration stated in the provider message always wins. They are read through
- * `src/config.ts` so an operator can tune the health machine without a code
+ * `src/config/cooldowns.ts` so an operator can tune the health machine without a code
  * change (`CARTETHYIA_ACCOUNT_*_COOLDOWN_MS`).
  */
 const DEFAULT_RATE_LIMIT_COOLDOWN_MS = resolveAccountRateLimitCooldownMs;
@@ -33,6 +39,12 @@ const DEFAULT_RATE_LIMIT_COOLDOWN_MS = resolveAccountRateLimitCooldownMs;
 const DEFAULT_QUOTA_COOLDOWN_MS = resolveAccountQuotaCooldownMs;
 const MODEL_CAPACITY_COOLDOWN_MS = resolveAccountModelCapacityCooldownMs;
 const TRANSIENT_ERROR_COOLDOWN_MS = resolveAccountTransientCooldownMs;
+/**
+ * Accounts one cooldown-recovery pass brings back. The sweep ticks every 30s,
+ * so a larger backlog drains over successive passes rather than one statement
+ * covering every expired row.
+ */
+const COOLDOWN_RECOVERY_BATCH = 500;
 /**
  * Backoff for a failure no rule matched. Short on purpose: an unclassified
  * error is more likely a new upstream shape than a broken account, so the
@@ -46,26 +58,88 @@ const UNCLASSIFIED_COOLDOWN_MS = resolveAccountUnclassifiedCooldownMs;
  */
 const GROK_QUOTA_COOLDOWN_MS = 24 * 60 * 60 * 1000;
 /**
- * The buddy family (CodeBuddy `cb`/`cbcn`, WorkBuddy) answers a content-policy
- * rejection with HTTP 403 code `11140` ("request illegal" / "did not pass the
- * safety review"). Unlike a normal one-off content filter, the account stays
- * blocked for *every* subsequent invocation until the upstream cools off, so
- * the account is parked for a long cooldown instead of being left in rotation
- * to fail every request. It is a cooldown, not `disabled`: the credential is
- * valid and the block clears on its own, so an operator does not have to
- * re-enable it by hand.
+ * The buddy family's policy/channel block (`11140`, `11128`) is a *base* backoff,
+ * not a flat penalty — see {@link resolveAccountPolicyBlockCooldownMs}. It used
+ * to be two constants, 24h for the content block and 6h for the channel one,
+ * both applied on the first observation. That was wrong in the direction that
+ * costs most: `11140` is also what a wrong desktop `User-Agent` brand answers
+ * (`workbuddy/shared.ts`), so after we fixed a header regression every buddy
+ * account stayed dead for up to a further day, and one prompt that failed a
+ * safety review cost a whole account a day. As a base it escalates through the
+ * consecutive-failure ladder, which tells the two causes apart by what they do
+ * next — a genuinely blocked account is refused again immediately and parks
+ * itself within minutes.
  */
-const POLICY_BLOCK_COOLDOWN_MS = 24 * 60 * 60 * 1000;
 /**
- * The buddy family also answers with HTTP 400 code `11128` ("Illegal API
- * invocation from an unapproved channel") when it rejects the calling channel
- * rather than the content. Like the policy block it is account-wide and
- * repeats on every invocation until the upstream lifts it, so the account is
- * parked the same way. Shorter than the policy block: a channel rejection can
- * follow a transient upstream rule change, while a content-policy block
- * follows a request the account itself made.
+ * Backoff for a model the upstream says does not exist for this account
+ * (Cursor answers Connect `not_found` for a model the credential's plan does
+ * not reach). Long, because the verdict is a property of the plan and will not
+ * change on the next request — but bounded, so a plan upgrade is picked up
+ * without an operator clearing it by hand.
  */
-const CHANNEL_BLOCK_COOLDOWN_MS = 6 * 60 * 60 * 1000;
+const MODEL_UNREACHABLE_COOLDOWN_MS = 6 * 60 * 60 * 1000;
+/**
+ * Backoff for a model the upstream does not serve at all (buddy family
+ * business code `11102` — `service info not found` — or a `model ... not
+ * found/supported` message). Mirrors the reference gateways'
+ * `MODEL_SITE_BLOCK_S` → `MODEL_SITE_BLOCK_MAX_S`.
+ *
+ * Escalating rather than flat: the pair is re-dialled after the first window
+ * and answers the same thing, so a flat 6h let a permanently unsupported model
+ * consume a request every six hours forever. The ladder tops out at a day,
+ * which is long enough to stop the redial and short enough that a backend that
+ * starts serving the model is picked up without an operator clearing it.
+ *
+ * This is the one place the references' *strict* behaviour is adopted as a
+ * backoff rather than as a 400: nothing currently succeeds through it, so no
+ * client is broken by it.
+ */
+const UNSUPPORTED_MODEL_COOLDOWN_MS = 6 * 60 * 60 * 1000;
+const UNSUPPORTED_MODEL_COOLDOWN_MAX_MS = 24 * 60 * 60 * 1000;
+/** How many doublings an unsupported-model cooldown may take before the cap. */
+const UNSUPPORTED_MODEL_MAX_LEVEL = 8;
+
+/**
+ * The cooldown for the *nth* consecutive unsupported-model report (`hits` is
+ * the new total, so the first report is `hits === 1`).
+ *
+ * Exported because the writer, not the classifier, is the only place that
+ * reads the authoritative hit count — the classifier sees only the count the
+ * caller supplied, which is absent on the first report of a pair.
+ */
+export function unsupportedModelCooldownMs(hits: number): number {
+  const level = Math.min(Math.max(0, Math.round(hits) - 1), UNSUPPORTED_MODEL_MAX_LEVEL);
+  return Math.min(
+    UNSUPPORTED_MODEL_COOLDOWN_MS * 2 ** level,
+    UNSUPPORTED_MODEL_COOLDOWN_MAX_MS,
+  );
+}
+
+/**
+ * The wording an upstream uses for "we do not serve this model at all", as
+ * opposed to "this account cannot reach it" (403 entitlement, above) or "this
+ * route does not exist" (404 `upstream_not_found`).
+ */
+const UNSUPPORTED_MODEL_MESSAGE =
+  /service info not found|model\s.{0,80}?\bnot\s+(?:found|supported)\b/;
+
+/**
+ * True when the evidence says the upstream does not serve the model.
+ *
+ * Narrow on purpose, and narrower than `model_unreachable`: only a 400/404
+ * carrying the buddy family's `11102` or one of the two phrasings above. A
+ * 4xx that merely *mentions* a model is far more often a payload the caller
+ * got wrong, and cooling a pair for six hours over that takes a working model
+ * out of rotation for a request bug.
+ */
+function isUnsupportedModelEvidence(
+  statusCode: number | null,
+  providerCode: string,
+  lower: string,
+): boolean {
+  if (statusCode !== 400 && statusCode !== 404) return false;
+  return providerCode === "11102" || UNSUPPORTED_MODEL_MESSAGE.test(lower);
+}
 
 // ===== health/account-recorder.ts =====
 export interface AccountHealthEventRecord {
@@ -83,6 +157,7 @@ export type AccountErrorCategory =
   | "quota_exhausted"
   | "rate_limit_transient"
   | "model_capacity"
+  | "model_unreachable"
   | "auth_invalidated"
   | "policy_blocked"
   | "server_error"
@@ -123,6 +198,13 @@ export interface AccountFailureEvidence {
    * content-policy block), never to broaden what disables an account.
    */
   readonly providerId?: string;
+  /**
+   * How many times this (account, model) pair has already been reported
+   * unsupported, when the caller has read them. Best-effort: the classifier
+   * states the base window without it, and the writer recomputes against the
+   * count it reads itself.
+   */
+  readonly modelBlockHits?: number;
 }
 
 export interface AccountErrorClassification {
@@ -132,6 +214,102 @@ export interface AccountErrorClassification {
   readonly reason: string;
   readonly retryAt: Date | null;
   readonly mutatesAccount: boolean;
+  /**
+   * True when `cooldownMs` came from the provider's own statement — a parsed
+   * `Retry-After`-family header, or a reset quoted in its message — rather than
+   * from one of this module's fallback constants.
+   *
+   * A property of the *evidence*, not of the category, so it is the same for
+   * every branch of one classification. Only {@link escalateFallbackCooldown}
+   * reads it: a provider-stated window is the truth and is never multiplied.
+   */
+  readonly providerStated?: boolean;
+  /**
+   * True when the upstream reported the model as one it does not serve (the
+   * buddy family's `11102`), rather than one this account merely cannot reach.
+   *
+   * A property of the classification, because both verdicts land in the same
+   * `model_unreachable` category and the writer cannot otherwise tell them
+   * apart — it needs to know whether to count the hit and escalate the window.
+   */
+  readonly modelUnsupported?: boolean;
+}
+
+/**
+ * How many doublings a fallback cooldown may take before the cap takes over.
+ *
+ * Four is enough to reach the cap from every fallback default (the longest is
+ * the 1h quota fallback, which reaches it on the first doubling) while keeping
+ * the ladder short enough to reason about.
+ */
+const COOLDOWN_ESCALATION_MAX_LEVEL = 4;
+
+/**
+ * Escalates a *fallback* cooldown for an account that keeps failing.
+ *
+ * `consecutiveFailures` has been incremented on every account failure since the
+ * health machine was written, but nothing ever read it — so a broken upstream
+ * was re-dialled once a minute forever, and an account whose quota had an
+ * unstated reset came straight back into rotation every time its short fallback
+ * lapsed. The count is now a backoff level: each further consecutive failure
+ * doubles the fallback, clamped to {@link resolveAccountCooldownEscalationMaxMs}.
+ *
+ * Two guards keep it from overriding the provider. A duration the provider
+ * *stated* is never multiplied — that window is the truth. And the caller writes
+ * the result through a monotonic maximum, so a burst of concurrent in-flight
+ * failures advances the deadline to the longest of them instead of compounding
+ * once per failure.
+ */
+function escalateFallbackCooldown(
+  cooldownMs: number,
+  providerStated: boolean,
+  consecutiveFailures: number,
+): number {
+  if (providerStated || cooldownMs <= 0) return cooldownMs;
+  const level = Math.min(Math.max(0, consecutiveFailures), COOLDOWN_ESCALATION_MAX_LEVEL);
+  return Math.min(cooldownMs * 2 ** level, resolveAccountCooldownEscalationMaxMs());
+}
+
+/**
+ * The later of a candidate deadline and the one already recorded.
+ *
+ * Every fallback duration is recomputed from *now* on each failure, so writing
+ * it unconditionally let a fresh short failure *shorten* a longer window already
+ * in force: a 60-second unclassified cooldown overwrote the provider's own
+ * "Try again in 11h" and released the pair back into rotation inside a window
+ * the upstream had closed, where it failed again — once a minute, forever.
+ * A cooling deadline may only ever move later.
+ */
+function latestDeadlineMs(...candidates: readonly (number | undefined | null)[]): number {
+  let latest = 0;
+  for (const value of candidates) {
+    if (typeof value !== "number" || !Number.isFinite(value)) continue;
+    if (value > latest) latest = value;
+  }
+  return latest;
+}
+
+/**
+ * The account-wide deadline to write, or `null` for "no deadline".
+ *
+ * {@link latestDeadlineMs} cannot express *no* deadline — it floors at 0 — and
+ * the account-wide write has one state that needs it. With
+ * `CARTETHYIA_ACCOUNT_DISABLED_RECOVERY_MS=0` an automatic disable is meant to
+ * be terminal again, and the classifier correctly reports `retryAt: null`; the
+ * write used to derive the deadline from `Date.now() + cooldownMs` anyway,
+ * which stamps *now*. The recovery sweep then treats that elapsed deadline as
+ * an automatic disable awaiting recovery and returns the row to rotation on its
+ * next tick — the escape hatch enabled exactly the behavior it documents
+ * itself as disabling.
+ *
+ * A candidate only exists when there is a real window to state. Monotonicity is
+ * preserved: a deadline already in force still wins over a new `null`.
+ */
+function accountDeadlineMs(
+  candidates: readonly (number | undefined | null)[],
+): Date | null {
+  const latest = latestDeadlineMs(...candidates);
+  return latest > 0 ? new Date(latest) : null;
 }
 
 
@@ -154,10 +332,24 @@ export function classifyAccountError(
     (typeof errorRecord?.status === "number" ? errorRecord.status : null);
   const origin = options?.origin ?? "cartethyia";
   const scope = options?.scope ?? "unknown";
+  // Providers write the same phrase with different separators: codex reports
+  // `token_revoked`, others `token revoked` or `token-revoked`. Folding the
+  // separators once lets every match below see one spelling.
+  const folded = lower.replace(/[_-]+/g, " ");
+  // A revocation named in the message is evidence about the credential itself,
+  // whichever scope the caller could establish. A stream error frame carries
+  // no `credentialEvidence` detail and classifies at provider scope, so without
+  // this the account stays in rotation: the phrase is recognised and then
+  // discarded because nothing mutates on provider scope.
+  const revocationNamed = folded.includes("token revoked") || folded.includes("invalidated oauth token");
   const accountEvidence =
     options?.credentialEvidence === true ||
+    revocationNamed ||
     (options?.origin === "upstream" && options.scope === "account");
-  const canMutate = origin === "upstream" && scope === "account" && accountEvidence;
+  // A named revocation mutates even at provider scope: the message is the
+  // evidence, and provider scope is what a frame with no credential detail
+  // classifies as. Every other signal still needs account scope.
+  const canMutate = origin === "upstream" && (revocationNamed || (scope === "account" && accountEvidence));
   const providerCode = options?.providerCode?.toLowerCase() ?? "";
 
   const getHeader = (name: string): string | null => {
@@ -173,6 +365,15 @@ export function classifyAccountError(
     options?.retryAfterMs ??
     parseUpstreamBackoff({ get: getHeader });
   const messageCooldown = parseProviderResetDuration(message);
+  // Whether the provider itself named a window. Decided once, from the
+  // evidence, so every branch of this classification agrees about it.
+  const providerStated = headerCooldown !== null || messageCooldown !== null;
+  const rawUpstreamResponse =
+    origin === "upstream" &&
+    error instanceof GatewayError &&
+    typeof error.details.raw === "string"
+      ? error.details.raw
+      : undefined;
   const reason = (prefix: string): string => `${prefix}: ${message.slice(0, 160)}`;
   const result = (
     category: AccountErrorCategory,
@@ -181,13 +382,16 @@ export function classifyAccountError(
     retryAt: Date | null,
     explanation: string,
     mutatesAccount = canMutate,
+    modelUnsupported = false,
   ): AccountErrorClassification => ({
     category,
     status,
     cooldownMs,
-    reason: explanation,
+    reason: origin === "upstream" ? rawUpstreamResponse ?? message.slice(0, 160) : explanation,
     retryAt,
     mutatesAccount,
+    providerStated,
+    modelUnsupported,
   });
 
   // A price refusal is a verdict on the *request*, not on the account. inferhub
@@ -213,6 +417,41 @@ export function classifyAccountError(
   if (deploymentInfraError) {
     return result("server_error", "cooldown", 60_000, null, `Proxy deployment error: ${message.slice(0, 160)}`, false);
   }
+  // A (CodeBuddy/WorkBuddy) *frequency* window is a verdict on one
+  // (account, model) pair, not on the account: `{"code":"6004","msg":"usage
+  // exceeds frequency limit ... your usage will reset at <stamp> UTC+8,
+  // alternatively, you can switch to the other models to continue using it."}`.
+  // The provider names the remedy itself — use a different model — which is
+  // only a remedy if the account still serves every other model. Taken as
+  // account-wide `quota_exhausted` it parked the whole account until the reset,
+  // so the switch the upstream offered was refused by our own gateway and every
+  // sibling model went dark with it; the account also read COOLDOWN /
+  // quota_exhausted while only that pair was throttled.
+  //
+  // Classified `rate_limit_transient` so the writer scopes it to the model:
+  // `recordAccountFailure` writes `modelCooldowns[modelId]` and leaves the
+  // account's own status alone. Kept ahead of `quotaSignal`, which matches a
+  // *broader* slice of the same wording (`usage exceeds` + `frequency limit`)
+  // and would otherwise claim this message as an account-wide quota window.
+  // Narrow on purpose — the extra phrase is what says the other models still
+  // work; without it the failure stays account-wide.
+  const modelFrequencyWindow =
+    lower.includes("frequency limit") && lower.includes("switch to the other models");
+  if (modelFrequencyWindow) {
+    const cooldownMs = messageCooldown ?? headerCooldown ?? DEFAULT_QUOTA_COOLDOWN_MS();
+    return result(
+      "rate_limit_transient",
+      "cooldown",
+      cooldownMs,
+      new Date(Date.now() + cooldownMs),
+      reason("Provider frequency limit for this model"),
+      // Provider-scoped evidence still has to reach the writer: a stream frame
+      // carries no credential detail, so `canMutate` is false and without this
+      // the pair would be retried for the whole window it was closed for.
+      origin === "upstream" && scope === "provider",
+    );
+  }
+
   // Quota-shaped provider codes/messages (e.g. xAI's
   const quotaSignal =
     !priceRefusal &&
@@ -221,18 +460,35 @@ export function classifyAccountError(
       providerCode === "insufficient_quota" ||
       providerCode === "quota_exceeded" ||
       providerCode === "subscription:free-usage-exhausted" ||
+      providerCode === "14018" ||
+      // CodeBuddy/WorkBuddy rate limit: `{"code":"6004","msg":"usage exceeds
+      // frequency limit ... your usage will reset at <stamp> UTC+8"}`. The
+      // message names a reset, so this is a parked window, not a transient
+      // 429 — without it the account fell through to `unknown` with
+      // `mutates=false`, stayed in rotation, and was re-picked for every
+      // request inside the window the provider had actually named.
+      //
+      // Matched on the message's own wording, not on the `6004` code: that code
+      // is not unique to this surface (the artifact-release API reuses it), so a
+      // code match would sweep an unrelated failure into a quota cooldown. The
+      // phrase is the reliable key, and `usage exceeds` + `frequency limit` is
+      // the pair this family actually prints.
+      (lower.includes("usage exceeds") && lower.includes("frequency limit")) ||
       lower.includes("insufficient_quota") ||
       lower.includes("quota_exceeded") ||
       lower.includes("usage_limit_reached") ||
       lower.includes("usage-exhausted") ||
       lower.includes("usage_exhausted") ||
       lower.includes("usage exhausted") ||
+      lower.includes("usage exceeds") ||
+      lower.includes("frequency limit") ||
       lower.includes("free-usage") ||
       lower.includes("free usage") ||
       lower.includes("exceeded your current quota") ||
       lower.includes("balance exhausted") ||
       lower.includes("insufficient balance") ||
       lower.includes("out of credits") ||
+      lower.includes("credits exhausted") ||
       lower.includes("spending limit"));
   // A deterministic content-policy rejection is NOT credential invalidation.
   // CodeBuddy returns HTTP 403 with provider code 11140 ("request illegal",
@@ -254,10 +510,50 @@ export function classifyAccountError(
     return result(
       "policy_blocked",
       "cooldown",
-      POLICY_BLOCK_COOLDOWN_MS,
-      new Date(Date.now() + POLICY_BLOCK_COOLDOWN_MS),
+      resolveAccountPolicyBlockCooldownMs(),
+      new Date(Date.now() + resolveAccountPolicyBlockCooldownMs()),
       reason("Provider content-policy block"),
       origin === "upstream",
+    );
+  }
+  // These codes are a verdict on the request, not the account. Cooling the
+  // account for them burns a healthy credential on a body that will fail the
+  // same way on every other account:
+  //
+  // - `11148` tool-call/result mismatch — the transcript is broken; the
+  //   pre-payload repair is supposed to prevent it, and a slip is still the
+  //   body's fault.
+  // - `11135` the image cannot be processed, `11133` the model rejected a
+  //   parameter, `11101` the body failed to parse — deterministic for that
+  //   payload.
+  // - `12153` the session is dead — a refresh problem, not a reason to park
+  //   the account on the first observation.
+  // - `14017` trial not activated — the account may recover once registration
+  //   finishes, so a hard cooldown would keep it out after it becomes usable.
+  //
+  // Recognised before the auth and quota branches: several of these arrive as
+  // 401/403/429, which those branches would otherwise treat as account evidence.
+  const requestScoped =
+    providerCode === "11148" ||
+    providerCode === "11135" ||
+    providerCode === "11133" ||
+    providerCode === "11101" ||
+    providerCode === "12153" ||
+    providerCode === "14017" ||
+    lower.includes("tool_call_sequence_broken") ||
+    lower.includes("unmarshal chat params failed") ||
+    lower.includes("invalid image_url content") ||
+    lower.includes("offline user session not found") ||
+    lower.includes("trial not activated") ||
+    lower.includes("trial version is not yet activated");
+  if (requestScoped && BUDDY_PROVIDER_IDS.has(options?.providerId?.toLowerCase() ?? "")) {
+    return result(
+      "unknown",
+      "cooldown",
+      0,
+      null,
+      reason("Request-scoped upstream rejection"),
+      false,
     );
   }
   // A channel rejection (`11128`) is the same shape: the upstream is refusing
@@ -276,8 +572,8 @@ export function classifyAccountError(
     return result(
       "policy_blocked",
       "cooldown",
-      CHANNEL_BLOCK_COOLDOWN_MS,
-      new Date(Date.now() + CHANNEL_BLOCK_COOLDOWN_MS),
+      resolveAccountPolicyBlockCooldownMs(),
+      new Date(Date.now() + resolveAccountPolicyBlockCooldownMs()),
       reason("Provider channel rejection"),
       origin === "upstream",
     );
@@ -307,19 +603,21 @@ export function classifyAccountError(
       lower.includes("model not supported") ||
       lower.includes("not entitled to") ||
       lower.includes("no access to model") ||
-      lower.includes("model_not_supported"));
+      lower.includes("model_not_supported") ||
+      lower.includes("not available in your region"));
   const authSignal =
     !quotaSignal &&
     !policyRejection &&
     !hostedToolFailure &&
     !modelEntitlementFailure &&
     (providerCode === "authentication_failed" ||
-      lower.includes("invalid_api_key") ||
-      lower.includes("incorrect api key") ||
-      lower.includes("invalid token") ||
-      lower.includes("token revoked") ||
-      lower.includes("reauthorization required") ||
-      lower.includes("account deactivated") ||
+      folded.includes("invalid api key") ||
+      folded.includes("incorrect api key") ||
+      folded.includes("invalid token") ||
+      folded.includes("token revoked") ||
+      folded.includes("invalidated oauth token") ||
+      folded.includes("reauthorization required") ||
+      folded.includes("account deactivated") ||
       ((statusCode === 401 || statusCode === 403) && accountEvidence));
   if (authSignal) {
     // A static token has no refresh to run, so an auth rejection must not park
@@ -331,19 +629,42 @@ export function classifyAccountError(
       !staticTokenRecovery &&
       options?.credentialKind === "oauth" &&
       (lower.includes("expired") || lower.includes("refresh"));
-    const recoverable = staticTokenRecovery || oauthRecovery;
-    const cooldownMs = recoverable ? 5 * 60 * 1000 : 0;
+    // A *named* revocation is the one auth outcome that still parks the account.
+    // The upstream said the credential itself is dead — not that it expired, not
+    // that this request was refused — so there is no window to wait out and no
+    // refresh to run, and a cooldown would only return it to rotation to fail
+    // again. Every other auth rejection is weak evidence (clock skew, a key
+    // rotated a moment ago, an edge answering before the credential loads) and
+    // cools down instead.
+    //
+    // This distinction is the whole fix. The generic `401`/`403` branch used to
+    // reach `disabled` too, which no sweep recovers, so one transient rejection
+    // removed the account from rotation until an operator noticed — the exact
+    // outcome the comment above says a static token must not suffer.
+    const revoked = revocationNamed;
+    const recoverable = staticTokenRecovery || oauthRecovery || !revoked;
+    // An automatic disable is **not** terminal any more, but the deadline is what
+    // makes that safe: `sweepExpiredCooldowns` recovers a disabled row only when
+    // its `cooldownUntil` has elapsed, and an operator-disabled row keeps that
+    // column null. So the machine can undo its own verdict while an operator's
+    // decision still outranks it — see `resolveAccountDisabledRecoveryMs`.
+    const disabledRecoveryMs = resolveAccountDisabledRecoveryMs();
+    const disabledRetryAt =
+      disabledRecoveryMs > 0 ? new Date(Date.now() + disabledRecoveryMs) : null;
+    const cooldownMs = recoverable ? resolveAccountAuthRejectedCooldownMs() : disabledRecoveryMs;
     return result(
       "auth_invalidated",
       recoverable ? "cooldown" : "disabled",
       cooldownMs,
-      recoverable ? new Date(Date.now() + cooldownMs) : null,
+      recoverable ? new Date(Date.now() + cooldownMs) : disabledRetryAt,
       reason(
-        staticTokenRecovery
-          ? "Static token rejected; retrying without a refresh"
-          : oauthRecovery
-            ? "OAuth credential requires refresh"
-            : "Provider credential rejected",
+        !revoked
+          ? "Provider credential rejected; retrying after a backoff"
+          : staticTokenRecovery
+            ? "Static token rejected; retrying without a refresh"
+            : oauthRecovery
+              ? "OAuth credential requires refresh"
+              : "Provider credential revoked",
       ),
       canMutate,
     );
@@ -378,9 +699,12 @@ export function classifyAccountError(
       lower.includes("rolling 24-hour") ||
       lower.includes("rolling 24 hour");
     const statedCooldown = messageCooldown ?? headerCooldown;
+    const buddyCreditsExhausted = providerCode === "14018" || lower.includes("credits exhausted");
     const cooldownMs = grokFreeTier
       ? (statedCooldown ?? GROK_QUOTA_COOLDOWN_MS)
-      : (statedCooldown ?? DEFAULT_QUOTA_COOLDOWN_MS());
+      : buddyCreditsExhausted
+        ? (statedCooldown ?? 12 * 60 * 60 * 1000)
+        : (statedCooldown ?? DEFAULT_QUOTA_COOLDOWN_MS());
     // The caller records against the concrete account that just failed
     // upstream, so a provider-scoped quota error still cools THAT account
     // down (enables fallback to the next account). Local-origin quota must
@@ -429,14 +753,71 @@ export function classifyAccountError(
     lower.includes("temporarily unavailable");
   if (capacitySignal) {
     const cooldownMs = headerCooldown ?? messageCooldown ?? MODEL_CAPACITY_COOLDOWN_MS();
-    const modelScopedMutation =
-      origin === "upstream" && scope === "account" && options?.modelId !== undefined;
+    const modelScopedMutation = origin === "upstream" && options?.modelId !== undefined;
     return result(
       "model_capacity",
       "cooldown",
       cooldownMs,
       new Date(Date.now() + cooldownMs),
       reason("Provider model capacity"),
+      modelScopedMutation,
+    );
+  }
+
+  // A model the upstream does not serve at all, detected before
+  // `model_unreachable`: the buddy family answers `400 {"code":"11102","msg":
+  // "service info not found"}` for an id its backend has never heard of, and
+  // the reference gateways treat that as a durable verdict on the (account,
+  // model) pair rather than as a request bug. Same category as
+  // `model_unreachable`, so the writer already does the right thing — a
+  // model-scoped cooldown that leaves the account's status alone — and what
+  // differs is the duration, which escalates per hit.
+  //
+  // The hit count the caller supplies is best-effort (absent on a pair's first
+  // report), so the classifier states the base window and the writer recomputes
+  // it from the authoritative count it reads.
+  if (isUnsupportedModelEvidence(statusCode, providerCode, folded)) {
+    const hits = Math.max(1, Math.floor(options?.modelBlockHits ?? 1));
+    const cooldownMs = unsupportedModelCooldownMs(hits);
+    return result(
+      "model_unreachable",
+      "cooldown",
+      cooldownMs,
+      new Date(Date.now() + cooldownMs),
+      reason("Model not supported by this upstream"),
+      origin === "upstream" && options?.modelId !== undefined,
+      true,
+    );
+  }
+
+  // A model the upstream says does not exist for this account is a verdict on
+  // the (account, model) pair, not on the credential. Cursor answers Connect
+  // `not_found` for a model the plan does not reach (`claude-opus-5` on a plan
+  // without it) while every other model on that same account serves normally,
+  // so parking the account would take healthy models down with it. Detected
+  // before the 5xx branch: the adapter surfaces it as a 404 carrying
+  // `providerCode: "not_found"`, and nothing else in the 5xx band is
+  // model-scoped.
+  // Keyed on the provider's own code rather than on the 404: a 404 also means
+  // an upstream *route* that does not exist (`upstream_not_found`), which says
+  // nothing about any model and must not cool one.
+  const modelUnreachable = providerCode === "not_found" || modelEntitlementFailure;
+  if (modelUnreachable) {
+    const cooldownMs = MODEL_UNREACHABLE_COOLDOWN_MS;
+    // Not credential evidence, so `classifyUpstreamFailure` scopes this to the
+    // provider and the `scope === "account"` gate the throttles use would
+    // forbid the mutation outright — leaving the probe reporting a failure that
+    // cooled nothing. The verdict is still about one (account, model) pair:
+    // `recordAccountFailure` writes `modelCooldowns[modelId]` and leaves the
+    // account's own status untouched, so all that is required is a model to
+    // write against.
+    const modelScopedMutation = origin === "upstream" && options?.modelId !== undefined;
+    return result(
+      "model_unreachable",
+      "cooldown",
+      cooldownMs,
+      new Date(Date.now() + cooldownMs),
+      reason("Model unreachable for this account"),
       modelScopedMutation,
     );
   }
@@ -452,13 +833,20 @@ export function classifyAccountError(
     // deadline rather than a state needing an operator. The deadline matters:
     // `sweepExpiredCooldowns` selects on `cooldownUntil IS NOT NULL`, so a row
     // parked without one is never recovered and stays out of rotation.
+    //
+    // `canMutate` rather than a flat `false`: a 5xx whose failure the caller
+    // scoped to the account (an edge/WAF challenge answered to one account's
+    // requests while its siblings on the same egress served fine) must cool
+    // that account down, or it stays `active` and is re-dialled for as long as
+    // the block lasts. Provider-scoped 5xx keeps the old behavior: the upstream
+    // is indiscriminately failing and no single account is at fault.
     return result(
       lower.includes("timeout") ? "timeout" : "server_error",
       "cooldown",
       TRANSIENT_ERROR_COOLDOWN_MS(),
       new Date(Date.now() + TRANSIENT_ERROR_COOLDOWN_MS()),
       reason(`Provider ${statusCode ?? "network"} failure`),
-      false,
+      canMutate,
     );
   }
 
@@ -476,7 +864,7 @@ export function classifyAccountError(
 
 
 /** Persists one classified failure to the account row and appends a health event. */
-async function persistAccountFailure(
+export async function recordAccountFailure(
   db: CartethyiaDatabase,
   accountId: string,
   error: unknown,
@@ -486,8 +874,21 @@ async function persistAccountFailure(
   if (!classification.mutatesAccount) return classification;
 
   const persist = async (client: CartethyiaDatabase): Promise<AccountErrorClassification | null> => {
+    // Projected, not a bare `select()`: this runs on *every* attempt outcome,
+    // and a full row drags `credential_ciphertext` (the largest thing stored
+    // per account) and `auth_state` over the wire to read a status and a
+    // counter. `RouteCatalogRepository` already projects for the same reason.
     const accountRows = await client
-      .select()
+      .select({
+        status: providerAccounts.status,
+        staticToken: providerAccounts.staticToken,
+        consecutiveFailures: providerAccounts.consecutiveFailures,
+        modelCooldowns: providerAccounts.modelCooldowns,
+        // Read only for the unsupported-model ladder; NULL means "never
+        // counted", which is the common case and must stay cheap.
+        modelBlockHits: providerAccounts.modelBlockHits,
+        cooldownUntil: providerAccounts.cooldownUntil,
+      })
       .from(providerAccounts)
       .where(eq(providerAccounts.id, accountId))
       .limit(1);
@@ -506,16 +907,55 @@ async function persistAccountFailure(
     const now = new Date();
 
     const modelId = options?.modelId;
+    // Every category here is a verdict about one (account, model) pair rather
+    // than about the credential, so all three back off that pair and leave the
+    // account routable for every other model. `model_unreachable` joins the two
+    // throttles on the same reasoning: an upstream that reports the model does
+    // not exist for this account will report it again on the next request.
     const isThrottle =
       effective.category === "rate_limit_transient" ||
-      effective.category === "model_capacity";
+      effective.category === "model_capacity" ||
+      effective.category === "model_unreachable";
     const shouldModelCooldown = modelId !== undefined && isThrottle;
+    // The account-wide streak, escalated for a provider-stated window. Read once
+    // so the model-scoped and account-wide paths below cannot disagree about it:
+    // this is the count *before* this failure, which the UPDATE below increments.
+    const streak = Math.max(0, account.consecutiveFailures ?? 0);
+    const escalatedCooldownMs = escalateFallbackCooldown(
+      effective.cooldownMs,
+      effective.providerStated === true,
+      streak,
+    );
+
+    // The unsupported-model ladder, computed before the branch: the classifier
+    // could only state the base window because the authoritative hit count
+    // lives on the row, and it is read here. `hits` is the new total for this
+    // pair, so the first report is 1 and gets the base window.
+    const blockHits = (account.modelBlockHits as Record<string, number> | null) ?? {};
+    const unsupportedHits =
+      effective.modelUnsupported === true && modelId !== undefined
+        ? Math.max(1, (blockHits[modelId] ?? 0) + 1)
+        : undefined;
+    // An unsupported-model window is stated by *us*, not by the provider, so it
+    // would otherwise be multiplied a second time by `escalateFallbackCooldown`
+    // (which reads `consecutiveFailures`, an account-wide counter). The two
+    // ladders are different things: one counts how many times this pair was
+    // reported unsupported, the other how many failures this account produced.
+    const unsupportedCooldownMs =
+      unsupportedHits === undefined ? undefined : unsupportedModelCooldownMs(unsupportedHits);
 
     if (shouldModelCooldown) {
       const existing = (account.modelCooldowns as Record<string, string> | null) ?? {};
-      const nextUntil =
-        effective.retryAt?.toISOString() ??
-        new Date(Date.now() + effective.cooldownMs).toISOString();
+      // Monotonic: never move an in-force window earlier (see `latestDeadlineMs`).
+      // A provider-stated deadline wins outright because it is already the later
+      // of the two whenever the provider really parked the pair longer.
+      const nextUntil = new Date(
+        latestDeadlineMs(
+          effective.retryAt?.getTime(),
+          Date.now() + (unsupportedCooldownMs ?? escalatedCooldownMs),
+          existing[modelId] ? Date.parse(existing[modelId]!) : undefined,
+        ),
+      ).toISOString();
       const previousUntil = existing[modelId];
       // A re-statement is not an event: what the audit row reports is the
       // *entry* into a cooling episode, and the deadline itself is not a
@@ -534,10 +974,24 @@ async function persistAccountFailure(
       // The error fields ARE written, because they are what provider detail and
       // the health dialog read to explain *why* a model is cooling — without
       // them the row showed "1 model cooling" with no reason at all.
+      //
+      // The streak advances here too. Without it the most common throttle — a
+      // model-scoped rate limit — never escalated, because the counter was only
+      // incremented on the account-wide path below, and `consecutiveFailures`
+      // stays honest about what it always claimed to count: how many failures in
+      // a row this account has just produced.
       await client
         .update(providerAccounts)
         .set({
           modelCooldowns: { ...existing, [modelId]: nextUntil },
+          // Counted only for the unsupported-model ladder, and only when this
+          // failure is that verdict — so a rate limit or a capacity refusal
+          // never advances it. `model_cooldowns`' own shape is untouched, so
+          // routing and the console keep parsing it exactly as before.
+          ...(unsupportedHits === undefined
+            ? {}
+            : { modelBlockHits: { ...blockHits, [modelId]: unsupportedHits } }),
+          consecutiveFailures: sql`${providerAccounts.consecutiveFailures} + 1`,
           lastError: effective.reason,
           lastErrorCategory: effective.category,
           lastErrorAt: now,
@@ -572,7 +1026,19 @@ async function persistAccountFailure(
         lastError: effective.reason,
         lastErrorCategory: effective.category,
         lastErrorAt: now,
-        cooldownUntil: effective.retryAt,
+        // Monotonic against the account's own in-force deadline, for the same
+        // reason as the model path: an unclassified 60-second failure must not
+        // release an account the provider parked for hours.
+        //
+        // A `0` duration contributes no candidate rather than stamping *now*
+        // (see `accountDeadlineMs`): the one state that asks for it is a
+        // terminal automatic disable, and an elapsed deadline there would hand
+        // the row straight back to the recovery sweep.
+        cooldownUntil: accountDeadlineMs([
+          effective.retryAt?.getTime(),
+          escalatedCooldownMs > 0 ? Date.now() + escalatedCooldownMs : undefined,
+          account.cooldownUntil?.getTime?.(),
+        ]),
       })
       .where(eq(providerAccounts.id, accountId));
 
@@ -606,13 +1072,23 @@ async function persistAccountFailure(
 }
 
 /** Clears failure state after a successful dispatch; true when the account changed. */
-async function persistAccountSuccess(
+export async function recordAccountSuccess(
   db: CartethyiaDatabase,
   accountId: string,
 ): Promise<boolean> {
   const mutate = async (client: CartethyiaDatabase): Promise<boolean> => {
+    // `recordAccountSuccess` runs on every successful dispatch, and for a
+    // healthy account `hadFailures` is false — the row was fetched purely to
+    // decide nothing. Projected so that no-op path does not pull the
+    // credential ciphertext across the wire.
     const rows = await client
-      .select()
+      .select({
+        status: providerAccounts.status,
+        consecutiveFailures: providerAccounts.consecutiveFailures,
+        // Read only to decide whether there is anything to clear: the common
+        // case (no unsupported-model hit ever recorded) must not write.
+        modelBlockHits: providerAccounts.modelBlockHits,
+      })
       .from(providerAccounts)
       .where(eq(providerAccounts.id, accountId))
       .limit(1);
@@ -621,6 +1097,14 @@ async function persistAccountSuccess(
     const fromStatus = account.status;
     const hadFailures = (account.consecutiveFailures ?? 0) > 0 || account.status !== "active";
     const now = new Date();
+    // The unsupported-model escalation restarts after a success: a model that
+    // just served is not "not supported", so the next report of it must start
+    // from the base window again rather than from wherever the ladder had
+    // reached. `modelCooldowns` is deliberately NOT cleared — an in-force
+    // window the provider stated survives, which is the existing behavior and
+    // the reference gateways' too.
+    const blockHits = account.modelBlockHits as Record<string, number> | null;
+    const hasBlockHits = blockHits !== null && Object.keys(blockHits).length > 0;
     await client
       .update(providerAccounts)
       .set({
@@ -629,6 +1113,7 @@ async function persistAccountSuccess(
         cooldownUntil: null,
         lastSuccessAt: now,
         ...(hadFailures ? { lastRecoveredAt: now } : {}),
+        ...(hasBlockHits ? { modelBlockHits: {} } : {}),
       })
       .where(eq(providerAccounts.id, accountId));
     if (hadFailures && typeof client.insert === "function") {
@@ -655,10 +1140,10 @@ async function persistAccountSuccess(
 }
 
 /** Operator-initiated recovery: forces the account back to active and logs the transition. */
-async function persistAccountRecovery(
+export async function recoverAccount(
   db: CartethyiaDatabase,
   accountId: string,
-  reason: string,
+  reason = "manual_operator_recovery",
 ): Promise<boolean> {
   const recover = async (client: CartethyiaDatabase): Promise<boolean> => {
     const accountRows = await client
@@ -715,7 +1200,7 @@ async function persistAccountRecovery(
 }
 
 /** Recovers accounts whose cooldown elapsed and prunes expired per-model keys. */
-async function sweepExpiredCooldownsFor(db: CartethyiaDatabase): Promise<number> {
+export async function sweepExpiredCooldowns(db: CartethyiaDatabase): Promise<number> {
   const recover = async (client: CartethyiaDatabase): Promise<number> => {
     const now = new Date();
     const nowIso = now.toISOString();
@@ -726,12 +1211,31 @@ async function sweepExpiredCooldownsFor(db: CartethyiaDatabase): Promise<number>
       })
       .from(providerAccounts)
       .where(
-        and(
-          eq(providerAccounts.status, "cooldown"),
-          isNotNull(providerAccounts.cooldownUntil),
-          lte(providerAccounts.cooldownUntil, now),
+        or(
+          // An ordinary cooldown, recovered as soon as its window elapses.
+          and(
+            eq(providerAccounts.status, "cooldown"),
+            isNotNull(providerAccounts.cooldownUntil),
+            lte(providerAccounts.cooldownUntil, now),
+          ),
+          // An **automatic** disable, which used to be terminal. Selected only
+          // when it carries a deadline: an operator's disable leaves
+          // `cooldownUntil` null, so a human's decision still outranks the
+          // machine and is never swept away. The deadline is written by the two
+          // paths that disable on evidence — the classifier's revocation branch
+          // and a definitively rejected refresh grant.
+          and(
+            eq(providerAccounts.status, "disabled"),
+            isNotNull(providerAccounts.cooldownUntil),
+            lte(providerAccounts.cooldownUntil, now),
+          ),
         ),
-      );
+      )
+      // One pass recovers a bounded batch. The sweep runs every 30s, so a
+      // backlog larger than this drains over successive ticks instead of one
+      // statement covering every expired row — that statement holds its locks
+      // for as long as the backlog takes.
+      .limit(COOLDOWN_RECOVERY_BATCH);
     if (expired.length > 0) {
       await client
         .update(providerAccounts)
@@ -740,6 +1244,11 @@ async function sweepExpiredCooldownsFor(db: CartethyiaDatabase): Promise<number>
           consecutiveFailures: 0,
           cooldownUntil: null,
           lastRecoveredAt: now,
+          // Cleared with the state it described. A recovered row that kept
+          // `auth_invalidated` still rendered the console's "Re-login required"
+          // pill above an `active` status, so the account read healthy to
+          // routing and broken to the operator at the same time.
+          lastErrorCategory: null,
         })
         .where(inArray(providerAccounts.id, expired.map((account) => account.id)));
       if (typeof client.insert === "function") {
@@ -773,26 +1282,12 @@ async function sweepExpiredCooldownsFor(db: CartethyiaDatabase): Promise<number>
     // whole sweep. `IS DISTINCT FROM` keeps the update from rewriting rows it
     // did not change, so the returned row count is the number of accounts whose
     // cooldown set actually shrank — the same thing the loop counted.
+    const pruning = pruneExpiredCooldowns(sql`${providerAccounts.modelCooldowns}`, sql`${nowIso}`);
     const pruned = await client
       .update(providerAccounts)
-      .set({
-        modelCooldowns: sql`COALESCE(
-          (SELECT jsonb_object_agg(entry.key, entry.value)
-           FROM jsonb_each_text(${providerAccounts.modelCooldowns}) AS entry
-           WHERE entry.value > ${nowIso}),
-          '{}'::jsonb
-        )`,
-      })
-      .where(
-        sql`jsonb_typeof(${providerAccounts.modelCooldowns}) = 'object'
-          AND ${providerAccounts.modelCooldowns} IS DISTINCT FROM COALESCE(
-            (SELECT jsonb_object_agg(entry.key, entry.value)
-             FROM jsonb_each_text(${providerAccounts.modelCooldowns}) AS entry
-             WHERE entry.value > ${nowIso}),
-            '{}'::jsonb
-          )`,
-      );
-    return expired.length + (pruned.rowCount ?? 0);
+      .set({ modelCooldowns: pruning.value })
+      .where(pruning.changed);
+    return expired.length + affectedRows(pruned);
   };
   try {
     if (typeof db.transaction === "function") {
@@ -802,22 +1297,6 @@ async function sweepExpiredCooldownsFor(db: CartethyiaDatabase): Promise<number>
   } catch {
     return 0;
   }
-}
-
-export async function recordAccountFailure(
-  db: CartethyiaDatabase,
-  accountId: string,
-  error: unknown,
-  options?: AccountFailureEvidence,
-): Promise<AccountErrorClassification | null> {
-  return persistAccountFailure(db, accountId, error, options);
-}
-
-export async function recordAccountSuccess(
-  db: CartethyiaDatabase,
-  accountId: string,
-): Promise<boolean> {
-  return persistAccountSuccess(db, accountId);
 }
 
 /**
@@ -850,18 +1329,6 @@ export async function reportAttemptOutcome(
     ...(report.modelId === undefined ? {} : { modelId: report.modelId }),
   }).catch(() => null);
   if (classification?.mutatesAccount) await report.snapshotService?.invalidate();
-}
-
-export async function recoverAccount(
-  db: CartethyiaDatabase,
-  accountId: string,
-  reason = "manual_operator_recovery",
-): Promise<boolean> {
-  return persistAccountRecovery(db, accountId, reason);
-}
-
-export async function sweepExpiredCooldowns(db: CartethyiaDatabase): Promise<number> {
-  return sweepExpiredCooldownsFor(db);
 }
 
 export async function listAccountHealthEvents(

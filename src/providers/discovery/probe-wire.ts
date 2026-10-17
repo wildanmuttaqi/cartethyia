@@ -16,11 +16,12 @@
  * against. `discoveryPathsFor` now reads the registry, so a provider declares
  * its endpoint paths once.
  */
-import type { ServiceKind, WireFamily } from "../../transport/canonical-model";
+import type { WireFamily } from "../../protocol/canonical-model";
 import type { CompatibilityProfile } from "../provider-metadata";
-import { isBundledProviderId, type ModelDefinition } from "../provider-registry";
+import { isBundledProviderId } from "../provider-contracts";
+import type { ModelDefinition } from "../provider-model-definition";
 import { PROVIDER_CAPABILITIES } from "../default-registry";
-import { stripEndpointBasePath, resolveByokWireProfile } from "../operations/byok-wire-profile";
+import { resolveByokWireProfile } from "../operations/byok-wire-profile";
 
 /**
  * Endpoint paths declared for one provider by the provider registry.
@@ -153,7 +154,7 @@ export function applyDiscoveredWire(input: DiscoveredWireInput): DiscoveredModel
     (discoveredFamily !== undefined ? input.discoveredEndpointPath : undefined) ??
     input.staticEndpoints?.[wireFamily] ??
     input.resolvedEndpointPath;
-  return { wireFamily, endpointPath: stripEndpointBasePath(endpointPath, input.baseUrl) };
+  return { wireFamily, endpointPath };
 }
 
 /**
@@ -167,15 +168,8 @@ export function staticEndpointForWire(
   catalog: ReadonlyMap<string, readonly ModelDefinition[]>,
   providerId: string,
   wireFamily: WireFamily,
-  serviceKind: ServiceKind = "llm",
 ): string | undefined {
-  return catalog
-    .get(providerId)
-    ?.find(
-      (def) =>
-        def.wireFamily === wireFamily &&
-        (def.serviceKind ?? "llm") === serviceKind,
-    )?.endpointPath;
+  return catalog.get(providerId)?.find((def) => def.wireFamily === wireFamily)?.endpointPath;
 }
 
 function matchModelWireFamily(

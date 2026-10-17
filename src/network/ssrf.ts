@@ -1,8 +1,8 @@
 // SSRF guard: DNS resolution allowlists and destination validation for outbound fetch.
-import { resolve4, resolve6 } from "node:dns/promises";
+import { lookup } from "node:dns/promises";
 import { isIP } from "node:net";
-import { GatewayError } from "../transport/gateway-error";
-import type { SsrfPolicy } from "../config";
+import { GatewayError } from "../protocol/gateway-error";
+import type { SsrfPolicy } from "../config/network";
 
 const DNS_CACHE_TTL_MS = 60_000;
 const DNS_CACHE_MAX = 64;
@@ -25,6 +25,11 @@ export interface ValidatedDestination {
   readonly resolvedAddress: string;
   readonly port: number;
 }
+
+type DnsLookup = (
+  hostname: string,
+  options: { all: true },
+) => Promise<readonly { address: string; family: number }[]>;
 
 function ipv4Number(address: string): number {
   const parts = address.split(".");
@@ -164,7 +169,7 @@ export function validateResolvedAddresses(
   policy: SsrfPolicy,
 ): string {
   if (addresses.length === 0 || addresses.some((address) => !isAddressAllowed(address, policy))) {
-    throw new GatewayError("invalid_request", 400, "unsafe upstream address rejected");
+    throw new GatewayError("invalid_request", 400, "The upstream address this route resolves to is not allowed. Point the provider at a permitted host.");
   }
   return addresses[0]!;
 }
@@ -172,30 +177,48 @@ export function validateResolvedAddresses(
 export async function resolveAllAddresses(
   hostname: string,
   signal: AbortSignal,
+  lookupFn: DnsLookup = lookup,
 ): Promise<string[]> {
-  if (signal.aborted) throw new GatewayError("transport_closed", 499, "request was cancelled");
+  if (signal.aborted) throw abortErrorForSignal(signal);
   if (isIP(hostname)) return [hostname];
   const cached = dnsCache.get(hostname);
-  if (cached && Date.now() - cached.at < DNS_CACHE_TTL_MS) return cached.addrs;
+  if (cached) {
+    if (Date.now() - cached.at < DNS_CACHE_TTL_MS) return cached.addrs;
+    // Stale: a cached answer past the TTL must not pin a hostname to addresses
+    // the resolver may have already re-pointed (provider failover, DNS rebinding
+    // rotation). Drop it and fall through to a fresh lookup.
+    dnsCache.delete(hostname);
+  }
   try {
-    // Happy-eyeballs style: block only on the IPv4 (A) lookup. Some edge
-    // resolvers silently drop AAAA queries, so `resolve6` can stall for the
-    // full 2-5s resolver timeout — which `Promise.allSettled` would force
-    // every cache miss to pay. Fall back to AAAA only for IPv6-only hosts.
-    const v4 = await resolve4(hostname).catch(() => [] as string[]);
-    if (v4.length > 0) {
-      cacheDnsResult(hostname, [...new Set(v4)], Date.now());
-      return v4;
+    // `dns.lookup` follows the OS resolver, including hosts entries and a VPN
+    // stub that replaces resolv.conf at runtime. `resolve4`/`resolve6` query
+    // c-ares directly, so a tunnel resolver that refuses or drops those
+    // queries fails direct egress even while the OS can still answer.
+    // AAAA-only resolvers can stall, so the OS lookup itself has a deadline.
+    let timeout: ReturnType<typeof setTimeout> | undefined;
+    let onAbort: (() => void) | undefined;
+    let rows: readonly { address: string; family: number }[];
+    try {
+      rows = await Promise.race([
+        lookupFn(hostname, { all: true }),
+        new Promise<never>((_, reject) => {
+          timeout = setTimeout(() => reject(new Error("DNS lookup timed out")), 5_000);
+          onAbort = () => reject(abortErrorForSignal(signal));
+          signal.addEventListener("abort", onAbort, { once: true });
+          if (signal.aborted) onAbort();
+        }),
+      ]);
+    } finally {
+      if (timeout !== undefined) clearTimeout(timeout);
+      if (onAbort !== undefined) signal.removeEventListener("abort", onAbort);
     }
-    const v6 = await resolve6(hostname).catch(() => [] as string[]);
-    const addresses = [...new Set(v6)];
-    if (addresses.length === 0) throw new Error("no DNS answers");
-    cacheDnsResult(hostname, addresses, Date.now());
-    return addresses;
+    const addresses = [...new Set(rows.filter((row) => row.family === 4).map((row) => row.address))];
+    const selected = addresses.length > 0 ? addresses : [...new Set(rows.map((row) => row.address))];
+    if (selected.length === 0) throw new Error("no DNS answers");
+    cacheDnsResult(hostname, selected, Date.now());
+    return selected;
   } catch (error) {
-    // A deadline/abort surfaces as 499 (client cancelled), never 400 — the
-    // same contract the dispatch layer uses for a timed-out upstream dial.
-    if (signal.aborted) throw new GatewayError("transport_closed", 499, "request was cancelled");
+    if (signal.aborted) throw abortErrorForSignal(signal);
     // The hostname belongs to the provider's configuration, not to the
     // caller's request: a resolver that cannot answer is a network failure,
     // and reporting it as the caller's 400 `invalid_request` blamed the
@@ -208,6 +231,14 @@ export async function resolveAllAddresses(
       "network",
     );
   }
+}
+
+function abortErrorForSignal(signal: AbortSignal): GatewayError {
+  const reason = signal.reason;
+  if (reason instanceof GatewayError) return reason;
+  if (reason instanceof DOMException && reason.name === "TimeoutError")
+    return new GatewayError("deadline_exceeded", 504, "request deadline exceeded", {}, "cartethyia");
+  return new GatewayError("transport_closed", 499, "request was cancelled");
 }
 
 export async function resolveAndValidateOnce(

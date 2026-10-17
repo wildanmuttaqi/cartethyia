@@ -11,6 +11,9 @@ export const queryKeys = {
   system: {
     health: ["console", "system", "health"] as const,
   },
+  releases: {
+    githubLatest: ["console", "releases", "github-latest"] as const,
+  },
   usageAnalytics: {
     summary: (period: string) => ["console", "usage", "summary", period] as const,
     chart: (period: string) => ["console", "usage", "chart", period] as const,
@@ -77,9 +80,5 @@ export const queryKeys = {
     all: ["console", "quota"] as const,
     account: (accountId: string) => ["console", "quota", "account", accountId] as const,
     resets: (accountId: string) => ["console", "quota", "account", accountId, "resets"] as const,
-  },
-  studio: {
-    sessions: ["console", "studio", "sessions"] as const,
-    session: (sessionId: string) => ["console", "studio", "sessions", sessionId] as const,
   },
 } as const;

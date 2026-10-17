@@ -1,13 +1,14 @@
 import { providerAccounts, providerOauthStates } from "../../../persistence/schema";
 import { and, eq, isNull, sql } from "drizzle-orm";
 import { encryptCredential, hashSecret } from "../../../security/crypto";
-import type { CartethyiaDatabase } from "../../../persistence/postgres";
+import type { CartethyiaDatabase } from "../../../persistence/db-handle";
 import type { OAuthExchangeResult, OAuthLoginClient } from "../../../providers/authentication/oauth-flow-store";
 import type { OAuthDevicePollResponse } from "../catalog/contracts";
-import { providerJwtVerification, type ProviderRegistry } from "../../../providers/provider-registry";
-import { browserAuthorizeRedirectUri } from "../../../config";
+import { providerJwtVerification } from "../../../providers/provider-metadata";
+import type { ProviderRegistry } from "../../../providers/provider-registry";
+import { browserAuthorizeRedirectUri } from "../../../config/providers";
 import { log } from "../../../observability/logger";
-import { GatewayError } from "../../../transport/gateway-error";
+import { GatewayError } from "../../../protocol/gateway-error";
 import { Elysia, t } from "elysia";
 import { ConsoleDomainError, errorResponse, requireScope } from "../../shared/errors";
 import { generateOAuthState, generatePkcePair } from "../../../providers/authentication/oauth-flow-store";
@@ -16,7 +17,7 @@ import type { OAuthCallbackListener } from "./callback-listener";
 import { validateIssuedAccessToken } from "../../../providers/authentication/jwt-validator";
 import { inlineScriptContentSecurityPolicy } from "../../../security/outbound-headers";
 import type { AccessDecision } from "../../../security/access-control";
-import { isUniqueViolation } from "../../../persistence/postgres";
+import { isUniqueViolation } from "../../../persistence/boot";
 import type { ConsoleAccessResolver } from "../../auth/access";
 /**
  * The identity a repeated OAuth login is matched on.

@@ -1,11 +1,12 @@
-import type { CanonicalRequest, ContentPart } from "../../transport/canonical-model";
-import type { ProviderDispatchContext } from "../provider-registry";
+import type { CanonicalRequest, ContentPart } from "../../protocol/canonical-model";
+import type { ProviderDispatchContext } from "../provider-contracts";
 import { createHash } from "node:crypto";
 const SESSION_HEADERS = [
   "x-conversation-id",
   "x-session-id",
   "x-session-affinity",
   "x-opencode-session",
+  "x-opencode-session-id",
   "x-claude-code-session-id",
   "prompt_cache_key",
   "prompt-cache-key",

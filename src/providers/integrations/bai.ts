@@ -1,6 +1,7 @@
-import type { CanonicalRequest } from "../../transport/canonical-model";
-import type { ProviderDispatchTarget, ModelDefinition } from "../provider-registry";
-import { ensurePayloadModel, type ApiKeyProviderSpec } from "./configured-provider";
+import type { CanonicalRequest } from "../../protocol/canonical-model";
+import type { ProviderDispatchTarget } from "../provider-contracts";
+import type { ModelDefinition } from "../provider-model-definition";
+import { ensurePayloadModel, type ApiKeyProviderSpec } from "../configured-provider";
 
 const BAI_PROVIDER_ID = "bai" as const;
 
@@ -11,7 +12,7 @@ const BAI_PROVIDER_ID = "bai" as const;
  */
 
 
-import { defineModel } from "../model-definition";
+import { defineModel } from "../provider-model-definition";
 
 
 export const BAI_FALLBACK_MODELS: readonly ModelDefinition[] = [

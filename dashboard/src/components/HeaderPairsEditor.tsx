@@ -29,26 +29,26 @@ export function HeaderPairsEditor({
 
   return (
     <div className="form-group">
-      <label className="form-label" style={{ display: "block" }}>
-        <span style={{ display: "block" }}>Custom Headers</span>
-        <span className="form-hint" style={{ display: "block", marginTop: "2px" }}>
+      <label className="form-label block">
+        <span className="block">Custom Headers</span>
+        <span className="form-hint block mt-1">
           Optional — sent with every request, override built-in headers on a name collision
         </span>
       </label>
-      <div style={{ display: "flex", flexDirection: "column", gap: "6px" }}>
+      <div className="flex flex-col gap-3">
         {pairs.map(([key, value], index) => (
-          <div key={index} style={{ display: "flex", minWidth: 0, gap: "6px" }}>
+          <div key={index} className="flex min-w-0 gap-3">
             <Input
               placeholder="Header-Name"
               value={key}
               onChange={(e) => setPair(index, [e.target.value, value])}
-              style={{ minWidth: 0, flex: 1, fontFamily: "var(--font-mono)", fontSize: "12px" }}
+              className="font-mono tabular-nums min-w-0 flex-1 text-caption"
             />
             <Input
               placeholder="value"
               value={value}
               onChange={(e) => setPair(index, [key, e.target.value])}
-              style={{ minWidth: 0, flex: 1, fontFamily: "var(--font-mono)", fontSize: "12px" }}
+              className="font-mono tabular-nums min-w-0 flex-1 text-caption"
             />
             <Button
               type="button"

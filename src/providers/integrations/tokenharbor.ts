@@ -1,10 +1,10 @@
-import type { ApiKeyProviderSpec } from "./configured-provider";
-import { GatewayError } from "../../transport/gateway-error";
+import type { ApiKeyProviderSpec } from "../configured-provider";
+import { GatewayError } from "../../protocol/gateway-error";
 
 const TOKENHARBOR_PROVIDER_ID = "tokenharbor" as const;
 
-import { defineModel } from "../model-definition";
-import type { ModelDefinition } from "../provider-registry";
+import { defineModel } from "../provider-model-definition";
+import type { ModelDefinition } from "../provider-model-definition";
 
 // Mirrors GET /v1/models (fetched 2026-09-22, 59 rows): the fallback catalog
 // is the live catalog on a bad day, so every id below must exist upstream.

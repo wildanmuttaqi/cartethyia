@@ -11,7 +11,7 @@
  * it holds captured prompt/response bodies. The user asked for metadata-only
  * history, and a backup is a file that gets copied around, so bodies stay out
  * of it. A backup is therefore not a substitute for a database dump, and the
- * layer doc says so. Studio sessions are included in config because they are
+ * layer doc says so. Browser-only playground state is excluded because it is
  * tenant-owned saved work; health events remain derived runtime history.
  *
  * A backup carries provider credentials and API-key hashes because that *is*
@@ -35,7 +35,7 @@ import {
   providerRoutingSettings,
   providers,
   shareLinks,
-  studioSessions,
+  sharePopups,
   tenantDisabledModels,
   tenants,
   telemetryEvents,
@@ -59,6 +59,15 @@ export const MAX_ROWS_PER_TABLE = 500_000;
  * holding session/audit/runtime state are absent on purpose — a config restore
  * must not log everyone out, and audit history is not configuration.
  *
+ * `console_users` is absent for the same reason a restore must not touch the
+ * install's encryption: sign-in accounts belong to the install being restored
+ * *into*, not to the file. Restoring the exported admin's username and password
+ * hash would hand the recovering operator whatever credential the old install
+ * had — including one they never chose — and would fail closed on a fresh
+ * install whose hash was written by a different build. A first-boot restore
+ * therefore restores the configuration and leaves the wizard to create the
+ * administrator (see `setup-service.ts`).
+ *
  * Every table here must also declare its owner in {@link ownershipOf}. A
  * restore replaces rows; it may only replace rows the restoring tenant owns, and
  * a table whose ownership is undeclared makes the restore fail rather than fall
@@ -67,6 +76,7 @@ export const MAX_ROWS_PER_TABLE = 500_000;
  * `tenants` is deliberately NOT here. See {@link TENANT_TABLE}.
  */
 export const CONFIG_TABLES = [
+  sharePopups,
   shareLinks,
   providerOauthStates,
   tenantDisabledModels,
@@ -81,7 +91,6 @@ export const CONFIG_TABLES = [
   cliToolMappings,
   cliToolSettings,
   consoleSettings,
-  studioSessions,
   apiKeys,
 ] as const satisfies readonly Table[];
 
@@ -90,9 +99,9 @@ export const CONFIG_TABLES = [
  *
  * Every tenant-scoped table cascades from `tenants`, and several of those are
  * **not** part of a config backup: `telemetry_events`,
- * `telemetry_usage_totals`, `telemetry_payloads`, `console_users`,
- * `console_sessions`. Deleting the tenant
- * to re-insert it would therefore destroy usage history and Studio data this feature exists
+ * `telemetry_usage_totals`, `telemetry_payloads`, and `console_sessions`.
+ * Deleting the tenant
+ * to re-insert it would therefore destroy the usage history this feature exists
  * to preserve — and log out every console user as a side effect. A restore
  * ensures the tenant exists (needed when importing into a fresh database) and
  * leaves its identity alone.
@@ -101,6 +110,86 @@ export const TENANT_TABLE = tenants;
 
 /** Restorable metadata events and durable lifetime totals; payloads are excluded. */
 export const TELEMETRY_TABLES = [telemetryEvents, telemetryUsageTotals] as const satisfies readonly Table[];
+
+/**
+ * Every column sealed with this install's `CARTETHYIA_ENCRYPTION_KEY`.
+ *
+ * A backup is meant to move between installations, and sealed ciphertext is not:
+ * the bytes are opened only by the key that wrote them, so copying them into an
+ * install with a different key yields a credential no local code can ever read
+ * again. That is the defect this table exists to end — a restore used to insert
+ * the exported bytes verbatim, after first deleting the receiving install's own
+ * working credentials, which left every provider in the restored configuration
+ * unopenable and the new install's encryption destroyed.
+ *
+ * So a payload carries these columns **decrypted**, under the alias below, and a
+ * restore re-seals them under the key of the install it is writing into (export:
+ * `store.exportTable`, import: `store.toValues`). The file is as sensitive as the
+ * database either way — it always carried the plaintext API keys and the OAuth
+ * tokens they authorize — so this changes what a reader of the file sees, not
+ * what a reader of the database already had.
+ *
+ * The alias is not decoration. `"credential_ciphertext": "ya29.a0Af…"` names the
+ * cell for what it used to be rather than what it now holds, and a reader who
+ * trusts that name believes the file carries ciphertext it does not have —
+ * including whoever is debugging why a restored credential will not open. The
+ * column's own name stays in the schema, where it belongs.
+ *
+ * Keyed per table rather than by column name, because `credential_ciphertext`
+ * exists in two tables and means different things in each: an account's access
+ * token is not a proxy's credential.
+ *
+ * The one `bytea` column absent from here is `share_popups.image`: a PNG or JPEG
+ * the operator uploaded, opaque to this table, and it travels verbatim. Every
+ * other `bytea` column in the schema is here, so a new sealed column has to be
+ * added rather than discovered as the next broken restore.
+ */
+const SEALED_COLUMNS: Readonly<Record<string, Readonly<Record<string, string>>>> = {
+  provider_accounts: { credential_ciphertext: "access_token" },
+  provider_oauth_states: {
+    refresh_ciphertext: "refresh_token",
+    client_secret_ciphertext: "client_secret",
+  },
+  network_pools: { credential_ciphertext: "proxy_credential" },
+  api_keys: { key_encrypted: "api_key" },
+  share_links: { token_encrypted: "share_token" },
+};
+
+/** The sealed columns of `table`, by column name. */
+export function sealedColumns(table: Table): ReadonlySet<string> {
+  return new Set(Object.keys(SEALED_COLUMNS[getTableName(table)] ?? {}));
+}
+
+/**
+ * The name a column travels under in a payload.
+ *
+ * Returns the column's own name for anything not sealed, so an export loop does
+ * not have to branch on the answer.
+ */
+export function payloadNameOf(table: Table, column: string): string {
+  return SEALED_COLUMNS[getTableName(table)]?.[column] ?? column;
+}
+
+/**
+ * A payload's secret names for `table`, mapped to the columns they fill.
+ *
+ * The inverse of {@link payloadNameOf}, and the one place a payload row is
+ * translated back into schema columns. It is what makes a payload portable in
+ * both directions: the export writes `access_token`, and a restore reads it as
+ * `credential_ciphertext` and seals it under its own key.
+ *
+ * An alias that is also a real column is dropped rather than mapped — the schema
+ * wins, because a row is validated against it.
+ */
+export function sealedAliases(table: Table): ReadonlyMap<string, string> {
+  const out = new Map<string, string>();
+  const allowed = columnNames(table);
+  for (const [column, alias] of Object.entries(SEALED_COLUMNS[getTableName(table)] ?? {})) {
+    if (!allowed.has(alias)) out.set(alias, column);
+  }
+  return out;
+}
+
 
 /**
  * Which rows of a table belong to one tenant, and how a restore replaces them.
@@ -171,6 +260,7 @@ const INHERITED_OWNERSHIP: ReadonlyMap<
       replace: "delete",
     },
   ],
+  [sharePopups, { column: "api_key_id", parent: apiKeys, parentColumn: "id", replace: "delete" }],
   [shareLinks, { column: "api_key_id", parent: apiKeys, parentColumn: "id", replace: "delete" }],
 ]);
 
@@ -291,6 +381,16 @@ export interface BackupPayload {
     readonly config?: Record<string, readonly BackupRow[]>;
     readonly telemetry?: Record<string, readonly BackupRow[]>;
   };
+  /**
+   * The interchange projection of `sections.config.provider_accounts`: one
+   * connection per row, with the router export's field names.
+   *
+   * At the root rather than inside `sections`, because it is not a table. Every
+   * key under `sections.config` is resolved against the live schema and reported
+   * when it does not match, so a projection living there would be announced as an
+   * unknown table on every single restore.
+   */
+  readonly providerConnections?: readonly Record<string, unknown>[];
 }
 
 /** One exported row: JSON-safe scalars only, so `JSON.stringify` round-trips. */
@@ -332,20 +432,22 @@ export function columnNames(table: Table): ReadonlySet<string> {
 /**
  * Columns a backup may still name even though the schema dropped them.
  *
- * A backup is versioned, but a column can be dropped without bumping
- * {@link BACKUP_VERSION}: migrations apply forward over the same table, and the
- * export/restore round-trip is expected to survive across them. An older export
- * therefore legitimately carries columns that no longer exist — the per-account
- * `provider_accounts.max_inflight` (0029) and several retired `api_keys.*`
- * fields (0005/0016/0017/0018). Validation must not reject those: it skips them,
- * so a stale backup still restores rather than failing on a column that is, by
- * definition, no longer read. The value is dropped, not migrated — each retired
- * column's replacement lives elsewhere in the schema, and importing a dead
- * number back would be worse than omitting it.
+ * A backup is versioned, but old exports may carry columns the current schema
+ * no longer has. Validation accepts known retired fields and skips them rather
+ * than rejecting the whole backup. Fields with a current equivalent are
+ * normalized before this list is applied; these remaining values have no
+ * replacement in the schema.
  */
 const LEGACY_DROPPED_COLUMNS: Readonly<Record<string, readonly string[]>> = {
-  provider_accounts: ["max_inflight"],
+  provider_accounts: ["max_inflight", "min_credit_balance", "last_remaining_credit", "last_remaining_percent"],
+  provider_routing_settings: ["credit_floor", "credit_limit", "credit_limit_enabled"],
+  share_links: ["used_at"],
   api_keys: [
+    "share_popup_enabled",
+    "share_popup_image",
+    "share_popup_image_mime",
+    "share_popup_title",
+    "share_popup_body",
     "model_allowlist",
     "model_denylist",
     "provider_allowlist",
@@ -399,11 +501,32 @@ export interface RestoreResult {
   readonly skipped: Record<string, number>;
 }
 
+/**
+ * One part of a backup that could not be restored, and why.
+ *
+ * Reported, never thrown: a restore is partial by contract. An old export
+ * legitimately names tables and columns that no longer exist, and the answer is
+ * to recover the rest and say what was left out — not to lose the whole file.
+ *
+ * A warning names schema objects only. It never carries a cell value, so a
+ * failed restore of a backup full of credentials cannot echo one.
+ */
+export interface RestoreWarning {
+  /** The table the payload named, when the cause belongs to one. */
+  readonly table?: string;
+  /** The column that did not resolve, when the cause is a column. */
+  readonly column?: string;
+  /** Operator-facing cause. */
+  readonly reason: string;
+}
+
 /** A payload that passed validation: tables resolved to real schema objects. */
 export interface ValidatedRestore {
   readonly tables: ReadonlyMap<Table, ValidatedTable>;
   readonly tenantRows: readonly BackupRow[];
   readonly counts: Record<string, number>;
+  /** What validation had to leave out. Empty means the whole file applied. */
+  readonly warnings: readonly RestoreWarning[];
 }
 
 export type RestoreValidation =

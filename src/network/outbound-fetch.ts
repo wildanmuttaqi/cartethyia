@@ -1,20 +1,12 @@
 // Validated fetch: SSRF-guarded outbound fetch with optional pool-agent support.
-import { GatewayError } from "../transport/gateway-error";
-import {
-  Agent as HttpAgent,
-  request as httpRequest,
-  type RequestOptions,
-} from "node:http";
+import { GatewayError } from "../protocol/gateway-error";
+import { Agent as HttpAgent, request as httpRequest, type RequestOptions } from "node:http";
 import { Agent as HttpsAgent, request as httpsRequest } from "node:https";
 import { Readable, type Transform } from "node:stream";
 import { createBrotliDecompress, createGunzip, createInflate } from "node:zlib";
 import { resolveAllAddresses, validateResolvedAddresses } from "./ssrf";
-import type { SsrfPolicy } from "../config";
-import {
-  isProxyAgentPair,
-  shouldFallbackToBridgeRelay,
-  type ProxyAgentPair,
-} from "./pool/agent";
+import type { SsrfPolicy } from "../config/network";
+import { isProxyAgentPair, type ProxyAgentPair } from "./pool/agent";
 import { metrics } from "../observability/metrics";
 import { trackNetworkCall } from "../observability/performance-metrics";
 import { stripResponseHeaders } from "./response-headers";
@@ -23,16 +15,10 @@ export interface ValidatedFetchOptions {
   readonly fetchFn?: typeof fetch;
   readonly policy?: SsrfPolicy;
   readonly maxRedirects?: number;
-  readonly resolveFn?: (
-    hostname: string,
-    signal: AbortSignal,
-  ) => Promise<readonly string[]>;
+  readonly resolveFn?: (hostname: string, signal: AbortSignal) => Promise<readonly string[]>;
   readonly agent?: HttpAgent | HttpsAgent | ProxyAgentPair;
 }
-export type ValidatedFetch = (
-  input: RequestInfo | URL,
-  init?: RequestInit,
-) => Promise<Response>;
+export type ValidatedFetch = (input: RequestInfo | URL, init?: RequestInit) => Promise<Response>;
 
 /**
  * Node validates `agent.protocol` per request, so a pool pair contributes
@@ -44,8 +30,7 @@ function agentForTarget(
   protocol: string,
 ): HttpAgent | HttpsAgent | undefined {
   if (!agent) return undefined;
-  if (isProxyAgentPair(agent))
-    return protocol === "https:" ? agent.https : agent.http;
+  if (isProxyAgentPair(agent)) return protocol === "https:" ? agent.https : agent.http;
   return agent;
 }
 
@@ -67,47 +52,11 @@ function relayRequest(
   headers.set("x-relay-path", `${target.pathname}${target.search}`);
   if (relayUrl.username || relayUrl.password) {
     const credentials = `${decodeURIComponent(relayUrl.username)}:${decodeURIComponent(relayUrl.password)}`;
-    headers.set(
-      "x-relay-auth",
-      `Basic ${Buffer.from(credentials).toString("base64")}`,
-    );
+    headers.set("x-relay-auth", `Basic ${Buffer.from(credentials).toString("base64")}`);
     relayUrl.username = "";
     relayUrl.password = "";
   }
   return { url: relayUrl, init: { ...init, headers } };
-}
-
-/**
- * Builds the request a `bridge` pool sends when the front door refused
- * CONNECT. A carte-bridge accepts its target origin and origin-form path in
- * bridge-specific headers, so the target never appears in a query string or
- * access-log URL.
- *
- * The caller's `Host` is dropped: it names the bridge, and the bridge rewrites
- * Host for the upstream itself. If the endpoint has userinfo credentials, they
- * are moved into `x-bridge-auth` and removed from the request URL; the
- * provider's `Authorization` header remains untouched.
- */
-function bridgeRequest(
-  bridgeEndpoint: URL,
-  target: URL,
-  init: RequestInit,
-): { url: URL; init: RequestInit } {
-  const bridgeUrl = new URL(bridgeEndpoint.toString());
-  const headers = new Headers(init.headers);
-  headers.delete("host");
-  headers.set("x-bridge-target", target.origin);
-  headers.set("x-bridge-path", `${target.pathname}${target.search}`);
-  if (bridgeUrl.username || bridgeUrl.password) {
-    const credentials = `${decodeURIComponent(bridgeUrl.username)}:${decodeURIComponent(bridgeUrl.password)}`;
-    headers.set(
-      "x-bridge-auth",
-      `Basic ${Buffer.from(credentials).toString("base64")}`,
-    );
-    bridgeUrl.username = "";
-    bridgeUrl.password = "";
-  }
-  return { url: bridgeUrl, init: { ...init, headers } };
 }
 
 /**
@@ -131,11 +80,7 @@ function decompressBody(
   encoding: string | undefined,
 ): { stream: Readable; encoding: string | undefined } {
   const normalized = encoding?.trim().toLowerCase();
-  if (
-    normalized === undefined ||
-    normalized === "" ||
-    normalized === "identity"
-  ) {
+  if (normalized === undefined || normalized === "" || normalized === "identity") {
     return { stream: body, encoding: undefined };
   }
   const decoder: Transform | undefined =
@@ -154,28 +99,22 @@ function decompressBody(
   return { stream: body.pipe(decoder), encoding: undefined };
 }
 
-async function pinnedFetch(
-  url: URL,
+async function pinnedFetch(  url: URL,
   init: RequestInit,
   resolvedAddress: string | undefined,
   agent?: HttpAgent | HttpsAgent,
 ): Promise<Response> {
   const request = url.protocol === "https:" ? httpsRequest : httpRequest;
   const headers = new Headers(init.headers);
-  let body: string | Buffer | undefined;
-  if (init.body !== undefined && init.body !== null) {
-    if (typeof init.body === "string") {
-      body = init.body;
-    } else {
-      const serialized = new Response(init.body);
-      // FormData's boundary must come from the same serialization as its bytes.
-      const contentType = serialized.headers.get("content-type");
-      if (contentType !== null && !headers.has("content-type")) {
-        headers.set("content-type", contentType);
-      }
-      body = Buffer.from(await serialized.arrayBuffer());
-    }
-  }
+  // String/Buffer/Uint8Array bodies go direct: routing them through
+  // `new Response(body).arrayBuffer()` copied the whole body per request.
+  const rawBody = init.body;
+  const body =
+    rawBody === undefined || rawBody === null
+      ? undefined
+      : typeof rawBody === "string" || Buffer.isBuffer(rawBody) || rawBody instanceof Uint8Array
+        ? rawBody
+        : Buffer.from(await new Response(rawBody).arrayBuffer());
   const outboundHeaders: Record<string, string> = {};
   headers.forEach((value, key) => {
     outboundHeaders[key] = value;
@@ -185,9 +124,7 @@ async function pinnedFetch(
   // the request, adding an avoidable RTT compared with global fetch/Undici.
   if (body !== undefined && !headers.has("content-length")) {
     outboundHeaders["content-length"] =
-      typeof body === "string"
-        ? String(Buffer.byteLength(body, "utf8"))
-        : String(body.byteLength);
+      typeof body === "string" ? String(Buffer.byteLength(body, "utf8")) : String(body.byteLength);
   }
   const lookup = ((
     _hostname: string,
@@ -225,10 +162,7 @@ async function pinnedFetch(
       },
       (response) => {
         const responseHeaders = stripResponseHeaders(response.headers);
-        const { stream, encoding } = decompressBody(
-          response,
-          response.headers["content-encoding"],
-        );
+        const { stream, encoding } = decompressBody(response, response.headers["content-encoding"]);
         if (encoding === undefined) {
           // Body is plain (decoded here, or never compressed): the header must
           // not survive, or the caller would try to decode a decoded body.
@@ -236,9 +170,7 @@ async function pinnedFetch(
         }
         // A compressed body this path cannot decode keeps its header so the
         // caller's decoder still applies.
-        const webStream = Readable.toWeb(
-          stream,
-        ) as unknown as ReadableStream<Uint8Array>;
+        const webStream = Readable.toWeb(stream) as unknown as ReadableStream<Uint8Array>;
         resolve(
           new Response(webStream, {
             status: response.statusCode ?? 502,
@@ -253,11 +185,7 @@ async function pinnedFetch(
   });
 }
 
-const CREDENTIAL_HEADERS = [
-  "authorization",
-  "cookie",
-  "proxy-authorization",
-] as const;
+const CREDENTIAL_HEADERS = ["authorization", "cookie", "proxy-authorization"] as const;
 
 function stripCredentialsOnCrossOrigin(
   headersInit: HeadersInit | undefined,
@@ -267,9 +195,7 @@ function stripCredentialsOnCrossOrigin(
   return headers;
 }
 
-export function createValidatedFetch(
-  options: ValidatedFetchOptions = {},
-): ValidatedFetch {
+export function createValidatedFetch(options: ValidatedFetchOptions = {}): ValidatedFetch {
   const policy = options.policy ?? {};
   const maxRedirects = options.maxRedirects ?? policy.maxRedirects ?? 3;
   const resolveFn = options.resolveFn ?? resolveAllAddresses;
@@ -277,13 +203,9 @@ export function createValidatedFetch(
   const relayEndpoint = isProxyAgentPair(configuredAgent)
     ? configuredAgent.relayEndpoint
     : undefined;
-  const bridgeEndpoint = isProxyAgentPair(configuredAgent)
-    ? configuredAgent.bridgeEndpoint
-    : undefined;
   return async (input, init = {}) => {
     const startedAt = performance.now();
-    let url =
-      input instanceof Request ? new URL(input.url) : new URL(input.toString());
+    let url = input instanceof Request ? new URL(input.url) : new URL(input.toString());
     let requestInit: RequestInit = { ...init, redirect: "manual" };
     if (input instanceof Request && init.headers === undefined) {
       requestInit.headers = new Headers(input.headers);
@@ -304,7 +226,6 @@ export function createValidatedFetch(
       const poolDialsTarget = Boolean(configuredAgent || relayEndpoint);
       let resolvedAddress: string | undefined;
       let relayResolvedAddress: string | undefined;
-      let bridgeResolvedAddress: string | undefined;
       if (poolDialsTarget) {
         // The egress dials the pool/relay, which resolves the target itself.
         // Counting these lets ops confirm how much traffic depends on
@@ -318,38 +239,17 @@ export function createValidatedFetch(
           resolvedAddress = addresses[0];
         }
         if (relayEndpoint) {
-          const relayAddresses = await resolveFn(
-            relayEndpoint.hostname,
-            signal,
-          );
+          const relayAddresses = await resolveFn(relayEndpoint.hostname, signal);
           validateResolvedAddresses(relayAddresses, policy);
           relayResolvedAddress = relayAddresses[0];
           if (!relayResolvedAddress)
-            throw new TypeError(
-              `no validated address for ${relayEndpoint.hostname}`,
-            );
-        }
-        // The bridge's relay fallback dials the bridge itself, so its host must
-        // resolve locally even though the CONNECT attempt does not need it.
-        if (bridgeEndpoint) {
-          const bridgeAddresses = await resolveFn(
-            bridgeEndpoint.hostname,
-            signal,
-          );
-          validateResolvedAddresses(bridgeAddresses, policy);
-          bridgeResolvedAddress = bridgeAddresses[0];
-          if (!bridgeResolvedAddress)
-            throw new TypeError(
-              `no validated address for ${bridgeEndpoint.hostname}`,
-            );
+            throw new TypeError(`no validated address for ${relayEndpoint.hostname}`);
         }
       } catch (error) {
         // A pool/relay-owned dial still needs its egress host locally; only
         // the advisory target lookup may degrade.
         if (relayEndpoint && !relayResolvedAddress) throw error;
-        if (bridgeEndpoint && !bridgeResolvedAddress) throw error;
-        if (!poolDialsTarget)
-          throw new TypeError(`no validated address for ${url.hostname}`);
+        if (!poolDialsTarget) throw new TypeError(`no validated address for ${url.hostname}`);
       }
       if (!poolDialsTarget && !resolvedAddress)
         throw new TypeError(`no validated address for ${url.hostname}`);
@@ -359,35 +259,6 @@ export function createValidatedFetch(
         response = options.fetchFn
           ? await options.fetchFn(relay.url, relay.init)
           : await pinnedFetch(relay.url, relay.init, relayResolvedAddress!);
-      } else if (bridgeEndpoint) {
-        // Prefer CONNECT: where the bridge's runtime holds a raw socket it
-        // answers the handshake and this pool tunnels like any HTTP proxy, which
-        // keeps the target's own TLS end-to-end. A serverless front door cannot,
-        // and its refusal is the signal to retry through the bridge-specific
-        // x-bridge-target/x-bridge-path relay contract. An injected `fetchFn`
-        // has no agent machinery, so it can only exercise that relay form.
-        if (options.fetchFn) {
-          const bridge = bridgeRequest(bridgeEndpoint, url, requestInit);
-          response = await options.fetchFn(bridge.url, bridge.init);
-        } else {
-          try {
-            const agent = agentForTarget(configuredAgent, url.protocol);
-            response = await pinnedFetch(
-              url,
-              requestInit,
-              resolvedAddress!,
-              agent,
-            );
-          } catch (error) {
-            if (!shouldFallbackToBridgeRelay(error)) throw error;
-            const bridge = bridgeRequest(bridgeEndpoint, url, requestInit);
-            response = await pinnedFetch(
-              bridge.url,
-              bridge.init,
-              bridgeResolvedAddress!,
-            );
-          }
-        }
       } else if (options.fetchFn) {
         response = await options.fetchFn(url, requestInit);
       } else {
@@ -409,34 +280,16 @@ export function createValidatedFetch(
       const nextUrl = new URL(location, url);
       const isCrossOriginRedirect = nextUrl.origin !== url.origin;
       if (isCrossOriginRedirect) {
-        requestInit = {
-          ...requestInit,
-          headers: stripCredentialsOnCrossOrigin(requestInit.headers),
-        };
+        requestInit = { ...requestInit, headers: stripCredentialsOnCrossOrigin(requestInit.headers) };
       }
-      if (
-        isCrossOriginRedirect &&
-        (response.status === 307 || response.status === 308)
-      ) {
+      if (isCrossOriginRedirect && (response.status === 307 || response.status === 308)) {
         const method = (requestInit.method ?? "GET").toUpperCase();
-        if (
-          method !== "GET" &&
-          method !== "HEAD" &&
-          requestInit.body !== undefined
-        ) {
-          throw new GatewayError(
-            "invalid_request",
-            400,
-            "cross-origin redirect with body blocked",
-          );
+        if (method !== "GET" && method !== "HEAD" && requestInit.body !== undefined) {
+          throw new GatewayError("invalid_request", 400, "cross-origin redirect with body blocked");
         }
       }
       url = nextUrl;
-      if (
-        response.status === 301 ||
-        response.status === 302 ||
-        response.status === 303
-      ) {
+      if (response.status === 301 || response.status === 302 || response.status === 303) {
         const method = (requestInit.method ?? "GET").toUpperCase();
         if (method !== "GET" && method !== "HEAD") {
           const { body: _body, ...withoutBody } = requestInit;

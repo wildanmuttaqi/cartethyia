@@ -27,11 +27,11 @@ import {
   isOAuthCredentialInvalidated,
   shouldCooldownPool,
 } from "../../src/transport/dispatch/retry-policy";
-import { GatewayError } from "../../src/transport/gateway-error";
-import { providerRateLimitIsIpScoped } from "../../src/providers/provider-registry";
+import { GatewayError } from "../../src/protocol/gateway-error";
+import { providerRateLimitIsIpScoped } from "../../src/providers/provider-metadata";
 
 /** The one bundled provider whose rate limit follows the egress address. */
-const IP_SCOPED_PROVIDER = "opencodeft";
+const IP_SCOPED_PROVIDER = "opencode";
 /** A bundled provider whose limits are keyed to the account credential. */
 const ACCOUNT_KEYED_PROVIDER = "anthropic";
 

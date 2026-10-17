@@ -1,9 +1,15 @@
 import { mkdir, open, readdir, readFile, stat, unlink } from "node:fs/promises";
 import { basename, join } from "node:path";
 import { randomUUID } from "node:crypto";
+import { gunzipSync, gzipSync } from "node:zlib";
 
 export interface PayloadFileReference {
-  readonly storage: "jsonb-file";
+  /**
+   * `jsonb-file` is a frame written before compression existed: plain JSON.
+   * New frames are `jsonl-file`: the same JSON, gzipped. The row names its
+   * encoding, so a reader never guesses and an old row still resolves.
+   */
+  readonly storage: "jsonb-file" | "jsonl-file";
   readonly file: string;
   readonly offset: number;
   readonly length: number;
@@ -22,7 +28,7 @@ export function isPayloadFileReference(value: unknown): value is PayloadFileRefe
   if (typeof value !== "object" || value === null) return false;
   const record = value as Record<string, unknown>;
   return (
-    record["storage"] === "jsonb-file" &&
+    (record["storage"] === "jsonb-file" || record["storage"] === "jsonl-file") &&
     typeof record["file"] === "string" &&
     typeof record["offset"] === "number" &&
     typeof record["length"] === "number" &&
@@ -62,7 +68,13 @@ const DEFAULT_MAX_FILE_BYTES = 64 * 1024 * 1024;
 const DEFAULT_DIRECTORY = "./data/telemetry-payloads";
 let writeTail: Promise<void> = Promise.resolve();
 
-function payloadDirectory(): string {
+/**
+ * Single source of truth for the telemetry payload directory: the
+ * `CARTETHYIA_TELEMETRY_PAYLOAD_DIR` override when set, otherwise the
+ * default `./data/telemetry-payloads`. Every writer and reader must resolve
+ * the directory through this function so the two can never drift.
+ */
+export function payloadDirectory(): string {
   return process.env.CARTETHYIA_TELEMETRY_PAYLOAD_DIR?.trim() || DEFAULT_DIRECTORY;
 }
 
@@ -71,11 +83,14 @@ function maxFileBytes(): number {
   return Number.isFinite(raw) && raw > 0 ? Math.floor(raw) : DEFAULT_MAX_FILE_BYTES;
 }
 
-function checksum(value: string): string {
+function checksum(value: Buffer | readonly Buffer[]): string {
+  const parts = Array.isArray(value) ? value : [value];
   let hash = 2166136261;
-  for (let index = 0; index < value.length; index += 1) {
-    hash ^= value.charCodeAt(index);
-    hash = Math.imul(hash, 16777619);
+  for (const part of parts) {
+    for (let index = 0; index < part.byteLength; index += 1) {
+      hash ^= part[index]!;
+      hash = Math.imul(hash, 16777619);
+    }
   }
   return (hash >>> 0).toString(16).padStart(8, "0");
 }
@@ -84,10 +99,24 @@ function fileName(now = new Date()): string {
   return `${now.toISOString().slice(0, 13).replaceAll(":", "-")}-${process.pid}.jsonb`;
 }
 
-async function appendFrame(frame: PayloadFrame): Promise<PayloadFileReference> {
+/**
+ * Gzipped frame body.
+ *
+ * The pieces stay separate until here, because nothing before the write reads
+ * them assembled and joining them earlier is a copy of the whole frame. The
+ * join happens once, at the moment of compression, and the compressed buffer
+ * is what gets written, checksummed, and bounded — so the cap and the
+ * reference both describe bytes on disk, not bytes of JSON.
+ */
+function compressFrame(parts: readonly Buffer[]): Buffer {
+  return gzipSync(Buffer.concat(parts));
+}
+
+async function appendFrame(frame: PayloadFrame, parts?: readonly Buffer[]): Promise<PayloadFileReference> {
   const directory = payloadDirectory();
   await mkdir(directory, { recursive: true });
-  const encoded = Buffer.from(JSON.stringify(frame), "utf8");
+  parts ??= [Buffer.from(JSON.stringify(frame), "utf8")];
+  const encoded = compressFrame(parts);
   if (encoded.byteLength > MAX_FRAME_BYTES) throw new Error("telemetry payload frame exceeds limit");
   const file = fileName();
   const path = join(directory, file);
@@ -95,7 +124,7 @@ async function appendFrame(frame: PayloadFrame): Promise<PayloadFileReference> {
   const offset = currentSize;
   if (offset + FRAME_HEADER_BYTES + encoded.byteLength > maxFileBytes()) {
     const rotated = `${Date.now()}-${randomUUID()}.jsonb`;
-    return appendFrameToPath(frame, join(directory, rotated));
+    return appendFrameToPath(frame, join(directory, rotated), basename(rotated), undefined, encoded);
   }
   return appendFrameToPath(frame, path, file, offset, encoded);
 }
@@ -107,34 +136,77 @@ async function appendFrameToPath(
   knownOffset?: number,
   knownEncoded?: Buffer,
 ): Promise<PayloadFileReference> {
-  const encoded = knownEncoded ?? Buffer.from(JSON.stringify(frame), "utf8");
+  const encoded = knownEncoded ?? compressFrame([Buffer.from(JSON.stringify(frame), "utf8")]);
   const offset = knownOffset ?? await stat(path).then((value) => value.size).catch(() => 0);
   const header = Buffer.alloc(FRAME_HEADER_BYTES);
   header.writeUInt32BE(encoded.byteLength, 0);
   const handle = await open(path, "a");
   try {
-    await handle.write(Buffer.concat([header, encoded]));
+    await handle.write(header);
+    await handle.write(encoded);
   } finally {
     await handle.close();
   }
   return {
-    storage: "jsonb-file",
+    storage: "jsonl-file",
     file: knownFile,
     offset,
     length: FRAME_HEADER_BYTES + encoded.byteLength,
-    checksum: checksum(encoded.toString("utf8")),
+    checksum: checksum(encoded),
     version: 1,
   };
 }
 
-export function writePayloadFrame(payload: unknown, expiresAt: Date): Promise<PayloadFileReference> {
-  const frame: PayloadFrame = {
-    version: 1,
-    id: randomUUID(),
-    expiresAt: expiresAt.toISOString(),
-    payload,
-  };
-  const task = writeTail.then(() => appendFrame(frame));
+const FRAME_BODY_KEYS = [
+  "request_body",
+  "response_body",
+  "client_response_body",
+  "provider_request_body",
+  "provider_response_body",
+] as const;
+
+/**
+ * The pieces of a frame whose bodies were already serialized while measured.
+ *
+ * Returned as separate buffers rather than one assembled buffer: the file
+ * write accepts a list, and assembling them first is a copy of the whole frame
+ * that nothing reads back.
+ */
+function prebuiltFrameParts(
+  id: string,
+  expiresAt: string,
+  capturedAt: string,
+  requestId: string | null,
+  signals: unknown,
+  bodies: readonly string[],
+): Buffer[] {
+  const parts = [
+    Buffer.from(
+      `{"version":1,"id":${JSON.stringify(id)},"expiresAt":${JSON.stringify(expiresAt)},` +
+        `"payload":{"request_id":${JSON.stringify(requestId)},"captured_at":${JSON.stringify(capturedAt)},` +
+        `"expires_at":${JSON.stringify(expiresAt)}`,
+      "utf8",
+    ),
+  ];
+  for (let index = 0; index < FRAME_BODY_KEYS.length; index += 1) {
+    parts.push(Buffer.from(`,"${FRAME_BODY_KEYS[index]}":${bodies[index] ?? "null"}`, "utf8"));
+  }
+  parts.push(Buffer.from(`,"signals":${JSON.stringify(signals)}}}`, "utf8"));
+  return parts;
+}
+
+export function writePayloadFrame(
+  payload: unknown,
+  expiresAt: Date,
+  prebuilt?: { readonly requestId: string | null; readonly capturedAt: string; readonly signals: unknown; readonly bodies: readonly string[] },
+): Promise<PayloadFileReference> {
+  const id = randomUUID();
+  const expires = expiresAt.toISOString();
+  const parts = prebuilt
+    ? prebuiltFrameParts(id, expires, prebuilt.capturedAt, prebuilt.requestId, prebuilt.signals, prebuilt.bodies)
+    : undefined;
+  const frame: PayloadFrame = { version: 1, id, expiresAt: expires, payload };
+  const task = writeTail.then(() => appendFrame(frame, parts));
   writeTail = task.then(() => undefined, () => undefined);
   return task;
 }
@@ -145,15 +217,39 @@ export async function readPayloadFrame(reference: PayloadFileReference): Promise
   const safeFile = basename(reference.file);
   if (safeFile !== reference.file || safeFile.length === 0) return undefined;
   const path = join(payloadDirectory(), safeFile);
-  const data = await readFile(path);
-  if (reference.offset < 0 || reference.offset + reference.length > data.byteLength) return undefined;
-  const frame = data.subarray(reference.offset, reference.offset + reference.length);
+  // Read exactly the frame. Reading the whole file copied every earlier frame
+  // in the same hour into memory just to return one of them.
+  const handle = await open(path, "r");
+  let data: Buffer;
+  try {
+    const stat = await handle.stat();
+    if (reference.offset < 0 || reference.offset + reference.length > stat.size) return undefined;
+    data = Buffer.alloc(reference.length);
+    await handle.read(data, 0, reference.length, reference.offset);
+  } finally {
+    await handle.close();
+  }
+  const frame = data;
   const length = frame.readUInt32BE(0);
-  if (length + FRAME_HEADER_BYTES !== frame.byteLength) return undefined;
-  const json = frame.subarray(FRAME_HEADER_BYTES).toString("utf8");
-  if (checksum(json) !== reference.checksum) return undefined;
-  const parsed = JSON.parse(json) as PayloadFrame;
+  if (length <= 0 || length + FRAME_HEADER_BYTES !== frame.byteLength) return undefined;
+  const stored = frame.subarray(FRAME_HEADER_BYTES);
+  if (checksum(stored) !== reference.checksum) return undefined;
+  // The row says which encoding it wrote. A compressed row that does not
+  // decompress is a damaged frame, reported as absent like any other
+  // unreadable frame, never thrown into the request that asked for it.
+  const json = reference.storage === "jsonl-file" ? gunzipFrame(stored) : stored;
+  if (json === undefined) return undefined;
+  const parsed = JSON.parse(json.toString("utf8")) as PayloadFrame;
   return parsed.version === 1 ? parsed.payload : undefined;
+}
+
+/** Decompressed frame body, or undefined when the bytes are not gzip. */
+function gunzipFrame(stored: Buffer): Buffer | undefined {
+  try {
+    return gunzipSync(stored);
+  } catch {
+    return undefined;
+  }
 }
 
 /**
@@ -166,6 +262,23 @@ export async function readPayloadFrame(reference: PayloadFileReference): Promise
  */
 type FrameLiveness = "live" | "none" | "unknown";
 
+/**
+ * The JSON of one stored frame, whichever encoding wrote it.
+ *
+ * A frame names no encoding of its own — the row does — and this pass reads
+ * files, not rows. gzip bytes start with the 0x1f 0x8b magic and plain JSON
+ * starts with `{`, so the encoding is read off the bytes. Anything else is
+ * corrupt and falls through to the caller's parse, which reports the file
+ * unreadable rather than empty.
+ */
+function frameJson(stored: Buffer): Buffer {
+  if (stored.byteLength >= 2 && stored[0] === 0x1f && stored[1] === 0x8b) {
+    return gunzipSync(stored);
+  }
+  return stored;
+}
+
+
 function frameLiveness(data: Buffer, before: Date): FrameLiveness {
   let offset = 0;
   while (offset + FRAME_HEADER_BYTES <= data.byteLength) {
@@ -175,7 +288,7 @@ function frameLiveness(data: Buffer, before: Date): FrameLiveness {
     if (length <= 0 || end > data.byteLength) return "unknown";
     let frame: PayloadFrame;
     try {
-      frame = JSON.parse(data.subarray(offset + FRAME_HEADER_BYTES, end).toString("utf8")) as PayloadFrame;
+      frame = JSON.parse(frameJson(data.subarray(offset + FRAME_HEADER_BYTES, end)).toString("utf8")) as PayloadFrame;
     } catch {
       return "unknown";
     }

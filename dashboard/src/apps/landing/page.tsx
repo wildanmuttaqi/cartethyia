@@ -1,10 +1,15 @@
-import { useEffect, useRef, useState, type ReactElement } from "react";
+import { useEffect, useRef, useState, type CSSProperties, type ReactElement } from "react";
 import { Activity, ArrowRight, ArrowUpRight, Home, Menu, MessageCircle, Network, ShieldCheck, Sparkles, Terminal, X } from "lucide-react";
-import { GITHUB_REPO_URL, GithubBadge } from "../../components/patterns/github-badge";
+import { GITHUB_REPO_URL } from "../../lib/links";
+import { GithubBadge } from "../../components/patterns/github-badge";
+import { acquireBodyScrollLock } from "../../hooks/use-modal-focus";
 import { useReducedMotion } from "../../hooks/use-reduced-motion";
 
 type SignalIconName = "activity" | "network" | "shield" | "sparkles" | "terminal";
 type StoryTheme = "night" | "core" | "blossom" | "voices" | "red" | "denial" | "shore";
+type StoryStyle = CSSProperties & {
+  readonly "--story-accent": string;
+};
 
 interface Signal {
   readonly label: string;
@@ -23,13 +28,21 @@ interface StoryChapter {
   readonly imageAlt: string;
   readonly theme: StoryTheme;
   readonly signals: readonly Signal[];
-  readonly sectionClass?: string;
 }
 
 const ASSET_BASE = import.meta.env.BASE_URL;
 const CONSOLE_PATH = "/console";
+const STORY_THEME_STYLES: Record<StoryTheme, StoryStyle> = {
+  night: { "--story-accent": "var(--color-story-night)" },
+  core: { "--story-accent": "var(--color-story-core)" },
+  blossom: { "--story-accent": "var(--color-story-blossom)" },
+  voices: { "--story-accent": "var(--color-story-voices)" },
+  red: { "--story-accent": "var(--color-story-red)" },
+  denial: { "--story-accent": "var(--color-story-denial)" },
+  shore: { "--story-accent": "var(--color-story-shore)" },
+};
 
-const storyImage = (name: string): string => `${ASSET_BASE}when_yah/${name}`;
+const storyImage = (name: string): string => `${ASSET_BASE}assets/story/${name}`;
 const titleCase = (value: string): string => value.toLowerCase().replace(/\b\w/g, (letter) => letter.toUpperCase());
 const nextChapterLabel = (index: number): string => {
   const next = CHAPTERS[index + 1];
@@ -54,7 +67,6 @@ const CHAPTERS: readonly StoryChapter[] = [
       { label: "The chosen vessel", value: "YOURS", icon: "shield" },
       { label: "The gate", value: "ALIGNED", icon: "sparkles" },
     ],
-    sectionClass: "story-page-section--first",
   },
   {
     id: "resonant-core",
@@ -89,7 +101,6 @@ const CHAPTERS: readonly StoryChapter[] = [
       { label: "The studio", value: "READY", icon: "sparkles" },
       { label: "The balance", value: "HELD", icon: "shield" },
     ],
-    sectionClass: "story-page-section--blossom",
   },
   {
     id: "many-voices",
@@ -169,13 +180,18 @@ const signalIcons: Record<SignalIconName, typeof Activity> = {
   terminal: Terminal,
 };
 
-function SignalRow({ signal }: { readonly signal: Signal }): ReactElement {
+function SignalStatusTile({ signal }: { readonly signal: Signal }): ReactElement {
   const Icon = signalIcons[signal.icon];
+
   return (
-    <div className="story-signal">
-      <Icon size={13} aria-hidden={true} />
-      <span>{signal.label}</span>
-      <strong>{signal.value}</strong>
+    <div className="landing-signal-tile">
+      <span className="landing-signal-icon">
+        <Icon size={12} aria-hidden={true} />
+      </span>
+      <div className="landing-signal-copy">
+        <div className="landing-signal-label">{signal.label}</div>
+        <div className="landing-signal-value">{signal.value}</div>
+      </div>
     </div>
   );
 }
@@ -187,14 +203,23 @@ export function LandingPage(): ReactElement {
   const [menuOpen, setMenuOpen] = useState(false);
   const [revealed, setRevealed] = useState<ReadonlySet<number>>(() => new Set([0]));
   const [showAll, setShowAll] = useState(false);
+  // Drives the header's shape: full-bleed and square-edged at the top of the
+  // page, a floating pill once the story has started scrolling under it. The
+  // threshold is one header height, so it flips as soon as content is
+  // genuinely passing beneath rather than on the first wheel tick.
+  const [scrolled, setScrolled] = useState(false);
+
+  useEffect(() => {
+    const onScroll = (): void => setScrolled(window.scrollY > 24);
+    onScroll();
+    window.addEventListener("scroll", onScroll, { passive: true });
+    return () => window.removeEventListener("scroll", onScroll);
+  }, []);
   const sectionRefs = useRef<Array<HTMLElement | null>>([]);
 
   useEffect(() => {
-    const prev = document.body.style.overflow;
-    document.body.style.overflow = menuOpen ? "hidden" : "";
-    return () => {
-      document.body.style.overflow = prev;
-    };
+    if (!menuOpen) return;
+    return acquireBodyScrollLock(document.body);
   }, [menuOpen]);
 
 
@@ -242,28 +267,38 @@ export function LandingPage(): ReactElement {
   };
 
   const activeTheme = CHAPTERS[activeIndex]?.theme ?? "night";
+  // Chapter copy fades up as it enters the viewport. Reduced-motion readers get
+  // the settled state immediately, and a chapter that has not been revealed yet
+  // stays transparent so the transition never flashes unanimated content.
+  const revealClass = (index: number, delayClass = ""): string => {
+    if (!revealed.has(index)) return "opacity-0";
+    return reducedMotion ? "" : `animate-story-reveal-up ${delayClass}`.trim();
+  };
 
   return (
-    <div className={`story story-simple story-theme-${activeTheme}`} id="top">
-      <header className="story-header">
-        <div className="story-shell story-header-inner">
+    <div className="relative min-h-screen overflow-x-clip bg-story-deep font-sans text-story-ink" id="top" style={STORY_THEME_STYLES[activeTheme]}>
+      <header
+        className="landing-header"
+        data-scrolled={scrolled}
+      >
+        <div className="landing-header-inner" data-scrolled={scrolled}>
           <a
-            className="story-brand"
+            className="landing-header-brand"
             href="#top"
             onClick={(e) => {
               e.preventDefault();
               scrollToChapter(0);
             }}
           >
-            <span className="story-brand-mark">
-              <img src={`${ASSET_BASE}favicon.webp`} alt="" />
+            <span className="flex size-9 items-center justify-center rounded-xl border border-story-white/25 bg-story-white p-0.5">
+              <img className="size-full rounded-lg object-cover" src={`${ASSET_BASE}assets/brand/favicon.jpg`} alt="" />
             </span>
             <span>
-              <strong>Cartethyia</strong>
-              <small>AI PROXY ROUTER</small>
+              <strong className="block font-heading text-lead leading-none">Cartethyia</strong>
+              <small className="mt-1 block font-mono text-micro font-medium leading-none tracking-code text-story-white/50">AI PROXY ROUTER</small>
             </span>
           </a>
-          <nav className="story-desktop-nav" aria-label="Primary navigation">
+          <nav className="landing-header-desktop-nav" aria-label="Primary navigation">
             <button type="button" onClick={() => scrollToChapter(0)}>
               <Home size={14} aria-hidden={true} />
               Home
@@ -277,24 +312,24 @@ export function LandingPage(): ReactElement {
               Community
             </a>
           </nav>
-          <div className="story-header-actions">
-            <GithubBadge className="story-github-badge" />
+          <div className="landing-header-actions">
+            <GithubBadge className="landing-header-github" />
             <button
               type="button"
               aria-label={showAll ? "Show story" : "Show all"}
               aria-pressed={showAll}
               onClick={() => setShowAll((v) => !v)}
-              className={`story-mode-button${showAll ? " is-selected" : ""}`}
+              className={`landing-header-control landing-header-show-all${showAll ? " is-active" : ""}`}
             >
-              <span className="story-mode-dot" aria-hidden={true} />
+              <span className="size-3.5 shrink-0 rounded-full bg-current" aria-hidden={true} />
               {showAll ? "Story" : "All view"}
             </button>
-            <a className="story-console-link" href={CONSOLE_PATH}>
+            <a className="landing-header-control landing-header-console" href={CONSOLE_PATH}>
               Enter console
               <ArrowUpRight size={14} aria-hidden={true} />
             </a>
             <button
-              className="story-menu-button"
+              className="landing-header-menu-toggle"
               type="button"
               aria-label={menuOpen ? "Close menu" : "Open menu"}
               aria-expanded={menuOpen}
@@ -304,22 +339,9 @@ export function LandingPage(): ReactElement {
             </button>
           </div>
         </div>
-        <div className={`story-mobile-overlay ${menuOpen ? "is-open" : ""}`} aria-hidden={true} onClick={() => setMenuOpen(false)} />
-        <nav className={`story-mobile-nav ${menuOpen ? "is-open" : ""}`} aria-label="Mobile navigation" aria-hidden={!menuOpen}>
-          <div className="story-mobile-nav-head">
-            <span>Navigation</span>
-            <button type="button" aria-label="Close menu" onClick={() => setMenuOpen(false)}>
-              <X size={17} aria-hidden={true} />
-            </button>
-          </div>
-          {CHAPTERS.map((entry, idx) => (
-            <button key={entry.id} type="button" onClick={() => scrollToChapter(idx)}>
-              <span>{entry.number}</span>
-              {entry.label}
-              <ArrowUpRight size={13} aria-hidden={true} />
-            </button>
-          ))}
-          <a href={CONSOLE_PATH}>
+        <div className="landing-header-menu-overlay" data-open={menuOpen} aria-hidden={true} onClick={() => setMenuOpen(false)} />
+        <nav className="landing-header-mobile-nav" data-scrolled={scrolled} data-open={menuOpen} aria-label="Mobile navigation" aria-hidden={!menuOpen}>
+          <a className="mt-1 inline-flex h-11 items-center justify-center gap-2 rounded-control border border-story-white bg-story-white px-3.5 text-badge font-bold text-story-deep no-underline transition-colors hover:bg-story-white/90" href={CONSOLE_PATH}>
             Enter console
             <ArrowUpRight size={14} aria-hidden={true} />
           </a>
@@ -327,18 +349,19 @@ export function LandingPage(): ReactElement {
       </header>
 
       {showAll ? (
-        <main className="mx-auto w-[min(100%-2rem,1280px)] pb-10 pt-[88px] sm:w-[min(100%-3rem,1280px)]">
-          <div className="mb-6 flex flex-wrap items-end justify-between gap-3">
+        <main className="px-12 pb-17.5 pt-44 max-compact:px-8">
+          <div className="mx-auto w-full max-w-640">
+          <div className="mb-10.5 flex flex-wrap items-end justify-between gap-5.25">
             <div>
-              <p className="text-[11px] font-bold uppercase tracking-[0.18em] text-white/50">All chapters · 7 stories</p>
-              <h2 className="mt-2 font-serif text-[28px] font-normal leading-none tracking-tight text-white">Everything at a glance</h2>
-              <p className="mt-2 max-w-[60ch] text-[13px] leading-5 text-white/65">Hover a card to lift it — click to jump to its story. All 7 visuals, captions and signals visible without scrolling forever.</p>
+              <p className="text-badge font-bold uppercase tracking-code text-story-white/50">All chapters · 7 stories</p>
+              <h2 className="mt-3.5 font-serif text-hero font-normal leading-none tracking-tight text-story-white">Everything at a glance</h2>
+              <p className="mt-3.5 max-w-60ch text-body leading-5 text-story-white/65">Hover a card to lift it — click to jump to its story. All 7 visuals, captions and signals visible without scrolling forever.</p>
             </div>
-            <div className="flex items-center gap-2 text-[11px] text-white/50">
-              <span className="h-1.5 w-1.5 rounded-full bg-emerald-400 shadow-[0_0_8px_rgba(52,211,153,0.7)]" aria-hidden={true} /> Stylish overview
+            <div className="flex items-center gap-3.5 text-badge text-story-white/50">
+              <span className="h-3 w-3 rounded-full bg-story-success shadow-glow-success" aria-hidden={true} /> Stylish overview
             </div>
           </div>
-          <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
+          <div className="grid gap-7 sm:grid-cols-2 lg:grid-cols-3">
             {CHAPTERS.map((entry, idx) => (
               <article
                 key={entry.id}
@@ -346,7 +369,8 @@ export function LandingPage(): ReactElement {
                   setShowAll(false);
                   requestAnimationFrame(() => scrollToChapter(idx));
                 }}
-                className={`group relative flex cursor-pointer flex-col overflow-hidden rounded-[18px] border bg-[#0b1220] text-left transition hover:-translate-y-1 hover:shadow-[0_20px_60px_rgba(0,0,0,0.45)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white/30 story-theme-${entry.theme}`}
+                className="group relative flex cursor-pointer flex-col overflow-hidden rounded-hero border bg-story-surface text-left transition hover:-translate-y-1 hover:shadow-window focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-story-white/30"
+                style={STORY_THEME_STYLES[entry.theme]}
                 tabIndex={0}
                 role="button"
                 aria-label={`Open ${entry.label}`}
@@ -358,29 +382,29 @@ export function LandingPage(): ReactElement {
                   }
                 }}
               >
-                <div className="relative h-[190px] overflow-hidden">
-                  <img src={entry.image} alt={entry.imageAlt} className="h-full w-full object-cover transition duration-500 group-hover:scale-[1.04]" loading="lazy" decoding="async" />
-                  <div className="absolute inset-0 bg-gradient-to-t from-[#05070d]/85 via-[#05070d]/10 to-transparent" />
-                  <div className="absolute left-3 top-3 flex items-center gap-1.5">
-                    <span className="rounded-full bg-white px-1.5 py-0.5 font-mono text-[10px] font-bold tracking-[0.08em] text-[#05070d]">{entry.number}</span>
-                    <span className="rounded-full border border-white/20 bg-black/25 px-2 py-0.5 text-[10px] font-bold uppercase tracking-[0.12em] text-white backdrop-blur">{entry.theme}</span>
+                <div className="relative h-95 overflow-hidden">
+                  <img src={entry.image} alt={entry.imageAlt} className="h-full w-full object-cover transition duration-500 group-hover:scale-104" loading="lazy" decoding="async" />
+                  <div className="absolute inset-0 bg-gradient-to-t from-story-deep/85 via-story-deep/10 to-transparent" />
+                  <div className="absolute left-3 top-3 flex items-center gap-3">
+                    <span className="rounded-chip bg-story-white px-3 py-1 font-mono text-micro font-bold tracking-label text-story-deep">{entry.number}</span>
+                    <span className="rounded-chip border border-story-white/20 bg-story-black/25 px-3.5 py-1 text-micro font-bold uppercase tracking-label text-story-white backdrop-blur">{entry.theme}</span>
                   </div>
-                  <div className="absolute bottom-2 left-3 right-3 flex items-center justify-between text-[10px] font-bold uppercase tracking-[0.14em] text-white/75">
+                  <div className="absolute bottom-2 left-3 right-3 flex items-center justify-between text-micro font-bold uppercase tracking-label text-story-white/75">
                     <span className="truncate">{entry.location}</span>
-                    <ArrowUpRight size={12} aria-hidden={true} className="opacity-60 group-hover:opacity-100" />
+                    <ArrowUpRight size={13} aria-hidden={true} className="opacity-60 group-hover:opacity-100" />
                   </div>
                 </div>
-                <div className="flex flex-1 flex-col gap-2 p-4">
-                  <h3 className="font-serif text-[18px] font-normal leading-tight tracking-tight text-white">{entry.title}</h3>
-                  <p className="line-clamp-2 text-[12.5px] leading-5 text-white/65">{entry.description}</p>
-                  <div className="mt-1 flex flex-wrap gap-1.5">
+                <div className="flex flex-1 flex-col gap-3.5 p-7">
+                  <h3 className="font-serif text-title font-normal leading-tight tracking-tight text-story-white">{entry.title}</h3>
+                  <p className="line-clamp-2 text-caption leading-5 text-story-white/65">{entry.description}</p>
+                  <div className="mt-1.75 flex flex-wrap gap-3">
                     {entry.signals.map((s) => {
                       const Icon = signalIcons[s.icon];
                       return (
-                        <span key={`${entry.id}-${s.label}`} className="inline-flex items-center gap-1 rounded-full border border-white/10 bg-white/[0.06] px-2 py-1 text-[10px] font-semibold uppercase tracking-[0.08em] text-white/75">
-                          <Icon size={11} aria-hidden={true} className="text-[var(--story-accent)]" />
+                        <span key={`${entry.id}-${s.label}`} className="inline-flex items-center gap-1.75 rounded-chip border border-story-white/10 bg-story-white/6 px-3.5 py-1.75 text-micro font-semibold uppercase tracking-label text-story-white/75">
+                          <Icon size={12} aria-hidden={true} className="text-story-accent" />
                           {s.label}
-                          <strong className="font-bold text-white">{s.value}</strong>
+                          <strong className="font-bold text-story-white">{s.value}</strong>
                         </span>
                       );
                     })}
@@ -389,9 +413,10 @@ export function LandingPage(): ReactElement {
               </article>
             ))}
           </div>
+          </div>
         </main>
       ) : (
-        <main className="story-simple-main">
+        <main className="relative z-1">
           {CHAPTERS.map((entry, idx) => (
             <article
               key={entry.id}
@@ -400,33 +425,33 @@ export function LandingPage(): ReactElement {
               ref={(node) => {
                 sectionRefs.current[idx] = node;
               }}
-              className={`story-page-section story-theme-${entry.theme} ${entry.sectionClass ?? ""} ${revealed.has(idx) ? "is-revealed" : ""}`}
+              className="relative flex min-h-screen items-center overflow-hidden bg-story-deep bg-[linear-gradient(to_right,color-mix(in_srgb,var(--story-accent)_2.4%,transparent)_1px,transparent_1px),linear-gradient(to_bottom,color-mix(in_srgb,var(--story-accent)_2.4%,transparent)_1px,transparent_1px)] bg-[length:44px_100%,100%_40px] py-16 max-medium:min-h-0 max-medium:py-36 max-compact:py-52 max-compact:pb-16"
+              style={STORY_THEME_STYLES[entry.theme]}
               aria-labelledby={`chapter-title-${idx}`}
             >
-              <div className="story-page-ambient" style={{ backgroundImage: `url(${entry.image})` }} aria-hidden={true} />
-              <div className="story-page-shell story-shell">
-                <div className="story-page-copy">
-                  <p className="story-location">{entry.location}</p>
-                  <h1 id={`chapter-title-${idx}`}>{entry.title}</h1>
-                  <p className="story-description">{entry.description}</p>
-                  <div className="story-signals">
+              <div className="absolute inset-0 z-0 scale-108 bg-cover bg-center mix-blend-screen" style={{ backgroundImage: `url(${entry.image})`, filter: "blur(27px) saturate(1.14)", opacity: 0.24 }} aria-hidden={true} />
+              <div className="landing-story-shell relative z-1 mx-auto">
+                <figure className={`landing-story-visual relative row-start-1 min-w-0 w-full self-center overflow-hidden border border-story-white/20 bg-[#090d16] shadow-popout after:absolute after:inset-0 after:bg-gradient-to-b after:from-story-deep/4 after:via-story-deep/30 after:to-story-deep/60 after:content-[''] ${idx % 2 === 0 ? "col-start-1" : "col-start-2"}`}>
+                  <img className="block size-full object-cover object-center" src={entry.image} alt={entry.imageAlt} loading={idx === 0 ? "eager" : "lazy"} fetchPriority={idx === 0 ? "high" : "low"} decoding="async" />
+                  <figcaption className="absolute inset-x-4 bottom-4 z-1 flex justify-between font-mono text-micro font-medium leading-none tracking-label text-story-white/70 uppercase">
+                    {entry.location} <span className="text-story-accent">{entry.number}</span>
+                  </figcaption>
+                </figure>
+                <div className={`min-w-0 ${idx % 2 === 0 ? "col-start-2 row-start-1" : "col-start-1 row-start-1"}`}>
+                  <h1 className={`mt-6 max-w-12ch font-head text-story-hero font-normal leading-[0.98] tracking-[-0.045em] text-balance max-compact:max-w-13ch max-compact:text-story-hero-compact ${revealClass(idx, "delay-100")}`} id={`chapter-title-${idx}`}>{entry.title}</h1>
+                  <p className={`landing-story-description mt-10 max-h-none max-w-[545px] text-lead leading-14 text-story-white/70 max-compact:max-w-full max-compact:text-body max-compact:leading-6 ${revealClass(idx, "delay-150")}`}>{entry.description}</p>
+                  <div className={`landing-signal-grid ${revealClass(idx, "delay-200")}`}>
                     {entry.signals.map((s) => (
-                      <SignalRow key={`${entry.id}-${s.label}`} signal={s} />
+                      <SignalStatusTile key={`${entry.id}-${s.label}`} signal={s} />
                     ))}
                   </div>
-                  <div className="story-page-actions">
-                    <button className="story-button story-button-secondary" type="button" onClick={() => scrollToChapter(idx === CHAPTERS.length - 1 ? 0 : idx + 1)}>
+                  <div className={`mt-7 flex flex-wrap gap-3.5 max-compact:mt-5 ${revealClass(idx, "delay-300")}`}>
+                    <button className="inline-flex h-22 items-center gap-2 rounded-control border border-story-white/25 bg-story-white/8 px-4.5 text-body font-bold text-story-white transition-transform active:scale-97 hover:bg-story-white/18 max-compact:h-21 max-compact:px-3.5 max-compact:text-badge" type="button" onClick={() => scrollToChapter(idx === CHAPTERS.length - 1 ? 0 : idx + 1)}>
                       {nextChapterLabel(idx)}
                       <ArrowRight size={15} aria-hidden={true} />
                     </button>
                   </div>
                 </div>
-                <figure className="story-page-visual">
-                  <img src={entry.image} alt={entry.imageAlt} loading={idx === 0 ? "eager" : "lazy"} fetchPriority={idx === 0 ? "high" : "low"} decoding="async" />
-                  <figcaption>
-                    {entry.location} <span>{entry.number}</span>
-                  </figcaption>
-                </figure>
               </div>
             </article>
           ))}

@@ -1,7 +1,7 @@
-import type { CartethyiaDatabase } from "../persistence/postgres";
+import type { CartethyiaDatabase } from "../persistence/db-handle";
 import { healthEvents } from "../persistence/schema";
 import type { NetworkPoolSelector } from "./pool/selector";
-import type { GatewayError } from "../transport/gateway-error";
+import type { GatewayError } from "../protocol/gateway-error";
 import { metrics } from "../observability/metrics";
 import { log } from "../observability/logger";
 
@@ -62,6 +62,76 @@ async function recordPoolCooldownEvent(
       }
     }
   }
+}
+
+/**
+ * Retires a pool for one provider because the upstream flagged its egress.
+ *
+ * Separate from `flagPoolCooldown` on purpose: the two facts are not
+ * interchangeable. A 429 is an allowance that refills, so the pool returns to
+ * rotation when the window ends. A free-tier refusal means the address itself
+ * is retired upstream, and putting it back would spend a real request to learn
+ * the same answer. The audit row therefore carries `errorCategory:
+ * "egress_blocked"` rather than `rate_limit_transient`, which is what the
+ * console reads to draw it as a block instead of a cooldown.
+ */
+export function flagPoolBlocked(
+  poolSelector: NetworkPoolSelector,
+  db: CartethyiaDatabase,
+  poolId: string,
+  providerId: string,
+  error: GatewayError,
+): void {
+  const reason = `Provider ${providerId} refused this egress`;
+  void poolSelector
+    .flagProviderBlocked(poolId, providerId, reason)
+    .catch((cause: unknown) => {
+      metrics.pool_cooldown_record_failed.inc(1);
+      log.warn("pool block flag failed", {
+        networkPoolId: poolId,
+        providerId,
+        error: String(cause),
+      });
+    });
+  void recordPoolBlockEvent(db, poolId, providerId, reason, error).catch((cause: unknown) => {
+    metrics.pool_cooldown_record_failed.inc(1);
+    log.warn("pool block event failed", {
+      networkPoolId: poolId,
+      providerId,
+      error: String(cause),
+    });
+  });
+}
+
+/**
+ * Durable half of `flagPoolBlocked`.
+ *
+ * Not coalesced the way a cooldown is: a block happens once per (pool,
+ * provider) for the life of the deployment, so there is no burst to collapse.
+ * A repeated event means the operator re-enabled the pool and it was refused
+ * again, which is worth a second row.
+ */
+async function recordPoolBlockEvent(
+  db: CartethyiaDatabase,
+  poolId: string,
+  providerId: string,
+  reason: string,
+  error: GatewayError,
+): Promise<void> {
+  await db.insert(healthEvents).values({
+    entityKind: "pool",
+    networkPoolId: poolId,
+    fromStatus: null,
+    toStatus: "cooldown",
+    reason: `provider ${providerId}: ${reason}${providerCodeSuffix(error)}`,
+    errorCategory: "egress_blocked",
+  });
+}
+
+/** The upstream's own code, when it named one, so the audit row is actionable. */
+function providerCodeSuffix(error: GatewayError): string {
+  const code = error.details.providerCode;
+  return typeof code === "string" && code.length > 0 ? ` (${code})` : "";
 }
 
 /** Cooldown applied when an upstream 429 carries no `retryAfterMs`. */

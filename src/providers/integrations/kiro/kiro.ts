@@ -30,21 +30,16 @@ import type {
   CanonicalRequest,
   CanonicalStopReason,
   UsageRecord,
-} from "../../../transport/canonical-model";
-import { GatewayError } from "../../../transport/gateway-error";
+} from "../../../protocol/canonical-model";
+import { GatewayError } from "../../../protocol/gateway-error";
 import { mapUpstreamHttpError } from "../../../transport/failure-policy";
-import type {
-  ProviderAdapter,
-  ProviderDispatchContext,
-  ProviderDispatchTarget,
-} from "../../provider-registry";
-import { providerBaseUrl } from "../../provider-metadata";
+import type { ProviderAdapter, ProviderDispatchContext, ProviderDispatchTarget } from "../../provider-contracts";
 import {
   buildKiroAmzUserAgent,
   buildKiroUserAgent,
   getKiroVersion,
 } from "../../operations/client-versions";
-import { FrameBuffer } from "../connect";
+import { FrameBuffer } from "../shared/connect";
 import { decodeEventStreamMessages } from "./aws-event-stream";
 import {
   buildKiroWireRequest,
@@ -55,7 +50,7 @@ import {
 import { machineIdForAuthState } from "./kiro-machine-id";
 import { resolveKiroProfileArn } from "./kiro-profile";
 import { kiroContextWindow } from "./kiro-catalog";
-import { resolveInboundSessionId } from "../../operations/session-resolution";
+import { resolveInboundSessionId, resolvePromptCacheKey } from "../../operations/session-resolution";
 import { KiroStreamDecoder, isKiroTruncationReason, type KiroUsage } from "./kiro-stream";
 
 /** Provider id this adapter registers under. */
@@ -124,6 +119,35 @@ function resolveKiroConversationId(
     resolveInboundSessionId(context, request) ??
     generateKiroConversationId()
   );
+}
+
+/**
+ * The field the upstream keys its prompt cache on.
+ *
+ * A stable `conversationId` is not enough: the upstream ignores `cache_control`
+ * entirely unless `metadata.user_id` is present, and then recomputes the whole
+ * prompt on every turn. The value follows the shape the real client sends, and
+ * its session id is the same one the conversation already uses, so turns of one
+ * conversation hit and a different conversation does not.
+ */
+function withKiroCacheKey(
+  payload: Record<string, unknown>,
+  request: CanonicalRequest,
+  context: ProviderDispatchContext,
+): Record<string, unknown> {
+  const existing = (payload.metadata as { user_id?: unknown } | undefined)?.user_id;
+  if (typeof existing === "string" && existing.length > 0) return payload;
+  const sessionId = resolvePromptCacheKey(request, context) ?? resolveKiroConversationId(request, context);
+  return {
+    ...payload,
+    metadata: {
+      user_id: JSON.stringify({
+        device_id: resolveAccountMachineId(context),
+        account_uuid: "",
+        session_id: sessionId,
+      }),
+    },
+  };
 }
 
 /**
@@ -208,6 +232,11 @@ export function kiroHeaders(
     headers["tokentype"] = "API_KEY";
   } else if (authMethod === "external_idp") {
     headers["tokentype"] = "EXTERNAL_IDP";
+  } else {
+    headers["x-amz-sso-bearer"] = secret;
+  }
+  if (authState?.profileArn !== undefined && authState.profileArn.length > 0) {
+    headers["x-amzn-codewhisperer-profile-arn"] = authState.profileArn;
   }
   return headers;
 }
@@ -231,32 +260,7 @@ export function kiroHeaders(
 function kiroUsage(usage: KiroUsage, modelId: string, outputText: string): UsageRecord {
   const cacheRead = usage.cacheReadTokens ?? 0;
   const cacheWrite = usage.cacheWriteTokens ?? 0;
-  // An explicit token field always wins: it is the upstream stating the number
-  // rather than us recovering it. No event observed from this surface carries
-  // one, but a `metricsEvent` that did would be authoritative.
-  if (usage.inputTokens !== undefined || usage.outputTokens !== undefined) {
-    const input = usage.inputTokens ?? 0;
-    const output = usage.outputTokens ?? 0;
-    return {
-      input_tokens: input,
-      cached_input_tokens: cacheRead > 0 ? cacheRead : "unavailable",
-      cache_write_tokens: cacheWrite > 0 ? cacheWrite : "unavailable",
-      uncached_input_tokens: cacheRead > 0 ? Math.max(0, input - cacheRead) : "unavailable",
-      output_tokens: output,
-      reasoning_tokens: "unavailable",
-      estimated_cost: null,
-      total_tokens: input + output,
-      ...(usage.credits === undefined ? {} : { credit_used: usage.credits }),
-    };
-  }
-  const completionTokens = outputText.length === 0 ? 0 : Math.max(1, Math.floor(outputText.length / 4));
-  const percentage = usage.contextUsagePercentage;
-  const measuredTotal =
-    percentage === undefined || percentage <= 0
-      ? undefined
-      : Math.round((kiroContextWindow(modelId) * percentage) / 100);
-  const input = measuredTotal === undefined ? 0 : Math.max(0, measuredTotal - completionTokens);
-  const output = measuredTotal === undefined ? 0 : completionTokens;
+  const [input, output] = kiroTokenCounts(usage, modelId, outputText);
   return {
     input_tokens: input,
     cached_input_tokens: cacheRead > 0 ? cacheRead : "unavailable",
@@ -271,6 +275,33 @@ function kiroUsage(usage: KiroUsage, modelId: string, outputText: string): Usage
     total_tokens: input + output,
     ...(usage.credits === undefined ? {} : { credit_used: usage.credits }),
   };
+}
+
+/**
+ * Input and output token counts for one Kiro response, as `[input, output]`.
+ *
+ * An explicit token field always wins: it is the upstream stating the number
+ * rather than us recovering it. No event observed from this surface carries
+ * one, but a `metricsEvent` that did would be authoritative. Otherwise the
+ * counts are recovered from the context window and the response text, which
+ * is the only figure this surface reports.
+ */
+function kiroTokenCounts(
+  usage: KiroUsage,
+  modelId: string,
+  outputText: string,
+): readonly [number, number] {
+  if (usage.inputTokens !== undefined || usage.outputTokens !== undefined) {
+    return [usage.inputTokens ?? 0, usage.outputTokens ?? 0];
+  }
+  const completionTokens = outputText.length === 0 ? 0 : Math.max(1, Math.floor(outputText.length / 4));
+  const percentage = usage.contextUsagePercentage;
+  const measuredTotal =
+    percentage === undefined || percentage <= 0
+      ? undefined
+      : Math.round((kiroContextWindow(modelId) * percentage) / 100);
+  if (measuredTotal === undefined) return [0, 0];
+  return [Math.max(0, measuredTotal - completionTokens), completionTokens];
 }
 
 /**
@@ -354,9 +385,8 @@ class KiroAdapter implements ProviderAdapter {
         { providerId: KIRO_PROVIDER_ID, problems: built.error.problems },
       );
     }
-
     const fetchFn = (context.outbound_fetch as unknown as typeof fetch | undefined) ?? this.#fetch;
-    const body = JSON.stringify(built.value.payload);
+    const body = JSON.stringify(withKiroCacheKey(built.value.payload, request, context));
     const machineId = resolveAccountMachineId(context);
     const response = await this.#send(
       fetchFn,
@@ -629,6 +659,3 @@ export function createKiroAdapter(options: KiroAdapterOptions = {}): ProviderAda
 }
 
 export const kiroAdapter: ProviderAdapter = createKiroAdapter();
-
-/** Base URL this provider registers, used by the metadata layer. */
-export const KIRO_BASE_URL = providerBaseUrl(KIRO_PROVIDER_ID);

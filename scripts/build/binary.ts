@@ -68,7 +68,9 @@ export async function buildBinary(
     minify: true,
     target: "bun",
     define: { "process.env.NODE_ENV": JSON.stringify("production") },
-    compile: { outfile },
+    compile: {
+      outfile,
+    },
   });
 
   if (result.logs.length > 0) {

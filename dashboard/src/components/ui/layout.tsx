@@ -1,4 +1,5 @@
 import type { ReactNode } from "react";
+import { cn } from "../../lib/classnames";
 
 export function SectionHeading({
   eyebrow,
@@ -18,16 +19,23 @@ export function SectionHeading({
   const hasText = Boolean(eyebrow || title || description);
   const Title = level === 1 ? "h1" : level === 3 ? "h3" : "h2";
   return (
-    <div className="section-header" style={hasText ? undefined : { justifyContent: "flex-end" }}>
+    <div className={cn(
+      "section-header flex items-center justify-between gap-6 max-small:flex-col max-small:items-start max-small:gap-4",
+      hasText ? undefined : "justify-end",
+    )}>
       {hasText ? (
-        <div className="section-header-text">
-          {eyebrow ? <p style={{ fontSize: "11px", fontWeight: 700, textTransform: "uppercase", letterSpacing: "0.08em", color: "var(--text-tertiary)", marginBottom: "2px" }}>{eyebrow}</p> : null}
-          {title ? <Title>{title}</Title> : null}
-          {description ? <p>{description}</p> : null}
+        <div className="section-header-text min-w-0">
+          {eyebrow ? (
+            <p className="text-badge font-bold uppercase tracking-label text-text-tertiary mb-1">
+              {eyebrow}
+            </p>
+          ) : null}
+          {title ? <Title className="font-head text-title font-bold tracking-[-0.02em] text-text-primary">{title}</Title> : null}
+          {description ? <p className="mt-1 text-caption text-text-secondary">{description}</p> : null}
         </div>
       ) : null}
-      {icon ? <div className="card-header-icon">{icon}</div> : null}
-      {action ? <div className="section-header-action">{action}</div> : null}
+      {icon ? <div className="card-header-icon grid size-14 shrink-0 place-items-center rounded-pill bg-accent-soft text-accent [&_svg]:size-7.5">{icon}</div> : null}
+      {action ? <div className="section-header-action max-small:w-full max-small:[&_button]:w-full">{action}</div> : null}
     </div>
   );
 }
@@ -41,6 +49,7 @@ export function StatCard({
   status,
   valueColor,
   action,
+  size = "default",
 }: {
   label: string;
   value: string;
@@ -50,56 +59,43 @@ export function StatCard({
   status?: string;
   valueColor?: string;
   action?: ReactNode;
+  size?: "default" | "roomy";
 }) {
   const toneColorMap: Record<string, string> = {
-    teal: "var(--teal)",
-    purple: "var(--purple)",
-    green: "var(--green)",
-    orange: "var(--orange)",
-    red: "var(--red)",
-    accent: "var(--accent)",
+    teal: "text-teal",
+    purple: "text-accent",
+    green: "text-green",
+    orange: "text-orange",
+    red: "text-red",
+    accent: "text-accent",
   };
 
   const effectiveTone =
     tone ||
     (status === "cooldown" ? "orange" : status === "disabled" ? "red" : "accent");
-  const toneColor = toneColorMap[effectiveTone] || "var(--accent)";
+  const toneColor = toneColorMap[effectiveTone] ?? "text-accent";
   return (
-    <div className="stat-card">
+    <div className={cn("stat-card min-w-0 border border-inner-border rounded-card bg-surface-2", size === "roomy" ? "p-9" : "p-6")}>
       <div
-        style={{
-          display: "flex",
-          alignItems: "center",
-          justifyContent: "space-between",
-          gap: "6px",
-          fontSize: "10px",
-          fontWeight: 700,
-          textTransform: "uppercase",
-          letterSpacing: "0.08em",
-          color: toneColor,
-        }}
+        className={cn(
+          "flex items-center justify-between gap-4 font-bold uppercase tracking-label",
+          size === "roomy" ? "text-caption" : "text-micro",
+          toneColor,
+        )}
       >
-        <span style={{ display: "inline-flex", alignItems: "center", gap: "6px", minWidth: 0 }}>
+        <span className="inline-flex items-center gap-4 min-w-0">
           {icon}
           <span>{label}</span>
         </span>
-        {action ? <span style={{ flexShrink: 0 }}>{action}</span> : null}
+        {action ? <span className="shrink-0">{action}</span> : null}
       </div>
       <p
-        style={{
-          fontFamily: "var(--font-mono)",
-          fontSize: "20px",
-          fontWeight: 700,
-          color: valueColor || "var(--text-primary)",
-          lineHeight: 1.2,
-          margin: "2px 0 0 0",
-        }}
+        className={cn("font-mono tabular-nums font-bold leading-[1.15] mb-0", size === "roomy" ? "text-hero mt-4" : "text-display mt-1")}
+        style={valueColor ? { color: valueColor } : undefined}
       >
         {value}
       </p>
-      <span className="stat-card-detail" style={{ fontSize: "11px", color: "var(--text-secondary)" }}>
-        {detail}
-      </span>
+      <span className={cn("stat-card-detail line-clamp-2 wrap-anywhere text-text-secondary", size === "roomy" ? "mt-2 text-body" : "text-badge")}>{detail}</span>
     </div>
   );
 }
@@ -119,6 +115,7 @@ export function DataTable({
   sortDirection,
   onSort,
   scrollRegion = false,
+  dense = false,
 }: {
   headers: readonly (string | DataTableColumn)[];
   children: ReactNode;
@@ -129,14 +126,16 @@ export function DataTable({
   onSort?: (key: string) => void;
   /** Style the scroll box like the sidebar rail (thin overlay scrollbar). */
   scrollRegion?: boolean;
+  /** Tighter cell padding for dense forms (the setup credential table). */
+  dense?: boolean;
 }) {
   return (
     <div
-      className={`data-table-container${scrollRegion ? " scroll-region" : ""}`}
+      className={cn("data-table-container", scrollRegion && "scroll-region")}
       style={maxHeight ? { maxHeight, overflowY: "auto" } : undefined}
       onScroll={onScroll}
     >
-      <table className="data-table">
+      <table className={cn("data-table text-caption", dense && "text-badge [&_th]:px-4 [&_th]:py-2.5 [&_td]:px-4 [&_td]:py-2.5 [&_th]:text-text-secondary [&_th]:font-semibold [&_th]:normal-case [&_th]:tracking-normal [&_td]:tabular-nums")}>
         <thead>
           <tr>
             {headers.map((header) => {
@@ -151,20 +150,10 @@ export function DataTable({
                       type="button"
                       onClick={() => onSort(key)}
                       title={`Sort by ${label}`}
-                      style={{
-                        all: "unset",
-                        cursor: "pointer",
-                        display: "inline-flex",
-                        alignItems: "center",
-                        gap: "4px",
-                        font: "inherit",
-                        color: "inherit",
-                        textTransform: "inherit",
-                        letterSpacing: "inherit",
-                      }}
+                      className="inline-flex items-center gap-2 cursor-pointer"
                     >
                       <span>{label}</span>
-                      <span aria-hidden="true" style={{ fontSize: "9px", opacity: active ? 1 : 0.35 }}>
+                      <span aria-hidden="true" className={cn("text-micro", active ? "opacity-100" : "opacity-[0.35]")}>
                         {active ? (sortDirection === "asc" ? "▲" : "▼") : "△"}
                       </span>
                     </button>

@@ -1,8 +1,9 @@
+import { currentSettingsRevision } from "./settings-revision";
 import { eq } from "drizzle-orm";
-import type { CartethyiaDatabase } from "./postgres";
+import type { CartethyiaDatabase } from "./db-handle";
 import { consoleSettings } from "./schema";
 import type { ConsoleSettingsPreferences } from "./schema";
-import { TtlCache } from "../runtime/ttl-cache";
+import { TtlCache } from "./ttl-cache";
 
 /**
  * Preference readers for tenant runtime settings. Cached reads are bounded by
@@ -72,27 +73,24 @@ export class CachedPreferencesReader implements PreferencesReader {
 }
 
 
-// ===== settings-revision.ts =====
+// ===== process-wide reader singleton =====
+let preferencesCache: { db: CartethyiaDatabase; reader: CachedPreferencesReader } | undefined;
+
 /**
- * Process-wide runtime-settings revision counter.
+ * Process-wide db-identity-keyed cached reader for the hot request path.
  *
- * Single staleness source for per-tenant `console_settings` caching: every
- * mutation bumps it, every cache key includes it, so a write instantly
- * invalidates cached reads (with TTL as the backstop, not the mechanism).
- *
- * Lives in `persistence/tenant-preferences.ts` — not in `console/stores/runtime-settings.ts` — because
- * the hot path (`transport/dispatch/proxy-request.ts`) reads it on every request and must not
- * import the dashboard persistence layer for a monotonic integer.
+ * A store singleton, so it lives here with the readers it composes rather than
+ * in any dispatch module. Rebound when the db identity changes (tests use a
+ * different database per file); production passes the same singleton every
+ * request. Consumers: the admission service's per-tenant concurrency read,
+ * tenant-preference request shaping, and telemetry payload capture.
  */
-let revisionCounter = 0;
-
-/** Current revision; cache keys embed this. */
-export function currentSettingsRevision(): number {
-  return revisionCounter;
-}
-
-/** Bumps the revision after a settings mutation. Returns the new revision. */
-export function bumpSettingsRevision(): number {
-  revisionCounter += 1;
-  return revisionCounter;
+export function preferencesReaderFor(db: CartethyiaDatabase): CachedPreferencesReader {
+  if (!preferencesCache || preferencesCache.db !== db) {
+    preferencesCache = {
+      db,
+      reader: new CachedPreferencesReader(new DrizzlePreferencesReader(db)),
+    };
+  }
+  return preferencesCache.reader;
 }

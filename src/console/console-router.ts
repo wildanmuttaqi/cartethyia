@@ -5,20 +5,23 @@
  * is the single place that knows them.
  */
 import { Elysia } from "elysia";
+import { log } from "../observability/logger";
 import { resolveConsoleAccess, resolveConsoleUser } from "./auth/session-resolver";
-import { ConsoleCredentialService, FirstBootSetupService, ConsoleSessionService, defaultSessionCookiePolicy, ConsoleLockoutService, AuditRecorder } from "./auth/service";
+import { ConsoleCredentialService } from "./auth/credentials";
+import { resolveDefaultGatewayApiKey } from "../config/runtime";
+import { FirstBootSetupService } from "./auth/setup-service";
+import { ConsoleSessionService, defaultSessionCookiePolicy } from "./auth/session-service";
+import { ConsoleLockoutService } from "./auth/lockout";
+import { AuditRecorder } from "./auth/audit-recorder";
 import { createConsoleAuthRoutes } from "./auth/session";
-import {
-  createConsoleCsrfMiddleware,
-  createConsoleMutationLimiterMiddleware,
-} from "../transport/middleware/gateway-guards";
+import { createConsoleCsrfMiddleware } from "./console-router-guards";
+import { createConsoleMutationLimiterMiddleware } from "./console-router-guards";
 import { registerConsoleDomains, type ConsoleDomainContext } from "./domain-registration";
 import type { ConsoleAccessResolver } from "./auth/access";
-import type { CartethyiaDatabase } from "../persistence/postgres";
+import type { CartethyiaDatabase } from "../persistence/db-handle";
 import { createAccessDecision, type AccessDecision } from "../security/access-control";
 import { resolveApiKeyAuthorization } from "../security/api-key-auth";
-import type { RouteSnapshotService } from "../transport/routing/route-model";
-import type { ProxyRequestStateStore } from "../transport/request/state";
+import type { LiveInFlightSource } from "./observability/live";
 import type { NetworkPoolSelector } from "../network/pool/selector";
 import type { TelemetryBatchBuffer } from "../observability/telemetry-buffer";
 import type { OAuthRefreshService } from "../providers/authentication/oauth-refresh-service";
@@ -31,20 +34,25 @@ import { DrizzleCliToolSecretSource } from "./cli-tools/secret-source";
 import type { ProviderRegistry } from "../providers/provider-registry";
 import type { BundledProviderCatalog } from "../providers/operations/provider-catalog-service";
 import type { ValidatedNetworkBindingFactory } from "../network/pool/resolver";
-import type { TrustedProxyBoundary } from "../config";
+import type { TrustedProxyBoundary } from "../config/network";
 import { gzipResponse } from "./response-compression";
 
 export interface ConsoleApiCompositionDeps {
   readonly db: CartethyiaDatabase;
   readonly accessResolver: ConsoleAccessResolver;
-  readonly routeSnapshotService: RouteSnapshotService;
+  /**
+   * Drops the cached route snapshot after a console write changes the catalog.
+   * Structurally satisfied by `RouteSnapshotService`; declared here so the
+   * console composition root does not import the transport layer.
+   */
+  readonly routeSnapshotService: { invalidate(): Promise<number> };
   readonly poolSelector: NetworkPoolSelector;
   readonly telemetryBuffer: TelemetryBatchBuffer;
   /**
    * The request state store owns the live in-flight gauge, so the console reads
    * its snapshot/subscription from here rather than a free-standing module.
    */
-  readonly stateStore?: ProxyRequestStateStore;
+  readonly stateStore?: LiveInFlightSource;
   readonly providerRegistry: ProviderRegistry;
   readonly bundledModelCatalog: BundledProviderCatalog;
   readonly networkBindingFactory: ValidatedNetworkBindingFactory;
@@ -56,7 +64,7 @@ export interface ConsoleApiCompositionDeps {
    * Optional so reduced compositions (route-only shell, console stubs) stay
    * valid; absent means the `/model-bans` routes are not mounted.
    */
-  readonly modelStrikes?: Pick<ModelStrikeService, "listBans" | "unban">;
+  readonly modelStrikes?: Pick<ModelStrikeService, "listBans" | "unban" | "ban">;
   readonly readRoutingAccountInflight?:
     | ((
         providerId: string,
@@ -99,6 +107,18 @@ export function createConsoleRouter(deps: ConsoleApiCompositionDeps): Elysia {
   const sessionService = new ConsoleSessionService(db, cookiePolicy);
   const lockoutService = new ConsoleLockoutService(db);
   const setupService = new FirstBootSetupService(db, credentialService);
+  // The default gateway key is seeded only when the first-boot wizard runs, so a
+  // key set in the environment does nothing until an operator completes setup.
+  // Fire and forget: a failed check must not stop the console from mounting.
+  void setupService.requiresSetup().then((needsSetup) => {
+    if (needsSetup && resolveDefaultGatewayApiKey() !== undefined) {
+      log.warn(
+        "[setup] CARTETHYIA_API_KEY is set but no console user exists yet; complete the first-boot wizard at /console so the key is seeded",
+      );
+    }
+  }).catch((error: unknown) => {
+    log.warn("[setup] could not check first-boot state", error);
+  });
   const auditRecorder = new AuditRecorder(db);
   const cliToolService = new CliToolService(
     new CliToolMappingStore(db),

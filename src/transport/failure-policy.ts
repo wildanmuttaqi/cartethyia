@@ -1,6 +1,6 @@
-import { GatewayError, type GatewayErrorCode, type GatewayErrorOrigin } from "./gateway-error";
-import { isRecord } from "../protocol/primitives";
-import { resolveFallbackRetryBaseMs, resolveFallbackRetryCapMs } from "../config";
+import { GatewayError, type GatewayErrorCode, type GatewayErrorOrigin } from "../protocol/gateway-error";
+import { isRecord } from "../protocol/codecs";
+import { resolveFallbackRetryBaseMs, resolveFallbackRetryCapMs } from "../config/timeouts";
 
 const MAX_UPSTREAM_ERROR_BYTES = 500;
 const MAX_COOLDOWN_MS = 24 * 3600 * 1000;
@@ -298,7 +298,7 @@ export interface UpstreamFailurePolicy {
   readonly credentialEvidence?: boolean;
   readonly retryAfterMs?: number;
   readonly statusCode?: number;
-  /** Provider that produced the failure, for the buddy `11140` policy block. */
+  /** Provider that produced the failure, for the buddy policy blocks (`11140`, and `11-128` channel verification). */
   readonly providerId?: string;
 }
 
@@ -310,7 +310,24 @@ export function classifyUpstreamFailure(error: unknown): UpstreamFailurePolicy {
   const providerCode = typeof error.details.providerCode === "string" ? error.details.providerCode : undefined;
   const providerId = typeof error.details.providerId === "string" ? error.details.providerId : undefined;
   const credentialEvidence = error.details.credentialEvidence === true || error.details.accountScope === true;
-  const policyAccountEvidence = providerCode === "11140";
+  // The buddy family reuses `11-128` for two unrelated rejections, so the code
+  // alone is not evidence:
+  //
+  // - "conversation id missing" — a malformed outbound request. The fault is
+  //   this gateway's, so cooling the account would burn a healthy credential
+  //   on a body that fails identically everywhere.
+  // - "request illegal" / "failed channel verification … not sent from an
+  //   official client" — a verdict on the account's channel. Proven account-
+  //   scoped: two live share-page requests carrying byte-identical bodies and
+  //   headers to the same model differed only in the pooled account, and the
+  //   blocked one 400'd while the other 200'd (2026-10-16).
+  //
+  // Only the second may mutate account health, hence the message test.
+  const message = error.message.toLowerCase();
+  const channelBlockEvidence =
+    providerCode === "11-128" &&
+    (message.includes("request illegal") || message.includes("channel verification"));
+  const policyAccountEvidence = providerCode === "11140" || channelBlockEvidence;
   let scope: "network" | "account" | "provider";
   if (error.origin === "network") scope = "network";
   else if (credentialEvidence || policyAccountEvidence) scope = "account";
@@ -337,8 +354,13 @@ export function classifyUpstreamFailure(error: unknown): UpstreamFailurePolicy {
     (statusCode >= 500 && statusCode <= 599);
   const mutatesAccount = error.origin === "upstream" && scope === "account";
   const retryable =
-    mutatesAccount || // account-scoped failure: try a sibling regardless of status
-    error.code === "capability_unsupported" ||
+    // Gateway-wide overload: no sibling candidate can help, because the whole
+    // process is short of memory. The correct move is the client retrying after
+    // the hint, not another attempt here.
+    error.code === "overloaded"
+      ? false
+      : mutatesAccount || // account-scoped failure: try a sibling regardless of status
+        error.code === "capability_unsupported" ||
     error.code === "model_not_found" ||
     error.code === "admission_unavailable" ||
     error.code === "capacity_exhausted" ||
@@ -348,6 +370,13 @@ export function classifyUpstreamFailure(error: unknown): UpstreamFailurePolicy {
     error.code === "authentication_failed" ||
     error.code === "proxy_auth_required" ||
     error.code === "deadline_exceeded" ||
+    // An overflow is a property of the window the *chosen* route offers, not
+    // of the request: a sibling on a larger window may take it unchanged. 413
+    // is not in `retryableByStatus`, so without this the client got the first
+    // candidate's overflow even when a candidate that fit was next in line.
+    // Nothing here shrinks or rewrites the prompt — a candidate that fits is
+    // tried verbatim, and only exhausting them returns the overflow.
+    error.code === "context_length_exceeded" ||
     retryableByStatus;
   return {
     retryable,
@@ -361,6 +390,30 @@ export function classifyUpstreamFailure(error: unknown): UpstreamFailurePolicy {
     ...(retryAfterMs === undefined ? {} : { retryAfterMs, cooldownMs: retryAfterMs }),
     statusCode: error.status,
   };
+}
+
+/**
+ * Transport-level failure signatures a runtime fetch body can raise when the
+ * upstream socket dies mid-response. Bun (this gateway's runtime) raises
+ * `TypeError` with `code: "ECONNRESET"` ("The socket connection was closed
+ * unexpectedly"); Node/undici raises `TypeError: terminated`; libuv surfaces
+ * `ECONNRESET`/`EPIPE` on the error. All mean the same thing: the upstream
+ * connection dropped — an upstream transport failure, not an unexplained
+ * gateway fault.
+ */
+function isUpstreamSocketDrop(error: unknown): boolean {
+  if (!(error instanceof TypeError) && !(error instanceof Error)) return false;
+  if ("code" in error && typeof error.code === "string") {
+    if (error.code === "ECONNRESET" || error.code === "EPIPE" || error.code === "UND_ERR_SOCKET") {
+      return true;
+    }
+  }
+  const message = String(error.message ?? "");
+  return (
+    message.includes("socket connection was closed unexpectedly") ||
+    message.startsWith("terminated") ||
+    message.includes("other side closed")
+  );
 }
 
 /**
@@ -387,6 +440,11 @@ export function classifyTerminalCategory(
   if (signal.aborted) {
     if (reason instanceof DOMException && reason.name === "TimeoutError") return "deadline_exceeded";
     return "transport_closed";
+  }
+  // A mid-response upstream socket drop reaches here as a raw runtime error:
+  // the upstream's transport failed, so the blame is upstream, not unknown.
+  if (isUpstreamSocketDrop(error) || isUpstreamSocketDrop(reason)) {
+    return "transport_unavailable";
   }
   return "unknown_error";
 }
@@ -468,12 +526,6 @@ export function classifyTerminalOutcome(error: unknown, signal: AbortSignal): Te
  * client itself wrote, and prose scans for phrases like "context window" or
  * "too many tokens" misfire the same way. Those heuristics
  * mislabel unrelated failures, so we read only the machine-readable field.
- *
- * Consequence, stated plainly: an upstream that reports overflow *only* in
- * prose (Anthropic's `invalid_request_error` with "prompt is too long") is not
- * recognized here and keeps its generic code. That is the deliberate cost of
- * refusing text matching — a wrong `context_length_exceeded` is worse than a
- * missing one, because it tells the client to truncate a prompt that was fine.
  */
 const CONTEXT_LENGTH_CODES: ReadonlySet<string> = new Set([
   "context_length_exceeded",
@@ -481,12 +533,61 @@ const CONTEXT_LENGTH_CODES: ReadonlySet<string> = new Set([
   "model_context_window_exceeded",
 ]);
 
+/**
+ * The measured-size shape of a prose overflow, e.g.
+ * `"prompt is too long: 100001 tokens > 100000 maximum"`.
+ *
+ * This is not a prose scan. It requires the upstream to state two numbers and
+ * the comparison between them, which is the difference between an overflow
+ * report and a message that merely quotes one: a client whose own prompt text
+ * contains "prompt is too long" still does not match, because it states no
+ * measured size and no ceiling. Requiring `larger > smaller` rules out the
+ * remaining accidental matches, since a real overflow always reports more
+ * tokens than the window allows.
+ */
+const PROSE_OVERFLOW_PATTERN =
+  /(?:the\s+)?(?:prompt|request|input|context|messages?|conversation)\b[^.\n]{0,80}?(?:is\s+|are\s+)?too\s+long[^.\n]{0,40}?:?\s*(\d[\d_,]*)\s*(?:tokens?|chars?|characters?)\s*(?:>|>=|exceeds?|over)\s*(\d[\d_,]*)/i;
+
+/** Digits with optional thousands separators, as `Number` wants them. */
+function parseCount(raw: string): number {
+  return Number(raw.replace(/[_,]/g, ""));
+}
+
+/**
+ * Reads a prose overflow's measured size and ceiling, in tokens.
+ *
+ * Returns `undefined` unless the text states both numbers with the measured
+ * side larger — so a malformed or coincidental match cannot promote a 400 to
+ * a 413. When it does match, the numbers are returned so the error can quote
+ * them: a client that compacts on overflow needs to know how far it overshot.
+ */
+export function proseOverflowLimit(text: string): { used: number; maximum: number } | undefined {
+  const match = PROSE_OVERFLOW_PATTERN.exec(text);
+  if (!match) return undefined;
+  const used = parseCount(match[1]!);
+  const maximum = parseCount(match[2]!);
+  if (!Number.isFinite(used) || !Number.isFinite(maximum)) return undefined;
+  if (used <= maximum || maximum <= 0) return undefined;
+  return { used, maximum };
+}
+
 /** True when an upstream error body names a context-window overflow. */
 export function isContextLengthFailure(body: unknown): boolean {
   if (!isRecord(body)) return false;
   const envelope = isRecord(body.error) ? body.error : body;
   for (const candidate of [envelope.code, envelope.type, body.code, body.type]) {
     if (typeof candidate === "string" && CONTEXT_LENGTH_CODES.has(candidate.toLowerCase())) return true;
+  }
+  // Some upstreams report overflow only in prose, with a numeric `code` that
+  // says nothing (WorkBuddy sends `code: 11115`, `extError.type:
+  // invalid_request_error`, and the real cause in `msg`). Leaving that as a
+  // generic 400 hides the one thing a client acts on: Claude Code compacts when
+  // it is told the prompt exceeded the window, and does nothing on a 400 that
+  // looks like any other bad request. So the prose form is recognized too —
+  // but only in its measured-size shape, never as a bare phrase.
+  for (const candidate of [envelope.message, envelope.msg, body.message, body.msg]) {
+    if (typeof candidate !== "string") continue;
+    if (proseOverflowLimit(candidate) !== undefined) return true;
   }
   return false;
 }
@@ -568,6 +669,43 @@ export interface UpstreamErrorClassification {
   readonly rateLimitScope?: "provider";
 }
 
+/**
+ * Statuses whose meaning is authoritative and must survive a body identifier.
+ *
+ * `401`, `402` and `429` name the failure class outright — the credential was
+ * rejected, the account cannot pay, or the bucket is exhausted — and no field in
+ * the error body can change what the status already decided. A generic body type
+ * must therefore not be allowed to demote them.
+ *
+ * The demotion it prevents is not cosmetic. `invalid_request_error` /
+ * `invalid_argument` / `invalid_parameter` / `bad_request` map to
+ * `invalid_request` at HTTP 400, which `classifyUpstreamFailure` does **not**
+ * consider retryable, so `runAttemptLoop` stops on the first candidate even when
+ * healthy siblings remain — and because an `invalid_request` carries no
+ * `credentialEvidence`, `classifyAccountError` leaves the account `unknown` with
+ * `mutatesAccount: false`, so the credential that was just rejected stays in
+ * rotation and fails the next request the same way. Reproduced end to end: an
+ * upstream `401` whose body reads `{"error":{"type":"invalid_request_error"}}`
+ * produced `invalid_request` / 400 / non-retryable / account unmarked, where the
+ * same status with `authentication_error` correctly produced
+ * `authentication_failed` / 401 / retryable / account `disabled`.
+ *
+ * `403` is deliberately absent. It is genuinely ambiguous, and two known
+ * providers depend on reading it: the buddy family answers a deterministic
+ * content-policy rejection with `403` + `11140` (which must not be treated as an
+ * auth signal, because refreshing a token cannot change a safety verdict), and
+ * Google Cloud Code / Antigravity answers a single-model entitlement gap with
+ * `403` + "you do not have a valid license of this product" (which must not
+ * disable an account whose other models are healthy). Leaving `403` out is what
+ * keeps those rules reachable.
+ *
+ * An absent status is not authoritative either: a stream error frame carries no
+ * HTTP status, and its body type is then the only evidence there is.
+ */
+function isAuthoritativeFailureStatus(status: number | undefined): boolean {
+  return status === 401 || status === 402 || status === 429;
+}
+
 /** Maps a machine-readable provider identifier before falling back to status alone. */
 export function classifyUpstreamError(
   status: number | undefined,
@@ -645,10 +783,11 @@ export function classifyUpstreamError(
   )
     return { code: "deadline_exceeded", status: 504, origin: "upstream" };
   if (
-    normalized === "invalid_request_error" ||
-    normalized === "invalid_argument" ||
-    normalized === "invalid_parameter" ||
-    normalized === "bad_request"
+    !isAuthoritativeFailureStatus(status) &&
+    (normalized === "invalid_request_error" ||
+      normalized === "invalid_argument" ||
+      normalized === "invalid_parameter" ||
+      normalized === "bad_request")
   )
     return { code: "invalid_request", status: 400, origin: "upstream" };
   const code = statusToGatewayErrorCode(upstreamStatus);
@@ -689,7 +828,7 @@ export async function mapUpstreamHttpError(response: Response, providerId: strin
     providerStatus: response.status,
     ...(reportedProviderCode ? { providerCode: reportedProviderCode } : {}),
     ...(requestId ? { upstreamRequestId: requestId } : {}),
-    raw: text.slice(0, MAX_UPSTREAM_ERROR_BYTES).replace(/[\r\n]+/g, " "),
+    raw: text.slice(0, MAX_UPSTREAM_ERROR_BYTES),
     ...(retryAfterMs === null || retryAfterMs === undefined ? {} : { retryAfterMs }),
     ...(classification.rateLimitScope
       ? { rateLimitScope: classification.rateLimitScope }
@@ -718,11 +857,24 @@ export async function throwIfHtmlResponse(response: Response): Promise<void> {
   // The page came from the upstream (an edge proxy or the origin itself), so
   // it is an upstream failure: attributing it to `cartethyia` made the console
   // blame the gateway for a provider/edge response.
+  //
+  // `accountScope` marks the account that was dialled, not its credential: a
+  // WAF/edge challenge answers the *request* this account sent, and the same
+  // upstream serves its siblings fine — proven by eight cb accounts on one
+  // egress where only one was ever challenged. Scoping it to the account is
+  // what lets the health machine cool that account down; without it the
+  // failure classified provider-scoped, `mutatesAccount` was false, and the
+  // account stayed `active` with `consecutiveFailures: 0` through 16/16
+  // failures — re-dialled once a minute for as long as the block lasted.
+  //
+  // Deliberately not `credentialEvidence`: that flag also drives forced OAuth
+  // refresh and terminal disable, and an edge challenge is neither a revoked
+  // credential nor a permanent one.
   throw new GatewayError(
     "transport_unavailable",
     502,
     `Upstream returned an HTML error page: ${summary}`.slice(0, 300),
-    { upstreamStatus: response.status, contentType },
+    { upstreamStatus: response.status, contentType, accountScope: true },
     "upstream",
   );
 }

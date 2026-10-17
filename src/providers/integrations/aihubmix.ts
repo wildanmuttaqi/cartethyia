@@ -1,4 +1,4 @@
-import type { ApiKeyProviderSpec } from "./configured-provider";
+import type { ApiKeyProviderSpec } from "../configured-provider";
 
 const AIHUBMIX_PROVIDER_ID = "aihubmix" as const;
 
@@ -6,13 +6,13 @@ const AIHUBMIX_PROVIDER_ID = "aihubmix" as const;
  * AiHubMix serves the same model ids on chat and responses, so both wire
  * families are declared and `candidate.wire_family` picks the endpoint.
  */
-import { defineModel } from "../model-definition";
-import type { ModelDefinition } from "../provider-registry";
+import { defineModel } from "../provider-model-definition";
+import type { ModelDefinition } from "../provider-model-definition";
 
 export const AIHUBMIX_FALLBACK_MODELS: readonly ModelDefinition[] = [
   defineModel({ id: "gpt-5", providerId: AIHUBMIX_PROVIDER_ID, reasoning: true, vision: true }),
   defineModel({ id: "gpt-5-mini", providerId: AIHUBMIX_PROVIDER_ID, reasoning: true }),
-  defineModel({ id: "", providerId: AIHUBMIX_PROVIDER_ID, reasoning: true, vision: true }),
+  defineModel({ id: "claude-sonnet-4-5", providerId: AIHUBMIX_PROVIDER_ID, reasoning: true, vision: true }),
   defineModel({ id: "gemini-3-pro", providerId: AIHUBMIX_PROVIDER_ID, reasoning: true, vision: true }),
 ];
 

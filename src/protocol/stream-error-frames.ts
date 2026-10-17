@@ -17,9 +17,9 @@
  * beyond "the upstream declared a failure" becomes `platform_unavailable`,
  * which is honest: the upstream failed and we do not know more.
  */
-import { GatewayError } from "../transport/gateway-error";
+import { GatewayError } from "./gateway-error";
 import { classifyUpstreamError, extractUpstreamMessage, upstreamErrorIdentifier } from "../transport/failure-policy";
-import { isRecord } from "./primitives";
+import { isRecord } from "./codecs";
 
 
 function numericStatus(...candidates: unknown[]): number | undefined {
@@ -59,6 +59,7 @@ export function gatewayErrorFromStreamError(
   const identifier = upstreamErrorIdentifier(error);
   const explicitStatus = numericStatus(error["status"], error["statusCode"], error["status_code"]);
   const classification = classifyUpstreamError(explicitStatus, identifier);
+  const raw = JSON.stringify(error, null, 2).slice(0, 16_384);
   return new GatewayError(
     classification.code,
     classification.status,
@@ -66,6 +67,7 @@ export function gatewayErrorFromStreamError(
     {
       ...(explicitStatus === undefined ? {} : { providerStatus: explicitStatus }),
       ...(identifier ? { providerCode: identifier } : {}),
+      raw,
       ...(classification.credentialEvidence ? { credentialEvidence: true } : {}),
       ...(classification.rateLimitScope
         ? { rateLimitScope: classification.rateLimitScope }

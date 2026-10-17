@@ -2,9 +2,9 @@
 // boundary, and the compatibility-profile validator shared by the catalog
 // routes and the Drizzle catalog store.
 
-import { GatewayError } from "../../../transport/gateway-error";
-import { type ServiceKind, type WireFamily, SERVICE_KINDS, WIRE_FAMILIES } from "../../../transport/canonical-model";
-import { type ProviderRoutingSetting, type ProviderRoutingStrategy } from "../../../transport/routing/route-model";
+import { GatewayError } from "../../../protocol/gateway-error";
+import { type ServiceKind, type WireFamily, SERVICE_KINDS, WIRE_FAMILIES } from "../../../protocol/canonical-model";
+import type { ProviderRoutingStrategy } from "../../../persistence/schema";
 import { isProtectedHeader } from "../../../security/outbound-headers";
 import type { AccountHealthEventRecord } from "../../../providers/operations/account-health-service";
 import type { CompatibilityProfile } from "../../../providers/provider-metadata";
@@ -66,6 +66,7 @@ const VALID_WIRE_FAMILIES: Record<WireFamily, true> = {
   chat: true,
   responses: true,
   messages: true,
+  gemini: true,
 };
 
 export function isWireFamily(value: unknown): value is WireFamily {
@@ -84,6 +85,8 @@ const VALID_SERVICE_KINDS: Record<ServiceKind, true> = {
   llm: true,
   systemone: true,
   websearch: true,
+  imageGeneration: true,
+  videoGeneration: true,
 };
 
 export function isServiceKind(value: unknown): value is ServiceKind {
@@ -328,6 +331,12 @@ export interface ModelCatalogEntry {
   } | null;
   source: string | null;
   sourceUpdatedAt: string | null;
+  /**
+   * True when no catalog row filed this model, so `contextLimit`/`outputLimit`
+   * are a shared fallback rather than anything measured. The surface marks them
+   * so an operator can tell a measured window from a stand-in.
+   */
+  limitsEstimated?: boolean;
 }
 export interface FlatModelCatalogEntry {
   readonly providerId: string;
@@ -356,6 +365,40 @@ export interface SetModelEnabledRequest {
   route: string;
   enabled: boolean;
 }
+
+/**
+ * Operator-supplied metadata for a model whose limits the catalog cannot know
+ * — a manually added id, or one discovery fetched without a context size.
+ *
+ * `passthrough` is the "accept everything" escape hatch: it grants every
+ * capability at once rather than enumerating them, so the caller does not have
+ * to guess which flags a model it has never probed actually supports. It
+ * supersedes the individual flags rather than adding to them.
+ *
+ * Absent fields mean "leave the stored value alone" on update, and "derive from
+ * the catalog" on register.
+ */
+export interface ModelMetadataOverride {
+  readonly contextLimit?: number | null;
+  readonly outputLimit?: number | null;
+  /** True to grant every capability; overrides the per-flag fields below. */
+  readonly passthrough?: boolean;
+  readonly image?: boolean;
+  readonly reasoning?: boolean;
+  readonly toolCall?: boolean;
+}
+
+/** Register payload: model ids plus optional operator metadata. */
+export interface RegisterModelsRequest {
+  readonly modelIds: readonly string[];
+  readonly wireFamily?: string;
+  readonly metadata?: ModelMetadataOverride;
+}
+
+/** Update payload for one existing model row. */
+export interface UpdateModelMetadataRequest extends SetModelEnabledRequest {
+  readonly metadata?: ModelMetadataOverride;
+}
 /** Credential input accepted when provisioning a provider account. Never echoed back.
  * Concurrency is governed by Routing Strategy, not by an account field. */
 export interface CreateProviderAccountRequest {
@@ -370,6 +413,43 @@ export interface CreateProviderAccountRequest {
    */
   authState?: Readonly<Record<string, unknown>>;
 }
+
+/**
+ * One account in a batch create.
+ *
+ * Identical to {@link CreateProviderAccountRequest} minus nothing: a batch is
+ * just a list of single creates submitted together, so the per-account rules
+ * (credential detection, duplicate fingerprinting) stay in exactly one place
+ * rather than being restated for a second shape.
+ */
+export type CreateProviderAccountBatchItem = CreateProviderAccountRequest;
+
+/**
+ * Result of one item in a batch create.
+ *
+ * Per-item rather than all-or-nothing: an operator pasting 40 credentials wants
+ * the 38 that were fine to land even if two are duplicates. `index` ties each
+ * outcome back to the request position so the dashboard can report which paste
+ * line failed without the client re-matching on label.
+ */
+export interface CreateProviderAccountBatchItemResult {
+  readonly index: number;
+  readonly ok: boolean;
+  /** Present only when `ok` is true. */
+  readonly account?: ProviderAccountResponse;
+  /** Present only when `ok` is false. */
+  readonly error?: string;
+  /** Stable machine-readable reason, so the client can branch without matching text. */
+  readonly code?: string;
+}
+
+/** Aggregate outcome of a batch create. */
+export interface CreateProviderAccountBatchResult {
+  readonly created: number;
+  readonly failed: number;
+  readonly results: readonly CreateProviderAccountBatchItemResult[];
+}
+
 /** Patch accepted when editing or revoking an existing account. */
 export interface UpdateProviderAccountRequest {
   label?: string;
@@ -429,10 +509,6 @@ export interface ProviderAccountResponse {
    * of treating the account as broken; the account stays dispatchable.
    */
   staticToken?: boolean;
-  /** Last remaining credit the quota sweep fetched; `null` = never fetched. */
-  lastRemainingCredit: number | null;
-  /** Lowest remaining quota percent the sweep fetched; `null` = never fetched. */
-  lastRemainingPercent: number | null;
   /** Stable list position within this provider; the console's "Added" order. */
   sortIndex: number;
 }
@@ -458,6 +534,15 @@ export interface ProviderAccountExport {
   inflight?: number;
   cooldownUntil?: string;
   lastErrorCategory?: string;
+}
+/**
+ * One buddy growth-task ledger row: the stamp that says this account's task
+ * was attempted today. Read-only — the console observes, it does not write.
+ */
+export interface BuddyGrowthTaskLedgerEntry {
+  readonly accountId: string;
+  readonly task: string;
+  readonly claimedAt: string;
 }
 /** Response body of `POST /accounts/export`. */
 export interface ProviderAccountsExportResponse {
@@ -489,8 +574,15 @@ export interface ProviderLoginField {
 }
 
 export interface ProviderClientVersion {
+  /** The client the adapter presents itself as. */
+  readonly client: string;
   readonly version: string;
   readonly source: "latest" | "fallback";
+}
+
+export interface RouteIdentityVersions {
+  readonly codex: string;
+  readonly claude: string;
 }
 
 export interface ProviderResponse {
@@ -522,6 +614,8 @@ export interface ProviderResponse {
   credentialUrl?: string;
   /** One line of guidance beside {@link credentialUrl} when the flow is not a plain paste. */
   credentialHint?: string;
+  /** Presentation-only limitation shown on the provider detail page. */
+  operatorNotice?: string;
   capabilityProfile?: Record<string, unknown>;
   baseUrl?: string;
   compatibilityProfile?: CompatibilityProfile;
@@ -529,6 +623,8 @@ export interface ProviderResponse {
   updatedAt?: string;
   /** Latest known client version; `fallback` means upstream discovery has not succeeded. */
   clientVersion?: ProviderClientVersion;
+  /** Live Codex and Claude versions offered by the route-identity control. */
+  routeIdentityVersions: RouteIdentityVersions;
   oauthFlows?: {
     readonly browser: boolean;
     readonly device: boolean;
@@ -554,7 +650,7 @@ export interface ProviderResponse {
    * declares nothing and the caller's own choice stands. */
   supportedWireFamilies?: readonly WireFamily[];
 }
-export interface ProviderRecord extends Omit<ProviderResponse, "hasAdapterUserAgent"> {
+export interface ProviderRecord extends Omit<ProviderResponse, "hasAdapterUserAgent" | "routeIdentityVersions"> {
   tenantId: string | null;
 }
 
@@ -626,7 +722,14 @@ export interface ProviderCatalogStore {
     providerId: string,
     modelIds: readonly string[],
     wireFamily?: string,
+    metadata?: ModelMetadataOverride,
   ): Promise<void>;
+  /** Edits one owned model's limits and capability flags. False for a shared row. */
+  updateModelMetadata(
+    tenantId: string,
+    providerId: string,
+    request: UpdateModelMetadataRequest,
+  ): Promise<boolean>;
   syncModels(tenantId: string, providerId: string): Promise<{ synced: number }>;
   listAccounts(tenantId: string, providerId: string): Promise<readonly ProviderAccountResponse[]>;
   listAllAccounts(tenantId: string): Promise<readonly ProviderAccountResponse[]>;
@@ -635,6 +738,18 @@ export interface ProviderCatalogStore {
     providerId: string,
     request: CreateProviderAccountRequest,
   ): Promise<ProviderAccountResponse>;
+  /**
+   * Creates many accounts in one transaction, reporting a per-item outcome.
+   *
+   * A batch is not an optimisation layered on top of N single creates: it is
+   * one connection checkout, so a 40-credential paste is a single round-trip
+   * instead of 40 sequential ones.
+   */
+  createAccountBatch(
+    tenantId: string,
+    providerId: string,
+    requests: readonly CreateProviderAccountRequest[],
+  ): Promise<CreateProviderAccountBatchResult>;
   updateAccount(
     tenantId: string,
     providerId: string,
@@ -646,6 +761,12 @@ export interface ProviderCatalogStore {
     providerId: string,
     accountId: string,
   ): Promise<readonly AccountHealthEventRecord[]>;
+  listBuddyGrowthTasks(
+    tenantId: string,
+    providerId: string,
+    accountId: string,
+    dayKey: string,
+  ): Promise<readonly BuddyGrowthTaskLedgerEntry[]>;
   recoverAccount(tenantId: string, providerId: string, accountId: string): Promise<boolean>;
 }
 
@@ -672,18 +793,23 @@ export interface ProviderRoutingResponse {
   readonly rotateCount: number;
   /** Per-account inflight ceiling; `null` = unlimited concurrency. */
   readonly maxInflight: number | null;
-  /** Minimum-balance protection for every account of this provider/tenant. */
-  readonly creditLimitEnabled: boolean;
-  /** Minimum remaining balance to keep; credits or percent, default 50. */
-  readonly creditLimit: number;
+  /** Per-pool inflight ceiling for this provider — how many concurrent
+   * requests one proxy pool may carry for it. `null` = unlimited, the default. */
+  readonly maxInflightPerProxy: number | null;
+  /** Minimum remaining allowance an account must hold to stay routable.
+   * `null` means no floor. */
+  readonly usageFloor: number | null;
+  /** `credit` sums remaining credit; `percent` uses aggregate credit percentage
+   * and the lowest independent percentage-only window. */
+  readonly usageFloorUnit: "credit" | "percent";
   readonly enabled: boolean;
   /** When true, this provider's requests always dial direct. When false,
    * dispatch automatically picks the least-loaded, non-cooldown pool among
    * every active network pool the tenant owns — never an admin-pinned
-   * single pool. Some providers (see `DEFAULT_PROXY_BYPASS_PROVIDER_IDS`)
-   * default to bypass because their transport can't route through an HTTP
+   * single pool. Some providers (see `DEFAULT_PROXY_SKIP_PROVIDER_IDS`)
+   * default to skipping because their transport can't route through an HTTP
    * CONNECT proxy; it stays a real, per-tenant-overridable setting. */
-  readonly bypassProxy: boolean;
+  readonly skipProxy: boolean;
   /** Built-in API-key upstream User-Agent; OAuth and custom providers retain their own identity. */
   readonly userAgent: string;
 }
@@ -694,4 +820,27 @@ export interface ProviderRoutingResponse {
  * let the request drift from `ProviderRoutingSetting` (and from the Elysia body
  * schema that validates it) without a compile error.
  */
-export type UpdateProviderRoutingRequest = Partial<ProviderRoutingSetting>;
+/**
+ * Patch accepted when editing a provider's routing settings. Declared here
+ * rather than as `Partial<ProviderRoutingSetting>`: that type lives in the
+ * routing engine, and the console must not depend on the transport layer for
+ * its own request contract. The fields mirror the persisted
+ * `provider_routing_settings` row.
+ */
+export interface UpdateProviderRoutingRequest {
+  readonly strategy?: ProviderRoutingStrategy;
+  /** Requests served by one account before round robin advances. */
+  readonly rotateCount?: number;
+  /** Per-account inflight ceiling; `null` = unlimited concurrency. */
+  readonly maxInflight?: number | null;
+  /** Per-pool inflight ceiling for this provider; `null` = unlimited. */
+  readonly maxInflightPerProxy?: number | null;
+  /** Minimum remaining allowance; `null` clears the floor. */
+  readonly usageFloor?: number | null;
+  readonly usageFloorUnit?: "credit" | "percent";
+  readonly enabled?: boolean;
+  /** When true, this provider's requests always dial direct. */
+  readonly skipProxy?: boolean;
+  /** Built-in API-key upstream User-Agent. */
+  readonly userAgent?: string;
+}

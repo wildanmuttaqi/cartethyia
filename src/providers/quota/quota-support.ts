@@ -1,6 +1,7 @@
 import type { FetchLike, ProviderQuotaResult } from "./quota-contracts";
 import { cleanError, unsupportedQuota } from "./quota-contracts";
-import { type ProviderRegistry, parseProviderId } from "../provider-registry";
+import type { ProviderRegistry } from "../provider-registry";
+import { parseProviderId } from "../provider-contracts";
 import { providerBaseUrl } from "../provider-metadata";
 import { createProbeFetch } from "../operations/probe-fetch";
 /**

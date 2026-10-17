@@ -1,10 +1,14 @@
+import { globalOrOwnedBy } from "../../persistence/tenant-scope";
 import { t } from "elysia";
 import type { Elysia } from "elysia";
-import { and, eq, inArray, isNull, or } from "drizzle-orm";
+import { and, eq, inArray } from "drizzle-orm";
 import { providerAccounts, providers } from "../../persistence/schema";
 import { providerDisplayName } from "../../providers/provider-metadata";
 import { invalidateCredentialCache } from "../../providers/operations/provider-credential-service";
 import { requireTenantScope } from "../shared/errors";
+import { BUDDY_PROVIDER_IDS } from "../../providers/provider-metadata";
+import { readBuddyUsageSnapshots } from "../../providers/integrations/buddy/buddy-usage-store";
+import { GatewayError } from "../../protocol/gateway-error";
 import {
   GLOBAL_QUOTA_LENS,
   getCachedQuotaEntries,
@@ -19,11 +23,14 @@ import {
   type QuotaRefreshDeps,
   type QuotaRefreshFailureCode,
 } from "./refresh";
-import type { ProviderId } from "../../providers/provider-registry";
+import { selectAccountTestEgress } from "./account-test-egress";
+import type { ValidatedFetch } from "../../network/outbound-fetch";
+import type { ProviderId } from "../../providers/provider-contracts";
 import {
   DAILY_CHECKIN_PROVIDER_IDS,
-  checkinDayKey,
-  ledgerKey,
+  checkinAttemptedToday,
+  dailyCheckinEgressForPass,
+  markCheckinAttempted,
 } from "../../workers/daily-checkin";
 import {
   fetchBuddyActivityReport,
@@ -38,7 +45,6 @@ import {
   listAccountResetCredits,
 } from "../../providers/operations/account-reset-service";
 import {
-  enqueueBackgroundQuotaRefresh,
   pendingQuotaRefreshes,
   toQuotaAccountHealth,
   toQuotaView,
@@ -52,6 +58,44 @@ import {
 /** Daily check-in only exists on the buddy billing facade; everything else 400s with intent. */
 function supportsAccountCheckin(providerId: string): boolean {
   return (DAILY_CHECKIN_PROVIDER_IDS as readonly string[]).includes(providerId);
+}
+
+/** Providers whose billing meter reports real per-day credit deductions. */
+function isBuddyProvider(providerId: string): boolean {
+  return BUDDY_PROVIDER_IDS.has(providerId);
+}
+
+/**
+ * One account's stored usage, as the console renders it.
+ *
+ * `null` when nothing has been synced yet. Deliberately not an empty list: an
+ * account with no snapshot has *no data*, while an account that spent nothing
+ * has a snapshot saying zero — the page has to tell those apart.
+ */
+function toBuddyUsageView(
+  rows: readonly { readonly day: string; readonly model: string; readonly credit: number }[] | undefined,
+): {
+  readonly totalCredits: number;
+  readonly days: readonly { readonly day: string; readonly credit: number }[];
+  readonly models: readonly { readonly model: string; readonly credit: number }[];
+} | null {
+  if (rows === undefined || rows.length === 0) return null;
+  const byDay = new Map<string, number>();
+  const byModel = new Map<string, number>();
+  let totalCredits = 0;
+  for (const row of rows) {
+    byDay.set(row.day, (byDay.get(row.day) ?? 0) + row.credit);
+    byModel.set(row.model, (byModel.get(row.model) ?? 0) + row.credit);
+    totalCredits += row.credit;
+  }
+  return {
+    totalCredits: Math.round(totalCredits * 100) / 100,
+    days: [...byDay.entries()].map(([day, credit]) => ({ day, credit })),
+    models: [...byModel.entries()]
+      .map(([model, credit]) => ({ model, credit }))
+      // Highest spend first: the operator is looking for what costs the most.
+      .sort((left, right) => right.credit - left.credit),
+  };
 }
 
 /** One account's check-in through the buddy billing facade. */
@@ -69,58 +113,147 @@ async function runAccountCheckin(
   });
 }
 
+/** Bound on accounts one manual daily-growth batch may cover. */
+const DAILY_GROWTH_MAX_IDS = 100;
+/** Concurrent accounts inside one manual daily-growth batch. */
+const DAILY_GROWTH_CONCURRENCY = 3;
+
 /**
- * Reads the sweep ledger for today's check-in slot: a present marker means the
- * sweep already attempted this account today, so the card can show the state
- * without spending an upstream request. Absent (or unreadable) means unknown —
- * never "not claimed", since the sweep may simply not have reached it yet.
+ * One account's daily growth pass, report first then claim.
+ *
+ * The report goes first because it is the leg that lands on a free plan; the
+ * claim is attempted after it regardless of how the report went. Each leg
+ * reports its own outcome so the operator can see which one failed.
+ *
+ * `rotator` supplies the per-account egress the sweep uses; without one the
+ * request leaves through direct egress, which is what the single-account routes
+ * do.
+ */
+async function runDailyGrowthForAccount(
+  providerId: ProviderId,
+  account: { readonly id: string; readonly tenantId: string | null },
+  refreshDeps: QuotaRefreshDeps,
+  rotator: ((accountId: string, tenantId?: string | null) => Promise<ValidatedFetch>) | undefined,
+): Promise<{
+  readonly report: { readonly ok: boolean; readonly message: string };
+  readonly checkin: { readonly ok: boolean; readonly message: string };
+}> {
+  const fetcher = rotator
+    ? ((await rotator(account.id, account.tenantId)) as unknown as typeof fetch)
+    : globalThis.fetch;
+  let credential: string;
+  try {
+    credential = await refreshDeps.resolveCredential(providerId, account.id);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "Unable to resolve the credential.";
+    return {
+      report: { ok: false, message },
+      checkin: { ok: false, message },
+    };
+  }
+
+  // Report leg: needs a uid, which only a JWT carries, so an opaque API key
+  // fails closed instead of reporting under another account's identity.
+  const userId = buddyAccountUid(credential);
+  let report: { ok: boolean; message: string };
+  if (userId === undefined || userId.length === 0) {
+    report = { ok: false, message: "Report needs an OAuth account (no uid in this credential)" };
+  } else {
+    try {
+      const result = await fetchBuddyActivityReport({
+        providerId,
+        accountId: account.id,
+        credential,
+        userId,
+        fetcher,
+      });
+      report = result.state === "error"
+        ? { ok: false, message: result.error ?? "Activity report failed" }
+        : { ok: true, message: "Report sent — login streak lit for today" };
+    } catch (error) {
+      report = {
+        ok: false,
+        message: error instanceof Error ? error.message : "Activity report failed",
+      };
+    }
+  }
+
+  let checkin: { ok: boolean; message: string };
+  try {
+    const result = await fetchDailyCheckin({
+      providerId,
+      accountId: account.id,
+      credential,
+      forceClaim: true,
+      fetcher,
+    });
+    checkin =
+      result.state === "error"
+        ? { ok: false, message: result.error ?? "Daily check-in failed" }
+        : { ok: true, message: checkinStateMessage(result) };
+    // A manual trigger bypasses the day marker on the way in — the operator
+    // asked for "now", and a marker must not be able to refuse that — but it
+    // still leaves the marker behind, so the sweep does not spend another
+    // claim on the same account later today and the console can answer
+    // "attempted today" for an attempt made outside the sweep.
+    if (result.state !== "error") {
+      await markCheckinAttempted({ db: refreshDeps.db, redis: refreshDeps.redis, accountId: account.id });
+    }
+  } catch (error) {
+    checkin = {
+      ok: false,
+      message: error instanceof Error ? error.message : "Daily check-in failed",
+    };
+  }
+  return { report, checkin };
+}
+
+/**
+ * Reads today's check-in attempt from the ledger.
+ *
+ * Delegates to the module that owns the write: the marker lives in Redis when
+ * Redis is present and in `daily_checkin_ledger` when it is not, and only that
+ * module knows which one its own writes used.
  */
 async function todayCheckinAttempted(
+  db: AccountQuotaRoutesDeps["db"] | undefined,
   redis: AccountQuotaRoutesDeps["redis"],
   accountId: string,
 ): Promise<boolean> {
-  // Memory backend: no shared ledger exists, so "unknown" is the only honest
-  // answer — and unknown never reads as "not claimed".
-  if (redis === undefined) return false;
-  try {
-    const marker = await redis.get(ledgerKey(checkinDayKey(), accountId));
-    return marker !== null;
-  } catch {
-    return false;
-  }
+  return checkinAttemptedToday({ db, redis, accountId });
 }
 
+/**
+ * Operator-facing sentence for one check-in outcome.
+ *
+ * Every non-claimed state says what happens next rather than only that the
+ * attempt happened. `unavailable` in particular is the normal case on a free
+ * plan — the check-in activity simply is not running — and reading as a bare
+ * "unavailable" looked like a failure, when the account had still done its
+ * daily report and will be credited on the next cycle. A claim that did land
+ * states the amount.
+ */
 function checkinStateMessage(result: DailyCheckinResult): string {
   switch (result.state) {
     case "claimed":
       return result.credit !== null
-        ? `Daily check-in claimed (+${result.credit} credits${result.streakDays !== null ? `, ${result.streakDays}-day streak` : ""})`
-        : "Daily check-in claimed";
+        ? `credited ${result.credit} credits${result.streakDays !== null ? ` (${result.streakDays}-day streak)` : ""}`
+        : "credited";
     case "already_claimed":
-      return "Already checked in today";
+      return "already claimed today — credited again tomorrow";
     case "not_eligible":
-      return "Account is not eligible for daily check-in";
+      return "not eligible on this account";
     case "event_ended":
-      return "Daily check-in event has ended";
+      return "event has ended";
     case "unavailable":
-      return result.error ?? "Daily check-in is unavailable";
+      return "not open right now — you'll be credited on the next cycle";
     case "error":
-      return result.error ?? "Daily check-in failed";
+      return result.error ?? "could not be completed";
   }
 }
 
 const QUOTA_REFRESH_CONCURRENCY = 5;
 const QUOTA_REFRESH_MAX_IDS = 100;
-
-/**
- * How stale a cached value may be before the overview asks for a refresh.
- *
- * The cache TTL is 300 s, so a value older than this is close enough to expiry
- * that re-fetching now avoids the page ever rendering an expired entry. The
- * background queue dedupes, so a page that polls every couple of seconds still
- * produces at most one upstream fetch per account per window.
- */
-const QUOTA_STALE_AFTER_MS = 240_000;
 
 /**
  * Registers the tenant-scoped account/quota routes onto `app`. Every route here
@@ -139,13 +272,11 @@ export function registerAccountQuotaTenantRoutes(
     snapshotInvalidator,
     auditRecorder,
     providerRegistry,
+    networkBindingFactory,
   } = deps;
   app
     .get("/quota/overview", async ({ request }) => {
-      const access = requireTenantScope(
-        accessResolver(request),
-        "dashboard:read",
-      );
+      const access = requireTenantScope(accessResolver(request), "dashboard:read");
       const rows = await db
         .select({
           id: providerAccounts.id,
@@ -153,7 +284,6 @@ export function registerAccountQuotaTenantRoutes(
           tenantId: providerAccounts.tenantId,
           label: providerAccounts.label,
           credentialKind: providerAccounts.credentialKind,
-          authState: providerAccounts.authState,
           status: providerAccounts.status,
           lastError: providerAccounts.lastError,
           lastErrorCategory: providerAccounts.lastErrorCategory,
@@ -165,14 +295,8 @@ export function registerAccountQuotaTenantRoutes(
         .innerJoin(providers, eq(providerAccounts.providerId, providers.id))
         .where(
           and(
-            or(
-              isNull(providerAccounts.tenantId),
-              eq(providerAccounts.tenantId, access.tenantId),
-            ),
-            or(
-              isNull(providers.tenantId),
-              eq(providers.tenantId, access.tenantId),
-            ),
+            globalOrOwnedBy(providerAccounts.tenantId, access.tenantId),
+            globalOrOwnedBy(providers.tenantId, access.tenantId),
           ),
         );
 
@@ -190,7 +314,6 @@ export function registerAccountQuotaTenantRoutes(
         getCachedQuotaEntries(GLOBAL_QUOTA_LENS, globalIds, redis),
       ]);
 
-      const now = Date.now();
       const pending = pendingQuotaRefreshes();
       const providerIds = [...new Set(rows.map((row) => row.providerId))];
       // The dropdown is a quota-page control, not a provider directory: only
@@ -210,43 +333,35 @@ export function registerAccountQuotaTenantRoutes(
       // The sweep's day markers answer "attempted today" without an upstream
       // request; only check-in-capable accounts can carry one, so only they
       // are read.
-      const checkinCandidates = rows.filter((row) =>
-        supportsAccountCheckin(row.providerId),
-      );
+      const checkinCandidates = rows.filter((row) => supportsAccountCheckin(row.providerId));
       const checkinAttempted = new Map<string, boolean>();
       await Promise.all(
         checkinCandidates.map(async (row) => {
-          checkinAttempted.set(
-            row.id,
-            await todayCheckinAttempted(redis, row.id),
-          );
+          checkinAttempted.set(row.id, await todayCheckinAttempted(db, redis, row.id));
         }),
+      );
+      // Real credit deductions, read from the stored snapshots rather than from
+      // the upstream: the page renders every account at once, and re-hitting the
+      // billing endpoint per account would make opening it scale with the
+      // account count. One batch read for every buddy row.
+      const usageByAccount = await readBuddyUsageSnapshots(
+        db,
+        rows.filter((row) => isBuddyProvider(row.providerId)).map((row) => row.id),
       );
       const accounts = rows.map((row) => {
         const entry =
-          row.tenantId === null
-            ? globalCache.get(row.id)
-            : ownedCache.get(row.id);
-        const ageMs = entry?.fetchedAt
-          ? now - new Date(entry.fetchedAt).getTime()
-          : Number.POSITIVE_INFINITY;
-        // Providers with no quota collector (custom BYOK endpoints, key-only
-        // providers) intentionally never refresh: there is no upstream quota
-        // endpoint to ask, so enqueueing would only manufacture the
-        // "not available" error the page would then have to explain away.
+          row.tenantId === null ? globalCache.get(row.id) : ownedCache.get(row.id);
+        // No background refresh is enqueued here. Opening the page used to
+        // enqueue one for every account whose cached value had aged out, so a
+        // single page open hit every provider's quota endpoint at once — and
+        // because the page also polled, the operator saw that fan-out as "the
+        // page refreshes everything when I open it". The periodic sweep owns
+        // freshness; this route renders what is cached.
+        //
+        // `refreshing` still counts accounts with no cached value, so the client
+        // can show them as pending while the sweep fills them.
         const canRefresh = providerRegistry.hasQuotaCollector(row.providerId);
-        const wantsRefresh = canRefresh && ageMs >= QUOTA_STALE_AFTER_MS;
-        if (wantsRefresh) {
-          enqueueBackgroundQuotaRefresh(refreshDeps, {
-            accountId: row.id,
-            providerId: row.providerId,
-            tenantId: row.tenantId,
-            credentialKind: row.credentialKind,
-            authState: row.authState,
-          });
-        }
-        const isRefreshing =
-          canRefresh && (pending.has(row.id) || entry === undefined);
+        const isRefreshing = canRefresh && (pending.has(row.id) || entry === undefined);
         if (isRefreshing) refreshing += 1;
         return {
           id: row.id,
@@ -257,8 +372,10 @@ export function registerAccountQuotaTenantRoutes(
           quota: entry
             ? toQuotaView(entry.quota, row, {
                 fetchedAt: entry.fetchedAt,
-                ...(isRefreshing ? { status: "refreshing" as const } : {}),
-              })
+              lastAttemptAt: entry.lastAttemptAt,
+              refreshError: entry.refreshError,
+              ...(isRefreshing ? { status: "refreshing" as const } : {}),
+            })
             : null,
           pending: isRefreshing,
           health: toQuotaAccountHealth(row),
@@ -268,11 +385,13 @@ export function registerAccountQuotaTenantRoutes(
           // ledger (no upstream cost); the card combines it with the manual
           // trigger result to render claimed / already / due / unknown.
           ...(supportsAccountCheckin(row.providerId)
-            ? {
-                checkin: {
-                  attemptedToday: checkinAttempted.get(row.id) ?? false,
-                },
-              }
+            ? { checkin: { attemptedToday: checkinAttempted.get(row.id) ?? false } }
+            : {}),
+          // Real usage: what the billing meter says this account actually spent,
+          // per day and per model. Absent when nothing has been synced yet,
+          // which is a "no data" state rather than a zero.
+          ...(isBuddyProvider(row.providerId)
+            ? { usage: toBuddyUsageView(usageByAccount.get(row.id)) }
             : {}),
         };
       });
@@ -283,19 +402,13 @@ export function registerAccountQuotaTenantRoutes(
       return { providers: providersSummary, accounts, refreshing };
     })
     .get("/accounts/:id/quota", async ({ request, params, set }) => {
-      const access = requireTenantScope(
-        accessResolver(request),
-        "dashboard:read",
-      );
+      const access = requireTenantScope(accessResolver(request), "dashboard:read");
       const accountId = params.id;
       const rows = await db
         .select()
         .from(providerAccounts)
         .where(
-          and(
-            eq(providerAccounts.id, accountId),
-            eq(providerAccounts.tenantId, access.tenantId),
-          ),
+          and(eq(providerAccounts.id, accountId), eq(providerAccounts.tenantId, access.tenantId)),
         )
         .limit(1);
       const account = rows[0];
@@ -312,16 +425,14 @@ export function registerAccountQuotaTenantRoutes(
           health: toQuotaAccountHealth(account),
         };
       }
-      const cached = await getCachedQuotaEntry(
-        access.tenantId,
-        accountId,
-        redis,
-      );
+      const cached = await getCachedQuotaEntry(access.tenantId, accountId, redis);
       if (cached) {
         return {
           accountId,
           quota: toQuotaView(cached.quota, account, {
             fetchedAt: cached.fetchedAt,
+            lastAttemptAt: cached.lastAttemptAt,
+            refreshError: cached.refreshError,
           }),
           health: toQuotaAccountHealth(account),
         };
@@ -332,45 +443,29 @@ export function registerAccountQuotaTenantRoutes(
       // page open never issues two requests for the same account.
       const outcome = await refreshAccountQuota(
         refreshDeps,
-        {
-          accountId,
-          providerId: account.providerId,
-          tenantId: account.tenantId,
-          credentialKind: account.credentialKind,
-          authState: account.authState,
-        },
+        { accountId, providerId: account.providerId, tenantId: account.tenantId, credentialKind: account.credentialKind },
         signalFetch(timeoutSignal(request.signal, QUOTA_REFRESH_TIMEOUT_MS)),
       );
-      const fresh = await getCachedQuotaEntry(
-        access.tenantId,
-        accountId,
-        redis,
-      );
+      const fresh = await getCachedQuotaEntry(access.tenantId, accountId, redis);
       return {
         accountId,
-        quota: toQuotaView(outcome.quota, account, {
-          fetchedAt: fresh?.fetchedAt ?? new Date().toISOString(),
-          lastAttemptAt: new Date().toISOString(),
-          lastSuccessAt:
-            outcome.quota.error === null ? new Date().toISOString() : null,
+        quota: toQuotaView(fresh?.quota ?? outcome.quota, account, {
+          fetchedAt: fresh?.fetchedAt ?? null,
+          lastAttemptAt: fresh?.lastAttemptAt ?? new Date().toISOString(),
+          lastSuccessAt: fresh?.fetchedAt ?? null,
+          refreshError: fresh?.refreshError ?? null,
         }),
         health: toQuotaAccountHealth(account),
       };
     })
     .post("/accounts/:id/quota/refresh", async ({ request, params, set }) => {
-      const access = requireTenantScope(
-        accessResolver(request),
-        "dashboard:write",
-      );
+      const access = requireTenantScope(accessResolver(request), "dashboard:write");
       const accountId = params.id;
       const rows = await db
         .select()
         .from(providerAccounts)
         .where(
-          and(
-            eq(providerAccounts.id, accountId),
-            eq(providerAccounts.tenantId, access.tenantId),
-          ),
+          and(eq(providerAccounts.id, accountId), eq(providerAccounts.tenantId, access.tenantId)),
         )
         .limit(1);
       const account = rows[0];
@@ -385,17 +480,37 @@ export function registerAccountQuotaTenantRoutes(
       }
 
       const attemptedAt = new Date().toISOString();
-      const outcome = await refreshAccountQuota(
-        refreshDeps,
+      if (!deps.poolSelector || !deps.networkBindingFactory) {
+        throw new GatewayError(
+          "proxy_pool_unavailable",
+          503,
+          "Account test cannot select a proxy because proxy routing is not configured.",
+          { reason: "proxy_routing_unconfigured" },
+          "network",
+        );
+      }
+      const egress = await selectAccountTestEgress(
         {
-          accountId,
-          providerId: account.providerId,
-          tenantId: account.tenantId,
-          credentialKind: account.credentialKind,
-          authState: account.authState,
+          db,
+          poolSelector: deps.poolSelector,
+          networkBindingFactory: deps.networkBindingFactory,
         },
-        signalFetch(timeoutSignal(request.signal, QUOTA_REFRESH_TIMEOUT_MS)),
+        {
+          tenantId: access.tenantId,
+          providerId: account.providerId,
+          signal: timeoutSignal(request.signal, QUOTA_REFRESH_TIMEOUT_MS),
+        },
       );
+      let outcome;
+      try {
+        outcome = await refreshAccountQuota(
+          refreshDeps,
+          { accountId, providerId: account.providerId, tenantId: account.tenantId, credentialKind: account.credentialKind },
+          egress.fetch,
+        );
+      } finally {
+        egress.release();
+      }
       const httpStatus = outcome.quota.error === null ? 200 : 502;
       set.status = httpStatus;
       return {
@@ -423,17 +538,11 @@ export function registerAccountQuotaTenantRoutes(
         ),
       },
       async ({ request, body, set }) => {
-        const access = requireTenantScope(
-          accessResolver(request),
-          "dashboard:write",
-        );
+        const access = requireTenantScope(accessResolver(request), "dashboard:write");
         const ids = body?.accountIds ?? body?.ids ?? [];
         if (ids.length === 0) {
           set.status = 400;
-          return {
-            error: "accountIds must be a non-empty array",
-            code: "invalid_request",
-          };
+          return { error: "accountIds must be a non-empty array", code: "invalid_request" };
         }
         if (ids.length > QUOTA_REFRESH_MAX_IDS) {
           set.status = 400;
@@ -448,27 +557,19 @@ export function registerAccountQuotaTenantRoutes(
             providerId: providerAccounts.providerId,
             tenantId: providerAccounts.tenantId,
             credentialKind: providerAccounts.credentialKind,
-            authState: providerAccounts.authState,
           })
           .from(providerAccounts)
           .where(
             and(
               inArray(providerAccounts.id, ids),
-              or(
-                isNull(providerAccounts.tenantId),
-                eq(providerAccounts.tenantId, access.tenantId),
-              ),
+              globalOrOwnedBy(providerAccounts.tenantId, access.tenantId),
             ),
           );
         // Collectorless accounts are done without a fetch: counted as
         // succeeded with no quota, never as failures.
-        const refreshable = accounts.filter((account) =>
-          providerRegistry.hasQuotaCollector(account.providerId),
-        );
+        const refreshable = accounts.filter((account) => providerRegistry.hasQuotaCollector(account.providerId));
 
-        const timedFetch = signalFetch(
-          timeoutSignal(request.signal, QUOTA_REFRESH_TIMEOUT_MS),
-        );
+        const timedFetch = signalFetch(timeoutSignal(request.signal, QUOTA_REFRESH_TIMEOUT_MS));
         const failures: Array<{
           accountId: string;
           code: QuotaRefreshFailureCode;
@@ -482,11 +583,7 @@ export function registerAccountQuotaTenantRoutes(
             async () => {
               while (cursor < refreshable.length) {
                 const target = refreshable[cursor++]!;
-                const outcome = await refreshAccountQuota(
-                  refreshDeps,
-                  target,
-                  timedFetch,
-                );
+                const outcome = await refreshAccountQuota(refreshDeps, target, timedFetch);
                 if (outcome.failure !== null) {
                   failures.push({
                     accountId: target.accountId,
@@ -520,14 +617,8 @@ export function registerAccountQuotaTenantRoutes(
         }),
       },
       async ({ request, params, body, set }) => {
-        const access = requireTenantScope(
-          accessResolver(request),
-          "dashboard:write",
-        );
-        if (
-          body.status !== undefined &&
-          !ACCOUNT_STATUSES.includes(body.status as AccountStatus)
-        ) {
+        const access = requireTenantScope(accessResolver(request), "dashboard:write");
+        if (body.status !== undefined && !ACCOUNT_STATUSES.includes(body.status as AccountStatus)) {
           set.status = 400;
           return {
             error: `status must be one of: ${ACCOUNT_STATUSES.join(", ")}`,
@@ -542,10 +633,7 @@ export function registerAccountQuotaTenantRoutes(
             : (body.status as AccountStatus | undefined);
         if (!nextStatus) {
           set.status = 400;
-          return {
-            error: "active or status is required",
-            code: "invalid_request",
-          };
+          return { error: "active or status is required", code: "invalid_request" };
         }
         const updated = await db
           .update(providerAccounts)
@@ -578,10 +666,7 @@ export function registerAccountQuotaTenantRoutes(
         }),
       },
       async ({ request, body, set }) => {
-        const access = requireTenantScope(
-          accessResolver(request),
-          "dashboard:write",
-        );
+        const access = requireTenantScope(accessResolver(request), "dashboard:write");
         if (body.ids.length === 0) return { ok: true, updated: 0 };
         if (body.ids.length > QUOTA_REFRESH_MAX_IDS) {
           set.status = 400;
@@ -590,9 +675,7 @@ export function registerAccountQuotaTenantRoutes(
             code: "invalid_request",
           };
         }
-        const status = body.active
-          ? ("active" as const)
-          : ("disabled" as const);
+        const status = body.active ? ("active" as const) : ("disabled" as const);
         const updated = await db
           .update(providerAccounts)
           .set({ status })
@@ -615,18 +698,12 @@ export function registerAccountQuotaTenantRoutes(
       },
     )
     .delete("/accounts/:id", async ({ request, params, set }) => {
-      const access = requireTenantScope(
-        accessResolver(request),
-        "dashboard:write",
-      );
+      const access = requireTenantScope(accessResolver(request), "dashboard:write");
       const accountId = params.id;
       const deleted = await db
         .delete(providerAccounts)
         .where(
-          and(
-            eq(providerAccounts.id, accountId),
-            eq(providerAccounts.tenantId, access.tenantId),
-          ),
+          and(eq(providerAccounts.id, accountId), eq(providerAccounts.tenantId, access.tenantId)),
         )
         .returning({ id: providerAccounts.id });
       if (deleted.length === 0) {
@@ -645,19 +722,126 @@ export function registerAccountQuotaTenantRoutes(
       });
       return { success: true };
     })
+    /**
+     * Runs the daily growth pass over a provider's accounts in one request:
+     * the growth-activity report first, then the check-in claim — the order the
+     * sweep uses — with egress rotated per account the same way the worker
+     * does, so a batch leaves from more than one address.
+     *
+     * A manual trigger is the operator asserting "try now", so it bypasses the
+     * sweep's once-per-day ledger; the upstream stays idempotent either way.
+     * Per-account outcomes are reported individually: a batch is not
+     * all-or-nothing, and one account's closed check-in must not hide the
+     * others' streaks.
+     */
+    .post(
+      "/quota/daily-growth",
+      {
+        body: t.Object({
+          providerId: t.String(),
+          accountIds: t.Optional(t.Array(t.String())),
+        }),
+      },
+      async ({ request, body, set }) => {
+        const access = requireTenantScope(accessResolver(request), "dashboard:write");
+        const providerId = body.providerId.trim().toLowerCase();
+        if (!supportsAccountCheckin(providerId)) {
+          set.status = 400;
+          return {
+            error: `Daily check-in is not supported for provider ${providerId}`,
+            code: "checkin_unsupported",
+          };
+        }
+        const wanted = body.accountIds?.filter((id) => id.trim().length > 0) ?? [];
+        const rows = await db
+          .select({
+            id: providerAccounts.id,
+            tenantId: providerAccounts.tenantId,
+            label: providerAccounts.label,
+          })
+          .from(providerAccounts)
+          .where(
+            and(
+              eq(providerAccounts.providerId, providerId),
+              globalOrOwnedBy(providerAccounts.tenantId, access.tenantId),
+              ...(wanted.length > 0 ? [inArray(providerAccounts.id, wanted)] : []),
+            ),
+          );
+        const accounts = wanted.length > 0
+          ? rows.filter((row) => wanted.includes(row.id))
+          : rows;
+        if (accounts.length === 0) {
+          set.status = 404;
+          return {
+            error: `No accounts for provider ${providerId} in this tenant`,
+            code: "not_found",
+          };
+        }
+        if (accounts.length > DAILY_GROWTH_MAX_IDS) {
+          set.status = 400;
+          return {
+            error: `accountIds exceeds the limit of ${DAILY_GROWTH_MAX_IDS}`,
+            code: "invalid_request",
+          };
+        }
+        // One egress rotator for the whole request, exactly as the sweep builds
+        // it, so consecutive accounts leave from consecutive pools.
+        const rotator =
+          networkBindingFactory !== undefined
+            ? dailyCheckinEgressForPass({ db, networkBindingFactory })
+            : undefined;
+
+        const results: {
+          readonly accountId: string;
+          readonly label: string;
+          readonly report: { readonly ok: boolean; readonly message: string };
+          readonly checkin: { readonly ok: boolean; readonly message: string };
+        }[] = [];
+
+        for (let offset = 0; offset < accounts.length; offset += DAILY_GROWTH_CONCURRENCY) {
+          const batch = accounts.slice(offset, offset + DAILY_GROWTH_CONCURRENCY);
+          const settled = await Promise.all(
+            batch.map(async (account) => {
+              const outcome = await runDailyGrowthForAccount(
+                providerId as ProviderId,
+                account,
+                refreshDeps,
+                rotator,
+              );
+              return { account, outcome };
+            }),
+          );
+          for (const { account, outcome } of settled) {
+            results.push({
+              accountId: account.id,
+              label: account.label || account.id,
+              report: outcome.report,
+              checkin: outcome.checkin,
+            });
+          }
+        }
+
+        // The ledger is shared with the sweep, so invalidate once at the end
+        // rather than per account — the page re-reads "attempted today" from it.
+        await snapshotInvalidator?.invalidate();
+        const reportsOk = results.filter((entry) => entry.report.ok).length;
+        const claimed = results.filter((entry) => entry.checkin.ok).length;
+        return {
+          ok: true,
+          status: 200,
+          providerId,
+          data: results,
+          message: `${results.length} account${results.length === 1 ? "" : "s"} · report ${reportsOk}/${results.length} · check-in ${claimed}/${results.length}`,
+        };
+      },
+    )
     .post("/accounts/:id/checkin", async ({ request, params, set }) => {
-      const access = requireTenantScope(
-        accessResolver(request),
-        "dashboard:write",
-      );
+      const access = requireTenantScope(accessResolver(request), "dashboard:write");
       const rows = await db
         .select()
         .from(providerAccounts)
         .where(
-          and(
-            eq(providerAccounts.id, params.id),
-            eq(providerAccounts.tenantId, access.tenantId),
-          ),
+          and(eq(providerAccounts.id, params.id), eq(providerAccounts.tenantId, access.tenantId)),
         )
         .limit(1);
       const account = rows[0];
@@ -690,8 +874,7 @@ export function registerAccountQuotaTenantRoutes(
           state: "error",
           credit: null,
           streakDays: null,
-          error:
-            error instanceof Error ? error.message : "Daily check-in failed.",
+          error: error instanceof Error ? error.message : "Daily check-in failed.",
         };
       }
       if (result.state === "error") {
@@ -704,6 +887,11 @@ export function registerAccountQuotaTenantRoutes(
           code: "checkin_failed",
         };
       }
+      // The trigger bypassed the ledger on the way in; leaving the marker
+      // behind is what stops the sweep spending a second claim on this account
+      // today and lets the console read "attempted today" for an attempt the
+      // sweep did not make.
+      await markCheckinAttempted({ db, redis, accountId: account.id });
       return {
         ok: true,
         status: 200,
@@ -717,18 +905,12 @@ export function registerAccountQuotaTenantRoutes(
       };
     })
     .post("/accounts/:id/activity-report", async ({ request, params, set }) => {
-      const access = requireTenantScope(
-        accessResolver(request),
-        "dashboard:write",
-      );
+      const access = requireTenantScope(accessResolver(request), "dashboard:write");
       const rows = await db
         .select()
         .from(providerAccounts)
         .where(
-          and(
-            eq(providerAccounts.id, params.id),
-            eq(providerAccounts.tenantId, access.tenantId),
-          ),
+          and(eq(providerAccounts.id, params.id), eq(providerAccounts.tenantId, access.tenantId)),
         )
         .limit(1);
       const account = rows[0];
@@ -748,21 +930,17 @@ export function registerAccountQuotaTenantRoutes(
       // The marker only proves an attempt happened today — the growth event is
       // a different upstream call, but sharing the marker keeps the "one
       // growth action per day" budget honest across both buttons.
-      let alreadyReported = false;
-      if (redis !== undefined) {
-        try {
-          alreadyReported =
-            (await redis.get(ledgerKey(checkinDayKey(), account.id))) !== null;
-        } catch {
-          alreadyReported = false;
-        }
-      }
-      if (alreadyReported) {
+      //
+      // Read through the same helper the console's own overview uses rather
+      // than the Redis key directly: without Redis the marker lives in
+      // `daily_checkin_ledger`, so a Redis-only read answered "not yet" for
+      // every Lite deployment and let the report be re-sent all day.
+      if (await todayCheckinAttempted(db, redis, account.id)) {
         return {
           ok: true,
           status: 200,
           data: { id: account.id, state: "reported", alreadyToday: true },
-          message: "Activity already reported today",
+          message: "Report sent — login streak already lit for today",
         };
       }
       let result: BuddyActivityReportResult;
@@ -778,8 +956,7 @@ export function registerAccountQuotaTenantRoutes(
         if (!userId) {
           set.status = 400;
           return {
-            error:
-              "Activity report needs an OAuth account (no uid in this credential)",
+            error: "Activity report needs an OAuth account (no uid in this credential)",
             code: "report_requires_oauth",
           };
         }
@@ -795,8 +972,7 @@ export function registerAccountQuotaTenantRoutes(
           providerId: account.providerId,
           accountId: account.id,
           state: "error",
-          error:
-            error instanceof Error ? error.message : "Activity report failed.",
+          error: error instanceof Error ? error.message : "Activity report failed.",
         };
       }
       if (result.state === "error") {
@@ -809,26 +985,24 @@ export function registerAccountQuotaTenantRoutes(
           code: "report_failed",
         };
       }
+      // Same reasoning as the check-in button: the growth budget is one per
+      // day across both buttons, so a report that landed stamps the marker the
+      // other button reads.
+      await markCheckinAttempted({ db, redis, accountId: account.id });
       return {
         ok: true,
         status: 200,
         data: { id: account.id, state: result.state, alreadyToday: false },
-        message: "Activity reported — login streak lit for today",
+        message: "Report sent — login streak lit for today",
       };
     })
     .get("/accounts/:id/resets", async ({ request, params, set }) => {
-      const access = requireTenantScope(
-        accessResolver(request),
-        "dashboard:read",
-      );
+      const access = requireTenantScope(accessResolver(request), "dashboard:read");
       const rows = await db
         .select()
         .from(providerAccounts)
         .where(
-          and(
-            eq(providerAccounts.id, params.id),
-            eq(providerAccounts.tenantId, access.tenantId),
-          ),
+          and(eq(providerAccounts.id, params.id), eq(providerAccounts.tenantId, access.tenantId)),
         )
         .limit(1);
       const account = rows[0];
@@ -844,28 +1018,19 @@ export function registerAccountQuotaTenantRoutes(
           account.providerId as ProviderId,
           account.id,
         );
-        const list = await listAccountResetCredits(
-          account.providerId,
-          credential,
-        );
+        const list = await listAccountResetCredits(account.providerId, credential);
         return list ?? { availableCount: 0, credits: [] };
       } catch (err) {
         return { availableCount: 0, credits: [] };
       }
     })
     .post("/accounts/:id/reset", async ({ request, params, set, body }) => {
-      const access = requireTenantScope(
-        accessResolver(request),
-        "dashboard:write",
-      );
+      const access = requireTenantScope(accessResolver(request), "dashboard:write");
       const rows = await db
         .select()
         .from(providerAccounts)
         .where(
-          and(
-            eq(providerAccounts.id, params.id),
-            eq(providerAccounts.tenantId, access.tenantId),
-          ),
+          and(eq(providerAccounts.id, params.id), eq(providerAccounts.tenantId, access.tenantId)),
         )
         .limit(1);
       const account = rows[0];
@@ -880,9 +1045,7 @@ export function registerAccountQuotaTenantRoutes(
           code: "reset_unsupported",
         };
       }
-      const reqBody = (body && typeof body === "object" ? body : {}) as {
-        creditId?: string;
-      };
+      const reqBody = (body && typeof body === "object" ? body : {}) as { creditId?: string };
       try {
         const credential = await refreshDeps.resolveCredential(
           account.providerId as ProviderId,
@@ -912,10 +1075,7 @@ export function registerAccountQuotaTenantRoutes(
             access,
             action: "provider_account.recovered",
             target: account.id,
-            detail: {
-              reason: "rate_limit_reset_consumed",
-              provider: account.providerId,
-            },
+            detail: { reason: "rate_limit_reset_consumed", provider: account.providerId },
           });
         }
         return {
@@ -929,8 +1089,7 @@ export function registerAccountQuotaTenantRoutes(
         return {
           ok: false,
           code: "reset_failed",
-          message:
-            err instanceof Error ? err.message : "Reset operation failed",
+          message: err instanceof Error ? err.message : "Reset operation failed",
         };
       }
     });

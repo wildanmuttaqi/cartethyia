@@ -24,7 +24,7 @@
  * whose directory is unreachable: discovery adds and corrects rows, it does not
  * replace the bundled list.
  */
-import type { ModelDefinition } from "../../model-definition";
+import type { ModelDefinition } from "../../provider-model-definition";
 import { makeBuddyModel, type BuddyRawEntry } from "./buddy-catalog-shared";
 import { buddyAccountUid } from "./buddy-oauth-shared";
 
@@ -49,6 +49,7 @@ interface BuddyDirectoryRow {
   readonly supportsImages?: unknown;
   readonly supportsToolCall?: unknown;
   readonly supportsReasoning?: unknown;
+  readonly tags?: unknown;
 }
 
 /**
@@ -147,6 +148,16 @@ export async function fetchBuddyDirectoryModels(args: {
     const id = model?.id;
     if (typeof id !== "string" || id.length === 0 || seen.has(id)) continue;
     if (model?.disabled === true) continue;
+    // Completion, NES, and codewise rows are not chat models. Listing them
+    // offers a route that 400s on a chat request. A declared output of 256 or
+    // less is the same signal: a completion model published with a chat-sized
+    // name. `text-to-image` is an image row, served by the image roster.
+    const lowerId = id.toLowerCase();
+    if (lowerId.startsWith("nes-") || lowerId.startsWith("completion-") || lowerId.startsWith("codewise-")) continue;
+    const output = asNumber(model?.maxOutputTokens);
+    if (output !== null && output <= 256) continue;
+    const tags = model?.tags;
+    if (Array.isArray(tags) && tags.some((tag) => typeof tag === "string" && tag.toLowerCase() === "text-to-image")) continue;
     if (cliRoster !== undefined && !cliRoster.has(id)) continue;
     seen.add(id);
     entries.push([

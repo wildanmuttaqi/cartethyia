@@ -1,29 +1,31 @@
 import { ArrowLeft } from "lucide-react";
 import type { ReactNode } from "react";
-import { Link } from "react-router-dom";
+import { useNavigate } from "react-router-dom";
+import { cn } from "../../lib/classnames";
 
 export interface BackLinkProps {
+  /** Used only when this page was opened directly and there is no history entry to return to. */
   readonly to: string;
   readonly label: string;
 }
 
-/** Consistent detail-page back link. */
+/** Consistent detail-page back link. Goes to the previous page, not a fixed route. */
 export function BackLink({ to, label }: BackLinkProps): ReactNode {
+  const navigate = useNavigate();
   return (
-    <Link
-      to={to}
-      style={{
-        display: "inline-flex",
-        alignItems: "center",
-        gap: "6px",
-        color: "var(--accent)",
-        fontSize: "12px",
-        textDecoration: "none",
+    <button
+      type="button"
+      onClick={() => {
+        // A direct open (bookmark, pasted URL) has no in-app page to return to.
+        // `history.length` counts the current entry, so 1 means this is the first.
+        if (window.history.length > 1) navigate(-1);
+        else navigate(to);
       }}
+      className="inline-flex items-center gap-3 text-accent text-caption bg-transparent border-0 p-0 cursor-pointer"
     >
       <ArrowLeft size={14} aria-hidden="true" />
       {label}
-    </Link>
+    </button>
   );
 }
 
@@ -46,30 +48,23 @@ export function PageHeader({
   back,
 }: PageHeaderProps): ReactNode {
   return (
-    <div style={{ display: "flex", flexDirection: "column", gap: "10px" }}>
+    <div className="flex flex-col gap-5">
       {back ? <BackLink {...back} /> : null}
-      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: "12px", flexWrap: "wrap" }}>
-        <div style={{ display: "flex", alignItems: "center", gap: "10px", minWidth: 0 }}>
+      <div className="flex items-center justify-between gap-6 flex-wrap">
+        <div className="flex items-center gap-5 min-w-0">
           {icon ? <div className="card-header-icon">{icon}</div> : null}
-          <div style={{ minWidth: 0 }}>
-            <div style={{ display: "flex", alignItems: "center", gap: "8px", flexWrap: "wrap" }}>
-              <h1 style={{ fontSize: "16px", fontWeight: 700 }}>{title}</h1>
+          <div className="min-w-0">
+            <div className="flex items-center gap-4 flex-wrap">
+              <h1 className="text-lead font-bold">{title}</h1>
               {badges}
             </div>
-            {description ? <p style={{ marginTop: "2px", fontSize: "11.5px", color: "var(--text-tertiary)" }}>{description}</p> : null}
+            {description ? (
+              <p className="mt-1 text-badge text-text-tertiary">{description}</p>
+            ) : null}
           </div>
         </div>
         {actions ? (
-          <div
-            style={{
-              display: "flex",
-              alignItems: "center",
-              gap: "8px",
-              flexWrap: "wrap",
-              minWidth: 0,
-              maxWidth: "100%",
-            }}
-          >
+          <div className={cn("flex items-center gap-4 flex-wrap min-w-0 max-w-full")}>
             {actions}
           </div>
         ) : null}

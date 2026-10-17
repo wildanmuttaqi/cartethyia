@@ -1,6 +1,9 @@
 import * as RadixSelect from "@radix-ui/react-select";
 import { Check, ChevronDown } from "lucide-react";
-import { type CSSProperties, type ReactNode, useState } from "react";
+import { type CSSProperties, type ReactNode } from "react";
+
+import { FormField } from "../patterns/form-field";
+import { cn } from "../../lib/classnames";
 
 export interface SelectOption {
   readonly value: string;
@@ -23,11 +26,43 @@ export interface SelectProps {
   readonly error?: string;
 }
 
-const SIZE_HEIGHT: Record<NonNullable<SelectProps["size"]>, number> = {
-  sm: 30,
-  md: 36,
-  lg: 44,
+/**
+ * Height is a static prop, so it is a utility rather than an inline style. The
+ * sheet already sets 36px on `.radix-select-trigger`; the map re-expresses the
+ * three sizes on the `--spacing: 2px` scale (`h-15` = 30px, `h-18` = 36px,
+ * `h-22` = 44px). A caller-supplied `style.height` still wins, because an inline
+ * declaration outranks a class.
+ */
+const SIZE_HEIGHT_CLASS: Record<NonNullable<SelectProps["size"]>, string> = {
+  sm: "h-15",
+  md: "h-18",
+  lg: "h-22",
 };
+
+/**
+ * The value handed to Radix, with its reserved empty string translated away.
+ *
+ * Radix treats `""` as "nothing selected" — `Select.Value` falls back to its
+ * placeholder for it, exactly as it does for `undefined`. A controlled `""`
+ * therefore renders "Select…" even when the caller's state names a real
+ * selection. Exported so the translation is pinned without a DOM: mounting
+ * Radix and asserting on what the trigger paints is the only other way to see
+ * it, and `dashboard/test` has no mount helper yet.
+ */
+export function radixRootValue(value: string): string | undefined {
+  return value === "" ? undefined : value;
+}
+
+/**
+ * Whether an emission from Radix is a real selection the caller should store.
+ *
+ * Radix can emit `""`; storing it puts the caller's state on the same dead
+ * value the trigger renders as "Select…", after which the field looks reset no
+ * matter what was picked. Refusing it keeps the last real selection.
+ */
+export function isSelectableValue(next: string): boolean {
+  return next !== "";
+}
 
 export function Select({
   value,
@@ -43,32 +78,41 @@ export function Select({
   size = "md",
   error,
 }: SelectProps): ReactNode {
-  const handler = onValueChange ?? (() => {});
+  const rootValue = radixRootValue(value);
+  const handler = (next: string): void => {
+    if (!isSelectableValue(next)) return;
+    onValueChange?.(next);
+  };
   const selectedLabel = options.find((option) => option.value === value)?.label;
-  const [open, setOpen] = useState(false);
+
 
   const trigger = (
-    <RadixSelect.Root
-      value={value}
-      onValueChange={handler}
-      disabled={disabled}
-      open={open}
-      onOpenChange={setOpen}
-    >
+    <RadixSelect.Root value={rootValue} onValueChange={handler} disabled={disabled}>
       <RadixSelect.Trigger
         id={id}
         aria-label={ariaLabelProp ?? label}
-        className={`radix-select-trigger ${className}`.trim()}
+        // `cn` (twMerge), not a template string: `size` emits a height class and a
+        // caller may pass its own (`h-16` for a 32px control in a toolbar). Two
+        // same-specificity height classes would otherwise be resolved by stylesheet
+        // order, not by the caller's intent, and the control would silently take the
+        // atom's size instead of the one asked for.
+        className={cn(
+          "radix-select-trigger inline-flex items-center justify-between gap-4 w-full px-6 rounded-control border border-inner-border bg-surface-2 text-text-primary text-caption font-sans text-left cursor-pointer transition-[border-color,background-color] duration-150 ease-spring hover:border-border-strong focus-visible:outline-2 focus-visible:outline-focus-ring focus-visible:outline-offset-1 aria-disabled:opacity-70 aria-disabled:cursor-default aria-disabled:pointer-events-none [&_svg]:text-text-tertiary [&_svg]:transition-transform [&_svg]:duration-150 [&_svg]:ease-spring data-[state=open]:[&_svg]:rotate-180",
+          SIZE_HEIGHT_CLASS[size],
+          className,
+        )}
         style={{
           ...style,
-          height: style?.height ?? `${SIZE_HEIGHT[size]}px`,
+          // Runtime-computed (depends on `disabled`), so they stay inline: the
+          // sheet's `[aria-disabled]` rule cannot outrank an inline declaration,
+          // and these deliberately differ from it (0.6 vs 0.72, not-allowed vs
+          // default). Moving them to classes would silently change the render.
           opacity: disabled ? 0.6 : 1,
           cursor: disabled ? "not-allowed" : "pointer",
         }}
-        data-state={open ? "open" : "closed"}
       >
-        <RadixSelect.Value placeholder={placeholder}>
-          {selectedLabel ?? placeholder}
+        <RadixSelect.Value placeholder={placeholder} asChild>
+          <span>{selectedLabel ?? placeholder}</span>
         </RadixSelect.Value>
         <RadixSelect.Icon asChild>
           <ChevronDown size={14} />
@@ -79,7 +123,7 @@ export function Select({
         <RadixSelect.Content
           position="popper"
           sideOffset={4}
-          className="radix-select-content"
+          className="radix-select-content z-toast min-w-[var(--radix-select-trigger-width)] max-h-140 max-h-[var(--radix-select-content-available-height)] overflow-hidden overflow-y-auto border border-border-strong rounded-card bg-popover-bg shadow-popout backdrop-blur-xl p-2.5 box-border"
         >
           <RadixSelect.Viewport>
             {options.map((option) => (
@@ -87,10 +131,11 @@ export function Select({
                 key={option.value}
                 value={option.value}
                 disabled={option.disabled}
-                className="radix-select-item"
+                className="radix-select-item flex items-center justify-between gap-4 px-5 py-4 rounded-control text-caption font-medium text-text-primary cursor-pointer outline-none transition-colors duration-150 select-none data-[highlighted]:bg-surface-hover data-[state=checked]:font-semibold data-[disabled]:opacity-40 data-[disabled]:cursor-not-allowed"
+                textValue={option.label}
               >
-                <RadixSelect.ItemText>{option.label}</RadixSelect.ItemText>
-                <RadixSelect.ItemIndicator className="radix-select-indicator">
+                <span>{option.label}</span>
+                <RadixSelect.ItemIndicator className="radix-select-indicator inline-flex items-center text-accent">
                   <Check size={14} />
                 </RadixSelect.ItemIndicator>
               </RadixSelect.Item>
@@ -103,15 +148,5 @@ export function Select({
 
   if (!label) return trigger;
 
-  return (
-    <div className="form-group" style={style}>
-      <label className="form-label" htmlFor={id}>
-        {label}
-      </label>
-      {trigger}
-      {error ? (
-        <span style={{ fontSize: "11px", color: "var(--status-danger)" }}>{error}</span>
-      ) : null}
-    </div>
-  );
+  return <FormField label={label} error={error} htmlFor={id}>{trigger}</FormField>;
 }

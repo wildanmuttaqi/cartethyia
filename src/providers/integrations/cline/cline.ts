@@ -1,12 +1,13 @@
-import { createApiKeyAdapter } from "../configured-provider";
-import type { ProviderDispatchTarget, ModelDefinition, ProviderAdapter, ProviderDispatchContext } from "../../provider-registry";
-import { unwrapProviderToken } from "../../credential-envelope";
-import { GatewayError } from "../../../transport/gateway-error";
-import type { CanonicalRequest } from "../../../transport/canonical-model";
-import { completeRequiredSchema, isRecord } from "../../../protocol/primitives";
+import { createApiKeyAdapter } from "../../configured-provider";
+import type { ProviderDispatchTarget, ProviderAdapter, ProviderDispatchContext } from "../../provider-contracts";
+import type { ModelDefinition } from "../../provider-model-definition";
+import { unwrapProviderToken } from "../../provider-credential-envelope";
+import { GatewayError } from "../../../protocol/gateway-error";
+import type { CanonicalRequest } from "../../../protocol/canonical-model";
+import { completeRequiredSchema, isRecord } from "../../../protocol/codecs";
 import { providerBaseUrl } from "../../provider-metadata";
 import { getCachedModelDiscovery } from "../../operations/model-discovery-cache";
-import { defineModel } from "../../model-definition";
+import { defineModel } from "../../provider-model-definition";
 import { clinePlatform, clinePlatformVersion } from "../../operations/cli-platform";
 import {
   getClineClientVersion,
@@ -360,6 +361,33 @@ export async function fetchClineRecommendedModels(
   return getCachedModelDiscovery(`cline-recommended:${pass ? "pass" : "free"}`, load);
 }
 
+/**
+ * Whether the credential belongs to a Cline Pass account.
+ *
+ * Reads the same `/users/me/plan` endpoint the quota collector uses. A pass
+ * account is the only one allowed to see the `clinePass`/`clineCloud` roster;
+ * any failure answers `false`, so a free account never has subscription rows
+ * written into its catalog.
+ */
+export async function clineAccountHasPass(
+  credential: string,
+  fetcher: (input: RequestInfo | URL, init?: RequestInit) => Promise<Response> = globalThis.fetch,
+): Promise<boolean> {
+  try {
+    const token = credential.startsWith("workos:") ? credential : `workos:${credential}`;
+    const res = await fetcher("https://api.cline.bot/api/v1/users/me/plan", {
+      headers: { accept: "application/json", authorization: `Bearer ${token}` },
+      signal: AbortSignal.timeout(10_000),
+    });
+    if (!res.ok) return false;
+    const body = (await res.json()) as { plan?: { displayName?: unknown } };
+    const name = typeof body.plan?.displayName === "string" ? body.plan.displayName.toLowerCase() : "";
+    return name.includes("pass");
+  } catch {
+    return false;
+  }
+}
+
 /** Cline's model catalog, indexed for limit lookup. Empty when unavailable. */
 async function fetchClineUpstreamCatalog(
   fetcher: (input: RequestInfo | URL, init?: RequestInit) => Promise<Response>,
@@ -407,14 +435,6 @@ export const CLINE_MODELS: readonly ModelDefinition[] = [
   }),
   // The `free` bucket's published ids are the tier; the upstream id prefixes
   // are retained verbatim because they are part of Cline's model contract.
-  defineModel({
-    id: "stealth/space-bunny-alpha",
-    ctx: 1_000_000,
-    out: 524_288,
-    reasoning: true,
-    vision: true,
-    free: true,
-  }),
   defineModel({
     id: "cline-free/mimo-v2.6-flash",
     ctx: 1_048_576,

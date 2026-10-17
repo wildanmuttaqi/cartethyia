@@ -1,8 +1,8 @@
-import type { CanonicalEvent, CanonicalRequest, GenerationControls, ReasoningIntent } from "../../canonical-model";
+import type { CanonicalEvent, CanonicalRequest, GenerationControls, ReasoningIntent } from "../../../protocol/canonical-model";
 import type { SurfaceAdapter } from "../adapters";
 import { requiredObject } from "../adapters";
-import { isRecord } from "../../../protocol/primitives";
-import { TEXT_ENCODER } from "../stream-frame";
+import { isRecord } from "../../../protocol/codecs";
+import { TEXT_ENCODER } from "../../../protocol/sse-frame";
 import type { MessagesEncodingContext, MessagesErrorResponse, MessagesParseOptions, MessagesResponse } from "./parse";
 import {
   asSurfaceBody,
@@ -16,8 +16,8 @@ import {
 } from "./parse";
 import { CANONICAL_REASONING_EFFORTS, parseReasoningIntent, parseToolChoice } from "../dialects";
 import { groupedBlocks, startModel, stopData } from "./encode";
-import { finiteNumber, stringValue } from "../../../protocol/primitives";
-import { usageToMessagesWire } from "../../../providers/usage";
+import { finiteNumber, stringValue } from "../../../protocol/codecs";
+import { usageToMessagesWire } from "../../../providers/provider-usage";
 
 export class MessagesAdapter implements SurfaceAdapter {
   readonly surface = "messages" as const;
@@ -77,11 +77,26 @@ export class MessagesAdapter implements SurfaceAdapter {
     };
     const reasoningOptions: MessagesParseOptions =
       headers === undefined ? options : { ...options, headers };
-    const reasoning = parseThinking(body.thinking, body.model, reasoningOptions, maxTokens);
     // `output_config` carries the effort/task-budget controls Anthropic
     // recommends alongside adaptive thinking; fold them into the same
     // canonical reasoning intent so the payload builder can re-emit them.
     const outputConfig = isRecord(body.output_config) ? body.output_config : undefined;
+    // Resolve the caller's effort before thinking: an Anthropic client sizes
+    // thinking with `budget_tokens`, but an OpenAI-shaped caller states only an
+    // effort, and a budget-era model still needs a budget. Passing it in lets
+    // `parseThinking` derive one instead of rejecting the request.
+    const configEffort = outputConfig?.["effort"];
+    const callerEffort: ReasoningIntent["effort"] =
+      stringValue(configEffort) && CANONICAL_REASONING_EFFORTS.has(configEffort)
+        ? (configEffort as ReasoningIntent["effort"])
+        : parseReasoningIntent(body)?.effort;
+    const reasoning = parseThinking(
+      body.thinking,
+      body.model,
+      reasoningOptions,
+      maxTokens,
+      callerEffort,
+    );
     let reasoningIntent = reasoning;
     if (outputConfig !== undefined) {
       reasoningIntent ??= {};
@@ -97,12 +112,9 @@ export class MessagesAdapter implements SurfaceAdapter {
     // not dropped here when Chat and Responses honor the same field. Anthropic's
     // own spelling still wins when both are present, because it is the more
     // specific one for this wire.
-    if (reasoningIntent?.effort === undefined) {
-      const shared = parseReasoningIntent(body);
-      if (shared?.effort !== undefined) {
-        reasoningIntent ??= {};
-        reasoningIntent.effort = shared.effort;
-      }
+    if (reasoningIntent?.effort === undefined && callerEffort !== undefined) {
+      reasoningIntent ??= {};
+      reasoningIntent.effort = callerEffort;
     }
     const cache = cacheHint(body, system);
     const tools = parseTools(body.tools);

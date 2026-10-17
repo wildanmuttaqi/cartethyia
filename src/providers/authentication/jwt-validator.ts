@@ -15,6 +15,8 @@
  */
 import { constants, createPublicKey, verify as cryptoVerify } from "node:crypto";
 import type { KeyObject } from "node:crypto";
+import { TtlCache } from "../../persistence/ttl-cache";
+import { resolveRedisClient } from "../../persistence/redis";
 
 interface AlgorithmSpec {
   readonly hash: string;
@@ -186,6 +188,50 @@ const DEFAULT_JWKS_CACHE_TTL_MS = 5 * 60 * 1_000;
 const DEFAULT_MIN_REFRESH_INTERVAL_MS = 30_000;
 const MAX_JWKS_KEYS = 64;
 
+/** Shared JWKS window, matching the local verifier cache so peers reuse fetched keys. */
+const JWKS_SHARED_TTL_SECONDS = 300;
+const JWKS_SHARED_KEY_PREFIX = "jwks:v1:";
+
+/** Parses a cached JWKS value into keys, or `undefined` when it is unusable. */
+function parseSharedJwks(raw: string): readonly Jwk[] | undefined {
+  try {
+    const parsed = JSON.parse(raw) as unknown;
+    if (!Array.isArray(parsed)) return undefined;
+    const keys = parsed.filter((key): key is Jwk => key !== null && typeof key === "object");
+    return keys.length > 0 ? keys : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/** Reads a peer instance's cached JWKS. Never throws; a miss falls through to fetch. */
+async function readSharedJwks(url: string): Promise<readonly Jwk[] | undefined> {
+  const redis = resolveRedisClient();
+  if (!redis) return undefined;
+  try {
+    const hit = await redis.get(`${JWKS_SHARED_KEY_PREFIX}${url}`);
+    return hit === null ? undefined : parseSharedJwks(hit);
+  } catch {
+    return undefined;
+  }
+}
+
+/** Publishes fetched keys for peer instances. Best-effort: a failure is not a request failure. */
+async function writeSharedJwks(url: string, keys: readonly Jwk[]): Promise<void> {
+  const redis = resolveRedisClient();
+  if (!redis) return;
+  try {
+    await redis.set(
+      `${JWKS_SHARED_KEY_PREFIX}${url}`,
+      JSON.stringify(keys),
+      "EX",
+      JWKS_SHARED_TTL_SECONDS,
+    );
+  } catch {
+    // Shared visibility only; the local cache stays authoritative.
+  }
+}
+
 interface CachedJwks {
   readonly keys: readonly Jwk[];
   readonly fetchedAt: number;
@@ -223,7 +269,7 @@ export class JwksVerifier {
     this.#minRefreshIntervalMs = options.minRefreshIntervalMs ?? DEFAULT_MIN_REFRESH_INTERVAL_MS;
   }
 
-  async #fetchKeys(): Promise<readonly Jwk[]> {
+  async #fetchKeysRemote(): Promise<readonly Jwk[]> {
     const response = await this.#fetch(this.#url, {
       headers: { accept: "application/json" },
       signal: AbortSignal.timeout(5_000),
@@ -237,13 +283,29 @@ export class JwksVerifier {
     );
   }
 
+  /**
+   * Resolves keys for this URL, reading a peer instance's shared copy first on a
+   * normal read. A forced refresh — the unknown-`kid` retry that picks up
+   * rotation — skips the shared copy and fetches the issuer, then republishes,
+   * so rotation is not delayed by the shared TTL.
+   */
+  async #fetchKeys(useSharedCache: boolean): Promise<readonly Jwk[]> {
+    if (useSharedCache) {
+      const shared = await readSharedJwks(this.#url);
+      if (shared !== undefined) return shared;
+    }
+    const keys = await this.#fetchKeysRemote();
+    await writeSharedJwks(this.#url, keys);
+    return keys;
+  }
+
   async #getKeys(forceRefresh: boolean): Promise<readonly Jwk[]> {
     const now = this.#clock();
     if (!forceRefresh && this.#cache && now - this.#cache.fetchedAt < this.#cacheTtlMs) {
       return this.#cache.keys;
     }
     if (this.#inflight) return this.#inflight;
-    const request = this.#fetchKeys()
+    const request = this.#fetchKeys(!forceRefresh)
       .then((keys) => {
         this.#cache = { keys, fetchedAt: this.#clock() };
         this.#lastRefreshAt = this.#clock();
@@ -309,7 +371,20 @@ function selectKeys(keys: readonly Jwk[], kid: string | undefined, kty: "RSA" | 
   });
 }
 
-const jwksVerifiers = new Map<string, JwksVerifier>();
+/**
+ * One verifier per URL, bounded and time-limited.
+ *
+ * The registry used to be an unbounded, never-evicted `Map`: every JWKS URL
+ * ever seen pinned its verifier — and its key cache — for the process
+ * lifetime. A TTL plus a hard entry cap keeps a fleet of issuers from growing
+ * it without limit while still sharing a verifier's key cache across calls.
+ */
+const JWKS_VERIFIER_TTL_MS = 5 * 60 * 1_000;
+const JWKS_VERIFIER_MAX_ENTRIES = 64;
+const jwksVerifiers = new TtlCache<JwksVerifier>({
+  ttlMs: JWKS_VERIFIER_TTL_MS,
+  maxEntries: JWKS_VERIFIER_MAX_ENTRIES,
+});
 
 /** Returns a process-wide verifier for `url` so its key cache is shared. */
 export function jwksVerifierFor(

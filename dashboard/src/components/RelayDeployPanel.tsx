@@ -5,35 +5,58 @@ import { Dialog } from "./ui/dialog";
 import { Input } from "./ui/input";
 import { Select } from "./ui/select";
 import { Stack } from "./ui/stack";
-import { RELAY_TARGETS, type RelayTarget } from "../data/contracts";
+import {
+  DEFAULT_RELAY_REGION,
+  RELAY_REGION_GROUPS,
+  RELAY_TARGETS,
+  type RelayRegion,
+  type RelayTarget,
+} from "../data/contracts";
 import { useDeployRelay } from "../hooks/network";
-import { getErrorMessage } from "../shared/helpers";
-import { toast } from "../shared/toast";
+import { getErrorMessage } from "../data/api";
+import { toast } from "../lib/toast";
 
 /** Human labels and per-target fields for the deploy form. */
 const TARGET_META: Record<
   RelayTarget,
-  { readonly label: string; readonly tokenLabel: string; readonly needsAccount: boolean; readonly host: string }
+  {
+    readonly label: string;
+    readonly tokenLabel: string;
+    readonly needsAccount: boolean;
+    readonly host: string;
+    /** Whether traffic leaves from a country the operator picks. */
+    readonly hasRegion: boolean;
+  }
 > = {
   cloudflare: {
     label: "Cloudflare Workers",
     tokenLabel: "Cloudflare API token",
     needsAccount: true,
     host: "*.workers.dev",
+    // Workers runs at the edge nearest the caller, not in a chosen region, so
+    // offering a country picker here would be a control that does nothing.
+    hasRegion: false,
   },
   vercel: {
     label: "Vercel",
     tokenLabel: "Vercel API token",
     needsAccount: false,
     host: "*.vercel.app",
+    hasRegion: true,
   },
   deno: {
     label: "Deno Deploy",
     tokenLabel: "Deno Deploy token",
     needsAccount: false,
     host: "*.deno.dev",
+    hasRegion: false,
   },
 };
+
+/** Flat options for the region picker; the group name leads each label. */
+const REGION_OPTIONS = RELAY_REGION_GROUPS.flatMap((group) =>
+  group.regions.map((entry) => ({ value: entry.id, label: `${group.label} — ${entry.label}` })),
+);
 
 /**
  * Deploy a hosted relay (Cloudflare Workers / Vercel / Deno Deploy) and register
@@ -55,6 +78,7 @@ export function RelayDeployModal({
 }): ReactNode {
   const deploy = useDeployRelay();
   const [target, setTarget] = useState<RelayTarget>("cloudflare");
+  const [region, setRegion] = useState<RelayRegion>(DEFAULT_RELAY_REGION);
   const [token, setToken] = useState("");
   const [accountId, setAccountId] = useState("");
   const [projectName, setProjectName] = useState("");
@@ -72,6 +96,9 @@ export function RelayDeployModal({
         token: token.trim(),
         ...(meta.needsAccount && accountId.trim() ? { accountId: accountId.trim() } : {}),
         ...(projectName.trim() ? { projectName: projectName.trim() } : {}),
+        // Only Vercel runs in a region an operator chooses; sending it to the
+        // others would be a control that does nothing.
+        ...(meta.hasRegion ? { region } : {}),
       },
       {
         onSuccess: (result) => {
@@ -93,8 +120,8 @@ export function RelayDeployModal({
       size="md"
     >
       <Stack gap="12px">
-        <p style={{ fontSize: "11px", color: "var(--text-tertiary)", margin: 0, display: "flex", gap: "6px" }}>
-          <Server size={13} style={{ flexShrink: 0, marginTop: "1px" }} />
+        <p className="text-badge text-text-tertiary m-0 flex gap-3">
+          <Server size={13} className="shrink-0 mt-0.5" />
           <span>
             Deploys a small relay worker to your own {meta.label} account and registers its URL
             (<code>{meta.host}</code>) as an active HTTP pool. Your API token is used only for the
@@ -132,19 +159,35 @@ export function RelayDeployModal({
           placeholder="e.g. cartethyia-relay"
           onChange={(event) => setProjectName(event.target.value)}
         />
-        <div style={{ display: "flex", alignItems: "center", gap: "10px" }}>
+        {meta.hasRegion ? (
+          <Select
+            label="Deploy region"
+            id="relay-region"
+            value={region}
+            onValueChange={(value) => setRegion(value as RelayRegion)}
+            options={REGION_OPTIONS}
+          />
+        ) : null}
+        {meta.hasRegion ? (
+          <p className="text-badge text-text-tertiary m-0">
+            Sets the region on the Vercel project, which is what decides the country
+            outbound traffic leaves from. A region sent on the deployment alone is
+            accepted but does not move the Function.
+          </p>
+        ) : null}
+        <div className="flex items-center gap-5">
           <Button variant="primary" size="sm" onClick={submit} disabled={!canSubmit || deploy.isPending}>
             {deploy.isPending ? "Deploying…" : "Deploy relay"}
           </Button>
           {lastUrl ? (
-            <span style={{ fontSize: "11px", color: "var(--text-tertiary)" }}>
+            <span className="mt-1 text-badge text-text-tertiary">
               Registered pool at <code>{lastUrl}</code>
             </span>
           ) : null}
         </div>
         {deploy.isError ? (
-          <p style={{ fontSize: "11px", color: "var(--red)", margin: 0, display: "flex", gap: "6px" }}>
-            <TriangleAlert size={13} style={{ flexShrink: 0, marginTop: "1px" }} />
+          <p className="text-badge text-red m-0 flex gap-3">
+            <TriangleAlert size={13} className="shrink-0 mt-0.5" />
             <span>{getErrorMessage(deploy.error, "Relay deploy failed.")}</span>
           </p>
         ) : null}

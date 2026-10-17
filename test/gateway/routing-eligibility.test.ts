@@ -22,7 +22,7 @@ import { createTestGateway, type TestGateway } from "../helpers/gateway";
 import { createWorld, type GatewayWorld } from "../helpers/fixtures";
 import { dbDescribe } from "../helpers/database";
 import { EligibilityEvaluator } from "../../src/transport/routing/router";
-import { GatewayError } from "../../src/transport/gateway-error";
+import { GatewayError } from "../../src/protocol/gateway-error";
 import type { RouteCandidate } from "../../src/transport/routing/route-model";
 
 const CHAT_BODY = { model: "placeholder", messages: [{ role: "user", content: "hi" }], stream: false };
@@ -47,6 +47,187 @@ describe("EligibilityEvaluator", () => {
       eligible: true,
       reason: "healthy",
     });
+  });
+
+  test("a depleted bonus window does not block positive summed credits", () => {
+    const quotaWindows = [
+      {
+        kind: "quota:monthly",
+        label: "Monthly",
+        accounting: "pooled",
+        usedPercent: 88.6,
+        remainingPercent: 11.4,
+        resetsAt: null,
+        limit: 500,
+        used: 441.7,
+      },
+      {
+        kind: "bonus:1",
+        label: "Bonus Pack 1",
+        accounting: "pooled",
+        usedPercent: 100,
+        remainingPercent: 0,
+        resetsAt: null,
+        limit: 10,
+        used: 10,
+      },
+    ];
+
+    expect(evaluator.evaluate(candidate({
+      usage_floor: 40,
+      usage_floor_unit: "credit",
+      quota_windows: quotaWindows,
+    }))).toMatchObject({ eligible: true, reason: "healthy" });
+    expect(evaluator.evaluate(candidate({
+      usage_floor: 10,
+      usage_floor_unit: "percent",
+      quota_windows: quotaWindows,
+    }))).toMatchObject({ eligible: true, reason: "healthy" });
+    expect(evaluator.evaluate(candidate({
+      usage_floor: 40,
+      usage_floor_unit: "percent",
+      quota_windows: [
+        ...quotaWindows,
+        {
+          kind: "session",
+          label: "5 Hour",
+          accounting: "independent",
+          usedPercent: 100,
+          remainingPercent: 0,
+          resetsAt: null,
+        },
+      ],
+    }))).toMatchObject({ eligible: false, reason: "quota_exhausted" });
+    expect(evaluator.evaluate(candidate({
+      usage_floor: 40,
+      usage_floor_unit: "credit",
+      quota_windows: [
+        ...quotaWindows,
+        {
+          kind: "weekly",
+          label: "Weekly",
+          accounting: "independent",
+          usedPercent: 100,
+          remainingPercent: 0,
+          resetsAt: null,
+        },
+      ],
+    }))).toMatchObject({ eligible: false, reason: "quota_exhausted" });
+  });
+
+  test("GitHub Chat and Premium Requests share one credit floor", () => {
+    const windows = [
+      {
+        kind: "chat",
+        label: "Chat Requests",
+        accounting: "pooled",
+        usedPercent: 87.5,
+        remainingPercent: 12.5,
+        resetsAt: null,
+        limit: 200,
+        used: 175,
+      },
+      {
+        kind: "premium_interactions",
+        label: "Premium Requests",
+        accounting: "pooled",
+        usedPercent: 93.3,
+        remainingPercent: 6.7,
+        resetsAt: null,
+        limit: 300,
+        used: 280,
+      },
+      {
+        kind: "completions",
+        label: "Completions",
+        accounting: "independent",
+        usedPercent: 99,
+        remainingPercent: 1,
+        resetsAt: null,
+        limit: 2_000,
+        used: 1_980,
+      },
+    ];
+
+    expect(evaluator.evaluate(candidate({
+      provider_id: "github",
+      usage_floor: 40,
+      usage_floor_unit: "credit",
+      quota_windows: windows,
+    }))).toMatchObject({ eligible: true, reason: "healthy" });
+
+    expect(evaluator.evaluate(candidate({
+      provider_id: "github",
+      usage_floor: 40,
+      usage_floor_unit: "credit",
+      quota_windows: windows.map((window) =>
+        window.kind === "premium_interactions" ? { ...window, used: 290 } : window,
+      ),
+    }))).toMatchObject({ eligible: false, reason: "quota_exhausted" });
+  });
+
+  test("a zero-percent window still exhausts accounts with no absolute credit reading", () => {
+    expect(
+      evaluator.evaluate(candidate({
+        quota_windows: [{
+          kind: "quota:weekly",
+          label: "Weekly",
+          accounting: "independent",
+          usedPercent: 100,
+          remainingPercent: 0,
+          resetsAt: null,
+        }],
+      })),
+    ).toMatchObject({ eligible: false, reason: "quota_exhausted" });
+  });
+
+  test("a usage-floor exclusion carries the window's reset as its deadline", () => {
+    // The floor compares the *remaining* allowance, and the window states when
+    // that refills, so the exclusion is time-bounded by construction. Carrying
+    // the reset is what lets `plan()` answer 429 with a real retry-after
+    // instead of 503 with nothing.
+    const reset = new Date(Date.now() + 4 * 60 * 60 * 1000).toISOString();
+    const decision = evaluator.evaluate(candidate({
+      quota_windows: [{
+        kind: "quota:weekly",
+        label: "Weekly",
+        accounting: "independent",
+        usedPercent: 100,
+        remainingPercent: 0,
+        resetsAt: reset,
+      }],
+    }));
+    expect(decision).toMatchObject({ eligible: false, reason: "quota_exhausted" });
+    expect(decision.cooldown_until).toBe(Date.parse(reset));
+  });
+
+  test("a usage-floor exclusion with no stated reset carries no deadline", () => {
+    // An unknown refill time must read as "unavailable", not as a 429 quoting
+    // a reset nobody measured.
+    const decision = evaluator.evaluate(candidate({
+      quota_windows: [{
+        kind: "quota:weekly",
+        label: "Weekly",
+        accounting: "independent",
+        usedPercent: 100,
+        remainingPercent: 0,
+        resetsAt: null,
+      }],
+    }));
+    expect(decision).toMatchObject({ eligible: false, reason: "quota_exhausted" });
+    expect(decision.cooldown_until).toBeUndefined();
+  });
+
+  test("a usage-floor exclusion reports the earliest refill, not the slowest", () => {
+    const soon = new Date(Date.now() + 2 * 60 * 60 * 1000).toISOString();
+    const later = new Date(Date.now() + 9 * 60 * 60 * 1000).toISOString();
+    const decision = evaluator.evaluate(candidate({
+      quota_windows: [
+        { kind: "quota:weekly", label: "Weekly", accounting: "independent", usedPercent: 100, remainingPercent: 0, resetsAt: later },
+        { kind: "quota:daily", label: "Daily", accounting: "independent", usedPercent: 100, remainingPercent: 0, resetsAt: soon },
+      ],
+    }));
+    expect(decision.cooldown_until).toBe(Date.parse(soon));
   });
 
   test("an absent health status is treated as healthy", () => {
@@ -112,6 +293,32 @@ describe("EligibilityEvaluator", () => {
     // detached decision would force a second lookup.
     const target = candidate({ health_status: "cooldown" });
     expect(evaluator.evaluate(target).candidate).toBe(target);
+  });
+
+  // A cooling decision carries the deadline that produced it, so `plan()` can
+  // report the real reset instead of a bare 429. Before this the deadline lived
+  // only on the account row at snapshot-build time and was dropped at the
+  // evaluator, so the all-accounts-cooling answer had no wait to quote and every
+  // client fell back to `retry-after: 1`.
+  test("a cooling decision carries the deadline the exclusion was built from", () => {
+    const until = Date.now() + 600_000;
+    expect(evaluator.evaluate(candidate({ health_status: "cooldown", cooldown_until: until })).cooldown_until).toBe(until);
+    expect(
+      evaluator.evaluate(candidate({ health_status: "cooldown", cooldown_kind: "hard", cooldown_until: until }))
+        .cooldown_until,
+    ).toBe(until);
+    expect(
+      evaluator.evaluate(candidate({ health_status: "model_cooldown", cooldown_until: until })).cooldown_until,
+    ).toBe(until);
+  });
+
+  test("a decision with no deadline carries none, rather than undefined-as-present", () => {
+    // `exactOptionalPropertyTypes` makes `cooldown_until: undefined` a *present*
+    // property, which would assert a window exists for a candidate that has
+    // none. Absent must mean absent.
+    const healthy = evaluator.evaluate(candidate({ health_status: "active" }));
+    expect("cooldown_until" in healthy).toBe(false);
+    expect(evaluator.evaluate(candidate({ health_status: "cooldown" }))).not.toHaveProperty("cooldown_until");
   });
 });
 
@@ -280,6 +487,84 @@ dbDescribe("account failover", () => {
     const body = (await response.json()) as { error: { code: string } };
     expect(body.error.code).toBe("accounts_rate_limited");
     expect(dispatchedAccountIds()).toEqual([]);
+  });
+
+  test("the all-cooling 429 reports the real reset in retry-after", async () => {
+    // The 429 already told the client to "retry once the cooldown resets", but
+    // carried no deadline, so `error-lifecycle.ts` fell back to `retry-after: 1`
+    // and a client re-dialled a resting account every second for the whole
+    // window. The earliest cooling deadline is now the reported wait.
+    const cooling = await world.addAccount({ label: "only-cooling" });
+    gateway.setRoutes([
+      {
+        providerId: world.providerId,
+        modelId: world.modelId,
+        accountId: cooling,
+        healthStatus: "cooldown",
+        cooldownUntil: Date.now() + 600_000,
+      },
+    ]);
+    gateway.adapter(world.providerId);
+
+    const response = await chat();
+    expect(response.status).toBe(429);
+    // ~600s, allowing for the clock ticking between the fixture and the header.
+    const retryAfter = Number(response.headers.get("retry-after"));
+    expect(Number.isFinite(retryAfter)).toBe(true);
+    expect(retryAfter).toBeGreaterThan(590);
+    expect(retryAfter).toBeLessThanOrEqual(600);
+    expect(dispatchedAccountIds()).toEqual([]);
+  });
+
+  test("with several cooling accounts the earliest reset is reported", async () => {
+    // The minimum, not the maximum: the request can be served as soon as the
+    // first account recovers, so quoting the slowest would hold the client off
+    // longer than it has to wait.
+    const soon = await world.addAccount({ label: "soon" });
+    const later = await world.addAccount({ label: "later" });
+    gateway.setRoutes([
+      {
+        providerId: world.providerId,
+        modelId: world.modelId,
+        accountId: soon,
+        healthStatus: "cooldown",
+        cooldownUntil: Date.now() + 120_000,
+      },
+      {
+        providerId: world.providerId,
+        modelId: world.modelId,
+        accountId: later,
+        healthStatus: "cooldown",
+        cooldownUntil: Date.now() + 7_200_000,
+      },
+    ]);
+    gateway.adapter(world.providerId);
+
+    const response = await chat();
+    expect(response.status).toBe(429);
+    const retryAfter = Number(response.headers.get("retry-after"));
+    expect(retryAfter).toBeGreaterThan(110);
+    expect(retryAfter).toBeLessThanOrEqual(120);
+  });
+
+  test("an exclusion with no deadline reports no invented wait", async () => {
+    // `disabled` has no reset — only an operator can lift it. Reporting a
+    // fabricated backoff would send the client into a retry loop that can never
+    // succeed, so the 503 path must not grow a `retry-after` from nothing.
+    const off = await world.addAccount({ label: "disabled" });
+    gateway.setRoutes([
+      {
+        providerId: world.providerId,
+        modelId: world.modelId,
+        accountId: off,
+        healthStatus: "disabled",
+      },
+    ]);
+    gateway.adapter(world.providerId);
+
+    const response = await chat();
+    expect(response.status).toBe(503);
+    expect(response.headers.get("retry-after")).toBeNull();
   });
 
   test("a non-retryable upstream failure is not retried against a sibling", async () => {

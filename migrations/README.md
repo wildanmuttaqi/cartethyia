@@ -1,34 +1,52 @@
-# Database migrations
+# Database baselines
 
-This directory is the **tracked source of truth for executable SQL migrations**. The backend runs migrations automatically during startup; operators do not choose files or run SQL manually.
+Cartethyia keeps one SQL baseline per database backend:
 
-```mermaid
-flowchart TD
-    A[Start backend] --> B[buildProductionDeps]
-    B --> C[ensureMigrated]
-    C --> D[applySqlMigrations]
-    D --> E[Read numbered SQL files in migrations/]
-    E --> F[Acquire PostgreSQL advisory lock]
-    F --> G{File recorded in cartethyia_schema_migrations?}
-    G -- Yes --> H[Skip file]
-    G -- No --> I[BEGIN; execute SQL; record filename; COMMIT]
-    H --> J[Continue startup and seed providers]
-    I --> J
-```
+- `full-postgres/0000_baseline.sql` defines the foundational PostgreSQL schema
+  for a new database.
+- `lite-sqlite3/0000_baseline.sql` is generated from the PostgreSQL baseline by
+  `scripts/generate/sqlite-ddl.ts`; do not edit it by hand.
 
-## Current state
+The startup runner applies the baseline and numbered forward migrations,
+recording them in `cartethyia_schema_migrations` along with a hash marker for
+the exact baseline contents. Released baselines are immutable so existing
+installations keep matching their marker; numbered migrations bring that
+foundational schema up to the current schema. Each backend's migrations must
+have matching behavior. Startup fails with a recovery instruction for a
+database with unsupported retired migration history instead of treating it as
+current.
 
-- `0000_baseline.sql` declares the complete current schema for a new database, including types, tables, constraints, and indexes. Keep it aligned with `src/persistence/schema.ts`. It is the baseline a fresh install starts from, so it always describes the *current* shape — a schema change edits it and adds a forward migration beside it.
-- `0001_*.sql` and later are **forward migrations**: the change needed by a database that already recorded an earlier file. They are applied in filename order after the baseline, so a fresh database runs the baseline and then converges through them.
-- `src/persistence/postgres.ts` resolves this directory relative to the process working directory, reads only top-level `NNNN_*.sql` files in filename order, and applies each file transactionally under a cross-process advisory lock. Successful filenames are stored in `cartethyia_schema_migrations`. A migration failure aborts startup; a failed transaction does not record its filename.
-- `src/runtime/dependencies.ts` calls `ensureMigrated()` before provider/catalog seeding. `src/persistence/readiness.ts` checks that every shipped filename is recorded before reporting ready.
-- The Docker image copies this directory to `/app/migrations` (`Dockerfile`); `bun run start` spawns the compiled binary with no `cwd` override (`scripts/commands/start-production.ts`), so it inherits the caller's working directory and the folder resolves there. Both read the same committed SQL, with no generated staging copy.
+## Recovering an existing installation
+
+1. Export a backup from the existing installation before switching it to a
+   release with unsupported migration history.
+2. Create a fresh database and point the application at it.
+3. Start the application so it creates the baseline schema.
+4. Restore the backup through the console restore flow.
+
+Restore normalizes legacy values that no longer satisfy current constraints,
+including `bypass_proxy` → `skip_proxy`, `bridge` → `https`, the retired
+provider User-Agent default, Cline's skip-proxy default, and `fusion` →
+`fallback`. Unknown or retired columns are reported and skipped according to
+the backup contract.
+
+Do not point tests or recovery steps at development or production databases.
+The startup path runs `ensureMigrated()` before provider/catalog seeding. Full
+mode uses `src/persistence/db-pg.ts` and an advisory lock; Lite uses
+`src/persistence/db-sqlite.ts`. Readiness compares the ledger to the available baseline and forward migration
+files. A failed migration aborts startup and is not recorded.
+
+Migrations are package assets, not resolved from the process working directory:
+`src/config/package-paths.ts` resolves them from the package root. `package.json`
+includes `migrations/` in the published files, and the Dockerfile copies the
+migration directories into `/app/migrations`.
 
 ## Next schema change
 
-1. Change `src/persistence/schema.ts` and fold the complete new shape into `0000_baseline.sql` for fresh installations.
-2. Add the next `<NNNN>_<description>.sql` **beside the baseline** with only the forward change needed by databases that already recorded an earlier file — the next number is one past the highest already shipped in this directory. Never put runnable SQL in a `manual/` subdirectory: the runner is non-recursive.
-3. Make each forward migration safe to retry where possible (for example, `ADD COLUMN IF NOT EXISTS`), and do not edit an already-shipped forward migration to change what a ledger entry means.
-4. Update this README when the migration flow or schema policy changes. Run `bun run typecheck` and verify a fresh schema against an isolated database.
-
-The baseline is for **new** databases. Editing it cannot upgrade a database that already recorded its filename; that is why every later schema change needs the corresponding numbered forward SQL file. The runner will apply that file at the next backend startup, before serving requests.
+1. Update `src/persistence/schema.ts` and add matching numbered migrations to
+   both backends. Preserve released baseline files so existing baseline markers
+   remain valid.
+2. Update backup validation/mapping when old exported rows need normalization
+   or new required values.
+3. Run focused migration, restore, and typecheck tests. Validate against an
+   isolated database only.

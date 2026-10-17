@@ -1,9 +1,8 @@
 import type { ConsoleAccessResolver } from "../auth/access";
 // Telemetry domain: system health, usage, and telemetry-event read API.
 
-import { ConsoleDomainError, consoleErrorHandler, requireTenantScope } from "../shared/errors";
+import { ConsoleDomainError, requireTenantScope } from "../shared/errors";
 import { parseQueryLimit } from "../shared/query";
-import { Elysia, t } from "elysia";
 import type { AccessDecision } from "../../security/access-control";
 import { USAGE_DIMENSIONS, type UsageDimension } from "./usage-dimensions";
 
@@ -29,11 +28,22 @@ export interface SystemHealthResponse {
   uptime_seconds: number;
   database_healthy: boolean;
   redis_healthy: boolean;
+  /** False when no Redis client is configured and coordination stays in memory. */
+  redis_configured: boolean;
+  /** JavaScript heap used by this process. */
+  memory_heap_bytes: number;
+  /** Native buffers and malloc outside the JavaScript heap. */
+  memory_external_bytes: number;
   memory_bytes: number;
+  /** RSS as a percentage of system memory, not of the JS heap. */
   memory_percent: number;
-  heap_used_bytes: number;
-  heap_total_bytes: number;
-  external_bytes: number;
+  /**
+   * True when the database runs inside this process (SQLite). Then RSS covers
+   * the gateway *and* a whole PostgreSQL build, so it is not comparable with a
+   * driver-only process and the console must say so rather than imply the
+   * gateway itself grew.
+   */
+  database_in_process: boolean;
   cpu_percent: number;
   cpu_cores: number;
   pid: number;
@@ -75,7 +85,21 @@ export interface UsageSummaryTotals {
   truncated: number;
   /** Counts by actual HTTP status for the clickable Requests filters. */
   statusCounts: Array<{ status: number; count: number }>;
+  /** Average gateway routing and preparation delay before upstream dispatch. */
+  avgResolveMs: number;
   avgDurationMs: number;
+  /** Nearest-rank latency percentiles over the selected usage period. */
+  latencyP50Ms: number;
+  latencyP95Ms: number;
+  latencyP99Ms: number;
+  /**
+   * How many events each latency series was computed from. A percentile over
+   * twenty requests and one over twenty thousand do not deserve the same
+   * confidence, and the count is the only thing that says which it is.
+   */
+  latencySampleCount: number;
+  /** Events carrying a resolve measurement; differs when a row never dispatched. */
+  resolveSampleCount: number;
   estimatedCostUsd: number;
   /** True when completed rows without persisted cost exist in the window. */
   partial: boolean;
@@ -126,6 +150,8 @@ export interface UsageByRow {
 export { USAGE_DIMENSIONS, type UsageDimension };
 
 export interface UsageByResponse {
+  /** The dimension these rows were grouped by, so a stale response can never be read as another tab's data. */
+  dimension: UsageDimension;
   rows: UsageByRow[];
 }
 export interface UsageCacheResponse {
@@ -144,6 +170,12 @@ export interface UsageRequestItem {
   /** Provider account (credential) that served this request, if any. */
   accountId?: string;
   model?: string;
+  /**
+   * The model the upstream named in its own response, verbatim — not the one
+   * the client asked for. Absent when the response carried no `model`; never
+   * backfilled from `model`, because that would report the ask as the answer.
+   */
+  reportedModel?: string;
   endpoint?: string;
   apiKeyId?: string;
   userAgent?: string;
@@ -177,6 +209,14 @@ export interface UsageRequestItem {
   tokensPerSec?: number;
   firstContentDeltaAtMs?: number;
   lastEventAtMs?: number;
+  /**
+   * Why this request's drawer payloads are empty, or `captured` when they are
+   * not. Remote-diagnosis field: the four panels read blank for every reason
+   * alike, so without this an operator cannot tell "capture is off" from
+   * "capture is broken" without access to the server's logs. Absent on rows
+   * written before the column existed.
+   */
+  payloadCaptureState?: string;
 }
 export interface UsageRequestsResponse {
   items: UsageRequestItem[];
@@ -380,87 +420,4 @@ export function createObservabilityOperations(config: ObservabilityConfig) {
       },
   };
   return operations;
-}
-
-const usageQuery = t.Object({ period: t.Optional(t.String()) });
-const telemetryListQuery = t.Object({
-  period: t.Optional(t.String()),
-  limit: t.Optional(t.String()),
-  cursor: t.Optional(t.String()),
-});
-const usageRequestsQuery = t.Object({
-  period: t.Optional(t.String()),
-  limit: t.Optional(t.String()),
-  httpStatus: t.Optional(t.String()),
-});
-const telemetryDetailQuery = t.Object({
-  includePayload: t.Optional(t.String()),
-  createdAt: t.Optional(t.String()),
-});
-export function createObservabilityRoutes(config: ObservabilityConfig): Elysia {
-  const factory = createObservabilityOperations(config);
-  return new Elysia()
-    .error(consoleErrorHandler("Observability operation failed"))
-    .get("/system/health", async ({ request }) => {
-      return await factory.getSystemHealth(config.accessResolver(request));
-})
-    .get("/system/usage", { query: usageQuery }, async ({ request, query }) => {
-      return await factory.getTenantUsage(config.accessResolver(request), query.period);
-})
-    .get("/system/usage/summary", { query: usageQuery }, async ({ request, query }) => {
-      return await factory.getUsageSummary(config.accessResolver(request), query.period);
-})
-    .get("/system/usage/chart", { query: usageQuery }, async ({ request, query }) => {
-      return await factory.getUsageChart(config.accessResolver(request), query.period);
-})
-    // One `by-<dimension>` route per member of `USAGE_DIMENSIONS`, so a new
-    // dimension cannot be added to the validator without its route existing.
-    .get(
-      "/system/usage/by-:dimension",
-      { query: usageQuery, params: t.Object({ dimension: t.String() }) },
-      async ({ request, params, query }) => {
-        const dimension = params.dimension as UsageDimension;
-        if (!(USAGE_DIMENSIONS as readonly string[]).includes(dimension)) {
-          throw new ConsoleDomainError(
-            "invalid_dimension",
-            404,
-            `Unknown usage dimension: ${dimension}`,
-          );
-        }
-        return await factory.getUsageBy(config.accessResolver(request), dimension, query.period);
-},
-    )
-    .get("/system/usage/cache", { query: usageQuery }, async ({ request, query }) => {
-      return await factory.getUsageCache(config.accessResolver(request), query.period);
-})
-    .get("/system/usage/requests", { query: usageRequestsQuery }, async ({ request, query }) => {
-      return await factory.listUsageRequests(
-        config.accessResolver(request),
-        query.period,
-        query.limit,
-        query.httpStatus,
-      );
-})
-    .get("/system/usage/requests/:requestId", async ({ request, params }) => {
-      return await factory.getUsageRequestDetail(config.accessResolver(request), params.requestId);
-})
-    .get("/telemetry/events", { query: telemetryListQuery }, async ({ request, query }) => {
-      return await factory.listEvents(
-        config.accessResolver(request),
-        query.limit,
-        query.cursor,
-      );
-})
-    .get(
-      "/telemetry/events/:eventId",
-      { query: telemetryDetailQuery },
-      async ({ request, params, query }) => {
-        return await factory.getEventDetail(
-          config.accessResolver(request),
-          params.eventId,
-          query.includePayload === "true",
-          query.createdAt,
-        );
-},
-    ) as unknown as Elysia;
 }

@@ -71,6 +71,9 @@ const CAPACITY = 500;
 const MAX_MSG = 2_000;
 
 const lines: ConsoleLogLine[] = [];
+// Start index of the live window: eviction advances the pointer instead of
+// splice() memmove on every overflow.
+let ringStart = 0;
 const listeners = new Set<(event: ConsoleLogEvent) => void>();
 
 /** Single append path: truncate, bound the ring, then fan out to subscribers. */
@@ -81,7 +84,11 @@ function appendLine(line: Omit<ConsoleLogLine, "ts" | "msg"> & { readonly msg: s
     msg: line.msg.length > MAX_MSG ? `${line.msg.slice(0, MAX_MSG)}…` : line.msg,
   };
   lines.push(stored);
-  if (lines.length > CAPACITY) lines.splice(0, lines.length - CAPACITY);
+  if (lines.length - ringStart > CAPACITY) ringStart += 1;
+  if (ringStart > 256 && ringStart > lines.length / 2) {
+    lines.splice(0, ringStart);
+    ringStart = 0;
+  }
   for (const listener of listeners) {
     try {
       listener({ type: "line", line: stored });
@@ -96,11 +103,12 @@ export function pushConsoleLog(level: ConsoleLogLevel, msg: string): void {
 }
 
 export function getConsoleLogSnapshot(): ConsoleLogLine[] {
-  return [...lines];
+  return [...lines.slice(ringStart)];
 }
 
 export function clearConsoleLogs(): void {
   lines.length = 0;
+  ringStart = 0;
   for (const listener of listeners) {
     try {
       listener({ type: "clear" });
@@ -123,5 +131,6 @@ export function subscribeConsoleLogs(
 /** Test-only: reset the shared ring and drop all subscribers between tests. */
 export function resetConsoleLogsForTests(): void {
   lines.length = 0;
+  ringStart = 0;
   listeners.clear();
 }

@@ -1,6 +1,6 @@
 import type { FetchLike, ProviderQuotaResult } from "../quota/quota-contracts";
 import { probeApiKeyConnectivity } from "../quota/quota-support";
-import type { ApiKeyProviderSpec } from "./configured-provider";
+import type { ApiKeyProviderSpec } from "../configured-provider";
 
 const CEREBRAS_PROVIDER_ID = "cerebras" as const;
 
@@ -9,8 +9,8 @@ export const CEREBRAS_SPEC: ApiKeyProviderSpec = {
   endpoint_paths_by_wire_family: {},
 };
 
-import { defineModel } from "../model-definition";
-import type { ModelDefinition } from "../provider-registry";
+import { defineModel } from "../provider-model-definition";
+import type { ModelDefinition } from "../provider-model-definition";
 
 export const CEREBRAS_MODELS: readonly ModelDefinition[] = [
   defineModel({

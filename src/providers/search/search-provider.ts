@@ -13,16 +13,8 @@
  * Keeping both beside the spec means the route never learns a provider's wire,
  * and a new search provider is one spec row plus one metadata/registry entry.
  */
-import type {
-  ProviderAdapter,
-  ProviderDispatchContext,
-  ProviderDispatchTarget,
-  ProviderId,
-  WebSearchOutcome,
-  WebSearchResult,
-} from "../provider-registry";
-import { GatewayError } from "../../transport/gateway-error";
-import { readCredentialSecret } from "../provider-registry";
+import type { ProviderAdapter, ProviderDispatchContext, ProviderDispatchTarget, ProviderId, WebSearchOutcome, WebSearchResult } from "../provider-contracts";
+import { GatewayError } from "../../protocol/gateway-error";
 
 /** Caller-facing search parameters, already validated by the route. */
 export interface SearchParams {
@@ -111,7 +103,9 @@ export function createSearchAdapter(spec: SearchProviderSpec): ProviderAdapter {
       context: ProviderDispatchContext,
     ): Promise<WebSearchOutcome> {
       const params = searchParamsFromBody(body);
-      const token = readCredentialSecret(context.credential);
+      const token = context.credential.secret
+        ? new TextDecoder().decode(context.credential.secret).trim()
+        : "";
       const { url, init } = spec.buildRequest(params, token);
       const outboundFetch = context.outbound_fetch ?? globalThis.fetch;
       let res: Response;
@@ -134,10 +128,14 @@ export function createSearchAdapter(spec: SearchProviderSpec): ProviderAdapter {
           `${spec.provider_id} search error: ${detail.slice(0, 240)}`,
         );
       }
+      const raw = await res.text();
       let data: unknown;
       try {
-        data = await res.json();
+        data = JSON.parse(raw);
       } catch {
+        data = jsonFromEventStream(raw);
+      }
+      if (data === undefined) {
         throw new GatewayError(
           "platform_unavailable",
           502,
@@ -148,6 +146,23 @@ export function createSearchAdapter(spec: SearchProviderSpec): ProviderAdapter {
       return { results, total_results: results.length };
     },
   };
+}
+
+
+/** The last JSON `data:` payload in an SSE search response. */
+function jsonFromEventStream(raw: string): unknown {
+  let parsed: unknown;
+  for (const line of raw.split(/\r?\n/)) {
+    const payload = line.startsWith("data:") ? line.slice(5).trim() : "";
+    if (payload.length === 0 || payload === "[DONE]") continue;
+    try {
+      parsed = JSON.parse(payload);
+    } catch {
+      // A non-JSON event line is not a result. The next data line may be.
+    }
+  }
+  return parsed;
+
 }
 
 export { asRecord, stringField };

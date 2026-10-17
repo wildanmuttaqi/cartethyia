@@ -3,9 +3,9 @@ import { Suspense, useEffect, useState, type ReactNode } from "react";
 import { QueryClientProvider } from "@tanstack/react-query";
 import { BrowserRouter, Navigate, Route, Routes, useLocation, useNavigate } from "react-router-dom";
 import { Toaster } from "sonner";
-import { DashboardShell } from "./components/Shell";
+import { DashboardShell } from "./apps/console/shell";
 import ErrorBoundary from "./components/ErrorBoundary";
-import { lazyWithRetry } from "./shared/lazy-retry";
+import { lazyWithRetry } from "./lib/lazy-retry";
 import { consoleRequest, fetchSessionUser, setSessionTransitionListener } from "./data/api";
 import { queryClient } from "./data/query-client";
 import { queryKeys } from "./data/query-keys";
@@ -17,18 +17,10 @@ function RouteLoadingShell(): ReactNode {
     <div
       role="status"
       aria-label="Loading console"
-      style={{
-        minHeight: "100dvh",
-        display: "flex",
-        flexDirection: "column",
-        alignItems: "center",
-        justifyContent: "center",
-        gap: "12px",
-        color: "var(--text-tertiary)",
-      }}
+      className="min-h-dvh flex flex-col items-center justify-center gap-6 text-text-tertiary"
     >
       <Loader2 size={22} className="animate-spin" aria-hidden="true" />
-      <p style={{ fontSize: "12.5px" }}>Loading console…</p>
+      <p className="text-caption">Loading console…</p>
     </div>
   );
 }
@@ -36,21 +28,22 @@ function RouteLoadingShell(): ReactNode {
 // Route chunks are content-hashed: after a rebuild the previous page's chunk
 // URLs 404. lazyWithRetry reloads once to pick up the fresh index.html, then
 // surfaces to the ErrorBoundary instead of looping.
-const Login = lazyWithRetry(() => import("./routes/Login"), "login");
-const Setup = lazyWithRetry(() => import("./routes/Setup"), "setup");
-const Banned = lazyWithRetry(() => import("./routes/Banned"), "banned");
-const Overview = lazyWithRetry(() => import("./routes/Overview"), "overview");
+const Login = lazyWithRetry(() => import("./features/session/LoginPage"), "login");
+const Setup = lazyWithRetry(() => import("./features/session/SetupPage"), "setup");
+const Banned = lazyWithRetry(() => import("./features/session/BannedPage"), "banned");
+const Overview = lazyWithRetry(() => import("./features/overview/OverviewPage"), "overview");
 const Usage = lazyWithRetry(() => import("./features/usage/UsagePage"), "usage");
-const ProviderDetail = lazyWithRetry(() => import("./routes/ProviderDetail"), "provider-detail");
+const ProviderDetail = lazyWithRetry(() => import("./features/provider-detail/ProviderDetailPage"), "provider-detail");
 const Providers = lazyWithRetry(() => import("./features/providers/ProvidersPage"), "providers");
-const Combos = lazyWithRetry(() => import("./routes/Combos"), "combos");
+const Combos = lazyWithRetry(() => import("./features/routing/CombosPage"), "combos");
 const Quota = lazyWithRetry(() => import("./features/quota/QuotaPage"), "quota");
-const Proxy = lazyWithRetry(() => import("./routes/Proxy"), "proxy");
-const Settings = lazyWithRetry(() => import("./routes/Settings"), "settings");
-const CliTools = lazyWithRetry(() => import("./routes/CliTools"), "cli-tools");
-const CliToolDetail = lazyWithRetry(() => import("./routes/CliToolDetail"), "cli-tool-detail");
+const Proxy = lazyWithRetry(() => import("./features/proxy/ProxyPage"), "proxy");
+const Settings = lazyWithRetry(() => import("./features/settings/SettingsPage"), "settings");
+const CliTools = lazyWithRetry(() => import("./features/cli-tools/CliToolsPage"), "cli-tools");
+const CliToolDetail = lazyWithRetry(() => import("./features/cli-tools/CliToolDetailPage"), "cli-tool-detail");
 const ConsoleLogPage = lazyWithRetry(() => import("./features/logs/ConsoleLogPage"), "console-log");
-const Studio = lazyWithRetry(() => import("./routes/Studio"), "studio");
+const Customization = lazyWithRetry(() => import("./features/customization/CustomizationPage"), "customization");
+const Studio = lazyWithRetry(() => import("./features/studio/StudioPage"), "studio");
 
 /**
  * Forwards shell-wide session transitions into router navigation. A 401 means
@@ -181,6 +174,7 @@ function ProtectedRoutes(): ReactNode {
           <Route path="/quota" element={<Quota />} />
           <Route path="/proxy" element={<Proxy />} />
           <Route path="/console-log" element={<ConsoleLogPage />} />
+          <Route path="/customization" element={<Customization />} />
           <Route path="/model-lab" element={<Studio />} />
           <Route path="/cli-tools" element={<CliTools />} />
           <Route path="/cli-tools/:toolId" element={<CliToolDetail />} />

@@ -1,15 +1,10 @@
 import { describe, expect, test } from "bun:test";
 import { createCodexAdapter } from "../../src/providers/integrations/codex/codex";
-import type {
-  ProviderDispatchContext,
-  ProviderDispatchTarget,
-  ResolvedCredential,
-  ValidatedOutboundFetch,
-} from "../../src/providers/provider-registry";
+import type { ProviderDispatchContext, ProviderDispatchTarget, ResolvedCredential, ValidatedOutboundFetch } from "../../src/providers/provider-contracts";
 
 const target: ProviderDispatchTarget = {
   provider_id: "codex",
-  model_id: "codex-search",
+  model_id: "gpt-5.6-luna",
   wire_family: "responses",
   endpoint_path: "/backend-api/codex/responses",
   capabilities: {},
@@ -45,7 +40,7 @@ describe("Codex hosted web search", () => {
     if (adapter.websearch === undefined) throw new Error("Codex search adapter is missing");
 
     const outcome = await adapter.websearch(
-      { model: "codex-search", query: "latest AI news", max_results: 5 },
+      { model: "gpt-5.6-luna", query: "latest AI news", max_results: 5 },
       target,
       responseContext(fetcher),
     );

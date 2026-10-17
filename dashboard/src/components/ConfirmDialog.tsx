@@ -1,7 +1,8 @@
 import { useEffect, useState } from "react";
 import { Button } from "./ui/button";
 import { Dialog } from "./ui/dialog";
-import { getErrorMessage } from "../shared/helpers";
+import { DialogActions } from "./ui/dialog-actions";
+import { getErrorMessage } from "../data/api";
 
 /**
  * Shared destructive-confirmation contract.
@@ -56,16 +57,16 @@ export function ConfirmDialog({
 
   return (
     <Dialog open={open} onClose={onClose} title={title} description={message}>
-      <div style={{ display: "flex", flexDirection: "column", gap: "16px", padding: "4px 0" }}>
-        <p style={{ fontSize: "13px", color: "var(--text-secondary)", lineHeight: 1.5 }}>
+      <div className="flex flex-col gap-8 py-2 px-0">
+        <p className="text-body text-text-secondary leading-normal">
           {message}
         </p>
         {error ? (
-          <p role="alert" style={{ fontSize: "12px", color: "var(--red)" }}>
+          <p role="alert" className="text-caption text-red">
             {error}
           </p>
         ) : null}
-        <div style={{ display: "flex", justifyContent: "flex-end", gap: "8px" }}>
+        <DialogActions>
           <Button variant="secondary" size="sm" onClick={onClose} disabled={pending}>
             {cancelLabel}
           </Button>
@@ -77,7 +78,7 @@ export function ConfirmDialog({
           >
             {pending ? "Working…" : confirmLabel}
           </Button>
-        </div>
+        </DialogActions>
       </div>
     </Dialog>
   );

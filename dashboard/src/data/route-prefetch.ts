@@ -1,6 +1,6 @@
 import { isCancelledError, type QueryClient } from "@tanstack/react-query";
 import { consoleRequest } from "./api";
-import { assertSystemHealth, querySignal } from "../hooks/common";
+import { assertSystemHealth, querySignal } from "./assert";
 import { DASHBOARD_QUERY_OPTIONS } from "./query-policy";
 import { queryKeys } from "./query-keys";
 
@@ -13,7 +13,7 @@ const routePrefetchFailureUntil = new WeakMap<QueryClient, number>();
 
 /**
  * Prefetches only the inexpensive, non-sensitive health read used by the shell.
- * Credential, share-link, studio, request-detail, mutation, and quota reads are
+ * Credential, share-link, request-detail, mutation, and quota reads are
  * intentionally absent so intent does not trigger privileged or upstream work.
  */
 export function prefetchRouteIntent(queryClient: QueryClient, pathname: string): Promise<void> {

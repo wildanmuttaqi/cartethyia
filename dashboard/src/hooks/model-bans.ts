@@ -2,7 +2,7 @@ import { consoleRequest } from "../data/api";
 import type { ApiErrorShape } from "../data/api";
 import type { ModelAbuseBan } from "../data/contracts";
 import { queryKeys } from "../data/query-keys";
-import { assertModelBans, querySignal } from "./common";
+import { assertModelBans, querySignal } from "../data/assert";
 import { DASHBOARD_MUTATION_OPTIONS, DASHBOARD_QUERY_OPTIONS } from "../data/query-policy";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 
@@ -39,6 +39,26 @@ export function useUnbanModel() {
       consoleRequest<{ success: boolean }>("/model-bans", {
         method: "DELETE",
         body: JSON.stringify({ identity }),
+      }),
+    ...DASHBOARD_MUTATION_OPTIONS,
+    onSuccess: async () => {
+      await queryClient.invalidateQueries({ queryKey: queryKeys.modelBans.all });
+    },
+  });
+}
+
+/**
+ * Instantly bans one client address for the full model-ban TTL, bypassing the
+ * graduated strike window. The operator action behind the request-detail
+ * "Ban user" button; keyed on the request's client IP.
+ */
+export function useBanIp() {
+  const queryClient = useQueryClient();
+  return useMutation<{ ban: ModelAbuseBan }, ApiErrorShape, string>({
+    mutationFn: (ip) =>
+      consoleRequest<{ ban: ModelAbuseBan }>("/model-bans", {
+        method: "POST",
+        body: JSON.stringify({ ip }),
       }),
     ...DASHBOARD_MUTATION_OPTIONS,
     onSuccess: async () => {

@@ -25,16 +25,16 @@
  * it without a manual teardown of the rows it wrote.
  */
 import { afterEach, describe, expect, test } from "bun:test";
-import { eq } from "drizzle-orm";
 import {
   adaptiveFlushIntervalMs,
   TelemetryBatchBuffer,
   type TelemetryEventInput,
 } from "../../src/observability/telemetry-buffer";
 import { metrics } from "../../src/observability/metrics";
-import { getDb, type CartethyiaDatabase } from "../../src/persistence/postgres";
-import { telemetryEvents } from "../../src/persistence/schema";
-import { createRunId, getTestPool, requireDatabase } from "../helpers/database";
+import { queryTelemetryEvents, type TelemetryEventRecord } from "../../src/observability/event-log";
+import { getDb } from "../../src/persistence/boot";
+import { type CartethyiaDatabase } from "../../src/persistence/db-handle";
+import { createRunId, dbDescribe, getTestPool, requireDatabase } from "../helpers/database";
 import { createTenant } from "../helpers/fixtures";
 
 requireDatabase();
@@ -92,9 +92,19 @@ async function tenantScope(
   }
 }
 
-/** The rows the buffer wrote for one tenant, read back through Drizzle. */
-async function rowsFor(tenantId: string): Promise<readonly (typeof telemetryEvents.$inferSelect)[]> {
-  return db().select().from(telemetryEvents).where(eq(telemetryEvents.tenantId, tenantId));
+/**
+ * The rows the buffer wrote for one tenant, read back off the file log.
+ *
+ * This goes through `queryTelemetryEvents` rather than re-reading the directory
+ * itself. The directory is shared by every worker in a `--parallel` run, so a
+ * hand-rolled scan races two things it does not handle: a file another worker
+ * is appending to (read mid-write, so the last line is torn) and a file another
+ * worker's retention pass deleted between `readdir` and `readFile`. Both are
+ * handled inside the production reader — a torn or vanished file is skipped —
+ * which is exactly why this calls it instead of copying its loop.
+ */
+async function rowsFor(tenantId: string): Promise<readonly TelemetryEventRecord[]> {
+  return queryTelemetryEvents({ tenantId });
 }
 
 function makeEvent(
@@ -186,7 +196,7 @@ describe("adaptiveFlushIntervalMs", () => {
   });
 });
 
-describe("TelemetryBatchBuffer — drop accounting", () => {
+dbDescribe("TelemetryBatchBuffer — drop accounting", () => {
   test("a queue past maxItems drops the overflow and counts it", async () => {
     // A silent drop is the worst outcome: the request appears in the gateway
     // log, no row appears in Usage, and nothing explains the gap.
@@ -240,7 +250,7 @@ describe("TelemetryBatchBuffer — drop accounting", () => {
   });
 });
 
-describe("TelemetryBatchBuffer — flush lifecycle", () => {
+dbDescribe("TelemetryBatchBuffer — flush lifecycle", () => {
   test("flushing an empty buffer resolves without touching the database", async () => {
     const buffer = startBuffer();
     await expect(buffer.flush()).resolves.toBeUndefined();
@@ -276,7 +286,7 @@ describe("TelemetryBatchBuffer — flush lifecycle", () => {
   });
 });
 
-describe("telemetry row mapping, read back from Postgres", () => {
+dbDescribe("telemetry row mapping, read back from Postgres", () => {
   test("every column with a live producer is persisted", async () => {
     // The end-to-end claim: what the buffer enqueues is what Postgres holds.
     // A column rename or a broken insert fails here rather than emptying the
@@ -324,9 +334,12 @@ describe("telemetry row mapping, read back from Postgres", () => {
       expect(row?.cachedInputTokens).toBe(800);
       expect(row?.outputTokens).toBe(120);
       expect(row?.reasoningTokens).toBe(40);
-      expect(row?.estimatedCostUsd).toBe("0.012345");
-      expect(row?.creditUsed).toBe("1.0100");
-      expect(row?.tokensPerSec).toBe("42.50");
+      expect(row?.estimatedCostUsd).toBe(0.012345);
+      // The file keeps the value as written. Postgres used to reformat numeric
+      // columns to their declared scale on read-back; that padding was a driver
+      // artifact, not data, and the file log has no `numeric` scale at all.
+      expect(row?.creditUsed).toBe(1.01);
+      expect(row?.tokensPerSec).toBe(42.5);
       // Epoch millis exceed int4, which is why these columns are bigint: a
       // completed request carrying stream timings used to fail its insert and
       // vanish from the console.
@@ -400,14 +413,16 @@ describe("telemetry row mapping, read back from Postgres", () => {
       expect(row?.ttfbMs).toBe(0);
       expect(row?.httpStatus).toBe(200);
       expect(row?.resolveMs).toBe(0);
-      expect(row?.tokensPerSec).toBe("0.00");
+      expect(row?.tokensPerSec).toBe(0);
       expect(row?.firstContentDeltaAtMs).toBe(0);
       expect(row?.lastEventAtMs).toBe(0);
-      // Zero credit is a reported measurement, not a missing field.
-      expect(row?.creditUsed).toBe("0.0000");
+      // Zero credit is a reported measurement, not a missing field. These are
+      // plain JSON numbers now: the file log has no `numeric` scale to pad, so
+      // a zero round-trips as `0` rather than Postgres' `"0.0000"`.
+      expect(row?.creditUsed).toBe(0);
       // Zero cost is a real answer (a free tier); it must not become NULL,
       // which is reserved for "the catalog had no rate to apply".
-      expect(row?.estimatedCostUsd).toBe("0.000000");
+      expect(row?.estimatedCostUsd).toBe(0);
     } finally {
       await scope.cleanup();
     }
@@ -527,7 +542,7 @@ describe("telemetry row mapping, read back from Postgres", () => {
   });
 });
 
-describe("TelemetryBatchBuffer — batching", () => {
+dbDescribe("TelemetryBatchBuffer — batching", () => {
   test("a batch of many events lands in one flush, all of them", async () => {
     // Batching is the entire reason this class exists: 1000 concurrent
     // requests must not race the pool with one INSERT each.
@@ -565,7 +580,7 @@ describe("TelemetryBatchBuffer — batching", () => {
   });
 });
 
-describe("TelemetryBatchBuffer — failed drain", () => {
+dbDescribe("TelemetryBatchBuffer — failed drain", () => {
   /**
    * A drain that the database rejects is retried `DRAIN_MAX_ATTEMPTS` (5) times
    * with exponential backoff before the batch is dropped, so one failing drain

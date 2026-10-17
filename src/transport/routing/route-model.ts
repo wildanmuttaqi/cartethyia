@@ -1,6 +1,6 @@
 // Routing contracts and snapshots.
-import { GatewayError } from "../gateway-error";
-import { type ServiceKind, type WireFamily } from "../canonical-model";
+import { GatewayError } from "../../protocol/gateway-error";
+import { type ServiceKind, type WireFamily } from "../../protocol/canonical-model";
 
 
 export type RoutingRevision = number;
@@ -18,12 +18,9 @@ export interface RouteCandidate {
    * canonical request. Absent means `llm` — every pre-existing row.
    */
   readonly service_kind?: ServiceKind;
-  /**
-   * Internal web-search routing role. Search metadata is consumed only by the
-   * ordinary chat dispatcher; it never appears in a client response.
-   */
-  readonly search_route?: "native" | "fallback";
   readonly endpoint: string;
+  /** Catalog output ceiling. Absent means the wire default still applies. */
+  readonly output_limit?: number | null;
   readonly capability_profile: CapabilityProfile;
   /** Route-selected User-Agent fallback; provider-supplied identities remain authoritative. */
   readonly user_agent?: string;
@@ -31,15 +28,6 @@ export interface RouteCandidate {
   readonly provider_account_id?: string;
   /** Cooldown class: `hard` = excluded until the deadline; `soft` = deprioritized. */
   readonly cooldown_kind?: "hard" | "soft";
-  /** Minimum-balance toggle for this candidate's provider/tenant. */
-  readonly credit_limit_enabled?: boolean;
-  /** Minimum remaining balance; candidate excluded when balance ≤ it — credits
-   * for credit providers, percent for quota-percent providers. */
-  readonly credit_limit?: number;
-  /** Last remaining credit the quota sweep fetched; absent = never fetched. */
-  readonly last_remaining_credit?: number | null;
-  /** Lowest remaining quota percent the sweep fetched; absent = never fetched. */
-  readonly last_remaining_percent?: number | null;
   /** Operator-facing label of `provider_account_id` (never the secret), for
    * the Console Log detail line — logs must show a name, not a bare id. */
   readonly provider_account_label?: string;
@@ -62,6 +50,11 @@ export interface RouteCandidate {
    * `tenantId` names that pool-owning tenant (settings owner and rotation
    * cursor key). Absent = `least_loaded`. */
   readonly network_pool_routing?: PoolRoutingSetting & { readonly tenantId: string };
+  /** This provider's ceiling on *each* pool's concurrent requests, from
+   * Routing Strategy. Distinct from `max_inflight` (one account) and from
+   * `network_pool_limits` (one pool, every provider). Absent = unlimited, the
+   * default, and then no per-provider counter is ever touched. */
+  readonly network_pool_provider_limit?: number;
   /** `null`/`undefined` = globally routable; a tenant id = routable only for that tenant's requests (BYOK). */
   readonly tenant_id?: string | null;
   /** `false` only for a genuinely credential-less provider (e.g. OpenCode
@@ -78,10 +71,6 @@ export interface RouteCandidate {
  * operations layer validates direct callers against the same list, so a new
  * strategy cannot land in one and be silently missing from the other.
  */
-export const DEFAULT_PROVIDER_USER_AGENT = "codex_cli_rs/0.156.1" as const;
-export const ROUTING_STRATEGIES = ["fallback", "round_robin"] as const;
-export type ProviderRoutingStrategy = (typeof ROUTING_STRATEGIES)[number];
-
 export interface ProviderRoutingSetting {
   readonly strategy: ProviderRoutingStrategy;
   /** Requests served by one account before round robin advances. */
@@ -89,30 +78,37 @@ export interface ProviderRoutingSetting {
   /** Per-account inflight ceiling from the routing panel; `null` = unlimited
    * concurrency per account. */
   readonly maxInflight: number | null;
-  /** Minimum-balance protection for every account of this provider/tenant. */
-  readonly creditLimitEnabled?: boolean;
-  /** Minimum remaining balance to keep on every account; credits or percent. */
-  readonly creditLimit?: number;
+  /** Per-pool inflight ceiling for this provider; `null` = unlimited, and
+   * `null` is the default. Bounds one provider's share of one proxy pool,
+   * independently of `maxInflight` (one account) and of the pool's own
+   * `network_pools.max_inflight` (every provider). */
+  readonly maxInflightPerProxy: number | null;
+  /** Minimum remaining allowance an account must hold to stay routable.
+   * `null` means no floor. `credit` compares the summed remaining credit;
+   * `percent` compares the aggregate credit percent and lowest independent
+   * percentage-only window. */
+  readonly usageFloor: number | null;
+  readonly usageFloorUnit: "credit" | "percent";
   readonly enabled: boolean;
   /** Built-in API-key User-Agent; OAuth and custom providers retain their identities. */
   readonly userAgent?: string;
   /** When true, this (tenant, provider) dispatches direct — candidates
    * never carry `network_pool_ids` regardless of pool availability. */
-  readonly bypassProxy: boolean;
+  readonly skipProxy: boolean;
 }
 
 /**
- * Providers whose routing defaults to `bypassProxy: true` when no explicit
+ * Providers whose routing defaults to `skipProxy: true` when no explicit
  * settings row exists yet for a given (tenant, provider) pair. Not a hard
- * lock — an explicit `bypassProxy: false` row overrides this same as any
+ * lock — an explicit `skipProxy: false` row overrides this same as any
  * other provider. Picks the starting value for providers that commonly
  * don't work through a plain HTTP/S proxy; route them via a SOCKS5 or
  * proxy pool instead if proxying is required. Consumed by both the
  * console API default (`console/domains/provider-detail.ts`) and the real
  * `transport/routing/route-catalog.ts` so the two never drift.
  *
- * Single owner is the manifest `defaultBypassProxy` flags in
- * `providers/provider-registry.ts`; consumers import it directly from there.
+ * Single owner is the manifest `defaultSkipProxy` flags in
+ * `providers/metadata.ts`; consumers import it directly from there.
  */
 
 /**
@@ -143,23 +139,16 @@ export interface RoutePlan {
   readonly requested_model: string;
   readonly resolved_model: string;
   readonly provider_id: string;
-  /**
-   * Present when the requested name resolved to a `fusion` combo. `panel` is
-   * every resolved member model (each answers the prompt in parallel) and
-   * `judge` is the first member, which additionally synthesizes the final
-   * answer from the panel responses — the same convention as a panel whose
-   * judge defaults to its first model. A fusion plan still carries the
-   * flattened member candidates (so admission and leases work if fusion is
-   * bypassed), but the proxy handler branches on this field and runs the
-   * panel/judge fan-out instead of a single dispatch.
-   */
-  readonly fusion?: {
-    readonly panel: readonly string[];
-    readonly judge: string;
-  };
 }
 
-import type { ComboStrategy, PoolRoutingStrategy } from "../../persistence/schema";
+import type { ComboStrategy, PoolRoutingStrategy, ProviderRoutingStrategy } from "../../persistence/schema";
+import { providerRoutingStrategy } from "../../persistence/schema";
+
+export { type ProviderRoutingStrategy };
+
+/** Provider-routing strategies, derived from the persisted enum so the console
+ * body schema and the routing engine validate against one list. */
+export const ROUTING_STRATEGIES = providerRoutingStrategy.enumValues;
 
 export interface ComboDefinition {
   readonly members: readonly string[];
@@ -182,9 +171,9 @@ export interface RouteSnapshot {
 
 export type EligibilityReason =
   | "healthy"
+  | "slow"
   | "cooldown"
   | "cooldown_hard"
-  | "credit_floor_reached"
   | "model_cooldown"
   | "quota_exhausted"
   | "locked"
@@ -194,6 +183,15 @@ export interface EligibilityDecision {
   readonly eligible: boolean;
   readonly reason: EligibilityReason;
   readonly candidate: RouteCandidate;
+  /**
+   * Epoch milliseconds at which this candidate's cooling window ends, when the
+   * exclusion that produced this decision carries one. Absent for a healthy
+   * candidate and for every reason with no deadline (`disabled`, `locked`,
+   * `quota_exhausted` from spent windows or the usage floor). `plan()` takes the
+   * minimum across the cooling set to report the earliest reset a client could
+   * retry against.
+   */
+  readonly cooldown_until?: number;
 }
 
 export interface Reservation {
@@ -221,11 +219,41 @@ export interface AdmissionController {
   snapshotAccountInflight?(): Promise<ReadonlyMap<string, number>> | ReadonlyMap<string, number>;
 }
 
+/**
+ * Translates the evaluator's internal reason codes into operator English.
+ *
+ * These names are the vocabulary the routing layers use with each other —
+ * `model_cooldown`, `cooldown_hard`, `locked` — and they used to be printed
+ * verbatim into the public message, so the client read an enum instead of an
+ * explanation. The codes stay in the envelope's `reasons` field for anyone who
+ * wants them; the sentence carries what they mean.
+ *
+ * Unmapped names are still readable: they fall through as themselves rather
+ * than being dropped, so a new reason shows up in the message on the day it is
+ * added instead of vanishing until someone remembers this map.
+ */
+const ELIGIBILITY_REASON_LABELS: Readonly<Record<string, string>> = {
+  model_cooldown: "every account is cooling down for this model",
+  cooldown_hard: "every account is in a hard cooldown",
+  cooldown: "accounts are cooling down",
+  disabled: "all accounts are disabled",
+  locked: "all accounts are locked by another request",
+  credit_floor_reached: "credit or quota is exhausted",
+  quota_exhausted: "every account has an exhausted quota window or is below its configured usage floor",
+};
+
+function explainEligibilityReasons(reasons: readonly string[]): string {
+  if (reasons.length === 0) return "no eligible candidate";
+  const parts = reasons.map((reason) => ELIGIBILITY_REASON_LABELS[reason] ?? reason);
+  const distinct = [...new Set(parts)];
+  return distinct.length === 1 ? distinct[0]! : distinct.join("; ");
+}
+
 export function ambiguousModelError(bare: string, owners: string[]): GatewayError {
   return new GatewayError(
     "ambiguous_model",
     400,
-    `Model '${bare}' is ambiguous across providers: ${owners.join(", ")}`,
+    `'${bare}' matches more than one provider (${owners.join(", ")}). Qualify it as '${owners[0]}/${bare}', or add an alias to pick one.`,
     {
       model: bare,
       owners,
@@ -245,7 +273,9 @@ export function modelNotFoundError(requested: string, resolved: readonly string[
   return new GatewayError(
     "model_not_found",
     404,
-    `Model '${requested}'${targets.length > 0 ? ` (resolved to ${hint})` : ""} not found`,
+    `'${requested}' is not routed${
+      targets.length > 0 ? ` — it resolved to ${hint}, which no account serves` : ""
+    }. Enable the model on an account, or point the alias at one that exists.`,
     {
       model: requested,
       ...(targets.length > 0 ? { resolved_models: targets } : {}),
@@ -257,13 +287,17 @@ export function capabilityUnsupportedError(capability: string): GatewayError {
   return new GatewayError(
     "capability_unsupported",
     400,
-    `Capability '${capability}' not supported`,
+    `No account serving this model supports ${capability}. Drop the ${capability} part of the request, or route to a model that accepts it.`,
     { capability },
   );
 }
 
 export function capacityExhaustedError(): GatewayError {
-  return new GatewayError("capacity_exhausted", 429, "No capacity available");
+  return new GatewayError(
+    "capacity_exhausted",
+    429,
+    "Every account is at its concurrency limit. Retry shortly; if it persists, raise the provider's max-inflight or add an account.",
+  );
 }
 
 /**
@@ -285,8 +319,8 @@ export function accountsUnavailableError(
   return new GatewayError(
     "accounts_unavailable",
     503,
-    `Model '${requested}' has no available account (${reasons.length} candidate(s) unusable: ${distinct.join(", ")})`,
-    { model: requested, reasons: distinct, candidate_count: reasons.length },
+    `No account in the pool can serve '${requested}' right now (${explainEligibilityReasons(distinct)}). Add an account, or wait for an operator to re-enable one.`,
+    { model: requested, reasons: distinct, candidate_count: reasons.length, gateway_hint: "no_healthy_account" },
   );
 }
 
@@ -305,13 +339,29 @@ export function accountsUnavailableError(
 export function accountsRateLimitedError(
   requested: string,
   routed: string = requested,
+  /** Earliest epoch-ms instant any cooling candidate recovers, when known. */
+  earliestResetMs?: number,
 ): GatewayError {
-  const routeNote = routed === requested ? "" : ` routed to '${routed}'`;
+  const routeNote = routed === requested ? "" : ` (routed to '${routed}')`;
+  // The reset rides as `retryAfterMs`, the same hint every other retryable
+  // failure uses, so `error-lifecycle.ts` turns it into a real `retry-after`
+  // header instead of the one-second floor it falls back to. Reporting the
+  // actual earliest recovery is the difference between a client that waits out
+  // the window and one that re-dials a resting account every second.
+  const retryAfterMs =
+    earliestResetMs !== undefined && earliestResetMs > Date.now()
+      ? earliestResetMs - Date.now()
+      : undefined;
   return new GatewayError(
     "accounts_rate_limited",
     429,
-    `Model '${requested}'${routeNote} has no healthy account: every account is rate limited or cooling down`,
-    { model: requested, routed_model: routed, reason: "all_accounts_cooling" },
+    `Every account serving '${requested}'${routeNote} is cooling down after hitting upstream limits. The request is fine — retry once the cooldown resets.`,
+    {
+      model: requested,
+      routed_model: routed,
+      reason: "all_accounts_cooling",
+      ...(retryAfterMs === undefined ? {} : { retryAfterMs }),
+    },
   );
 }
 

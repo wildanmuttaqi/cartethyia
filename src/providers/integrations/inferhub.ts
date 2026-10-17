@@ -1,24 +1,19 @@
 // Hybrid: the Messages-wire leg (`InferhubMessagesAdapter`, Claude Messages
 // envelope + Bearer auth + breakpoint cache stamping) is a non-OpenAI wire and
 // stays bespoke; the chat leg is a declarative spec row.
-import type {
-  ProviderDispatchTarget,
-  ModelDefinition,
-  ProviderAdapter,
-  ProviderDispatchContext,
-} from "../provider-registry";
+import type { ProviderDispatchTarget, ProviderAdapter, ProviderDispatchContext } from "../provider-contracts";
+import type { ModelDefinition } from "../provider-model-definition";
 import { providerBaseUrl } from "../provider-metadata";
-import { defineModel, isResponsesNativeModelId } from "../model-definition";
-import { createApiKeyAdapter, type ApiKeyProviderSpec } from "./configured-provider";
-import { GATEWAY_USER_AGENT } from "../operations/gateway-user-agent";
+import { defineModel, isResponsesNativeModelId } from "../provider-model-definition";
+import { createApiKeyAdapter, type ApiKeyProviderSpec } from "../configured-provider";
 import type { FetchLike, ProviderQuotaResult } from "../quota/quota-contracts";
 import { probeApiKeyConnectivity } from "../quota/quota-support";
-import type { CanonicalEvent, CanonicalRequest, ContentPart } from "../../transport/canonical-model";
-import { GatewayError } from "../../transport/gateway-error";
+import type { CanonicalEvent, CanonicalRequest, ContentPart } from "../../protocol/canonical-model";
+import { GatewayError } from "../../protocol/gateway-error";
 import { applyParamQuirks } from "../../transport/translation/quirks";
-import { buildClaudeMessagesRequest, filterClaudeCustomHeaders } from "./claude-messages";
-import { isRecord } from "../../protocol/primitives";
-import { sendClaudeMessagesRequest } from "../../protocol/transport/messages";
+import { buildClaudeMessagesRequest, filterClaudeCustomHeaders } from "./shared/claude-messages";
+import { isRecord } from "../../protocol/codecs";
+import { sendClaudeMessagesRequest } from "../../protocol/upstream/send-claude-messages";
 
 const INFERHUB_CACHE_CONTROL = { type: "ephemeral", ttl: "1h" } as const;
 
@@ -107,9 +102,6 @@ export const INFERHUB_PROVIDER_ID = "inferhub" as const;
 const INFERHUB_CHAT_SPEC: ApiKeyProviderSpec = {
   provider_id: INFERHUB_PROVIDER_ID,
   endpoint_paths_by_wire_family: { responses: "/responses" },
-  // InferHub is explicitly provisioned for the gateway identity; bespoke
-  // first-party adapters (Codex, Claude Code) are untouched by this flag.
-  gatewayUserAgent: true,
 };
 
 /** InferHub — full marketplace catalog from your paste (80+ models, 4 providers ag/cc/cb/cbcn/cx/ocg/ali/mimo/zai). Context sizes via websearch (Claude 1M/200k, Gemini 1M). */
@@ -243,9 +235,6 @@ export class InferhubMessagesAdapter implements ProviderAdapter {
       baseUrl: this.baseUrl,
       endpointPath: candidate.endpoint_path,
       mutatePayload: ensureInferhubMessagesTextBreakpoints,
-      // Same explicit provisioning as the chat leg: inferhub's messages leg
-      // carries the gateway identity; bespoke first-party paths never do.
-      gatewayUserAgent: GATEWAY_USER_AGENT,
     });
     yield* sendClaudeMessagesRequest(
       outbound.url,
@@ -258,35 +247,53 @@ export class InferhubMessagesAdapter implements ProviderAdapter {
   }
 }
 
+/**
+ * The one InferHub dispatch definition: branches by wire family (Claude-backed
+ * models → `InferhubMessagesAdapter`, everything else → the OpenAI-compatible
+ * chat leg), defaults `cache_hint` to a stable-prefix breakpoint when the client
+ * did not opt in, and translates inferhub's text-based `<tool_call>` convention
+ * (see `toInferhubTextModeRequest` / `extractInferhubTextToolCalls`).
+ */
+class InferhubAdapter implements ProviderAdapter {
+  readonly provider_id = INFERHUB_PROVIDER_ID;
+  private readonly chat: ProviderAdapter;
+  private readonly messages: ProviderAdapter;
+
+  constructor(chat: ProviderAdapter, messages: ProviderAdapter) {
+    this.chat = chat;
+    this.messages = messages;
+  }
+
+  async *dispatch(
+    request: CanonicalRequest,
+    candidate: ProviderDispatchTarget,
+    context: ProviderDispatchContext,
+  ): AsyncIterable<CanonicalEvent> {
+    // ag/* agent models emit text tool calls instead of wire tool calls once
+    // history carries tool parts; translate the request first, then let the
+    // chosen leg apply the cache default.
+    const textMode = toInferhubTextModeRequest(request);
+    const translated = textMode ?? request;
+    // Agent harnesses reuse long session prefixes turn after turn without
+    // sending a cache opt-in; inferhub bills cache reads far below fresh
+    // input, so default to a stable-prefix breakpoint when the client did
+    // not say otherwise. Explicit hints (including per-block breakpoints)
+    // always win. Other providers are untouched by this default.
+    const effective =
+      translated.cache_hint === undefined ? { ...translated, cache_hint: "stable_prefix" as const } : translated;
+    const leg = candidate.wire_family === "messages" ? this.messages : this.chat;
+    yield* extractInferhubTextToolCalls(
+      request,
+      leg.dispatch(effective, candidate, context),
+      textMode !== undefined,
+    );
+  }
+}
+
 export function createInferhubAdapter(fetchImpl?: typeof fetch): ProviderAdapter {
   const chat = createApiKeyAdapter(INFERHUB_CHAT_SPEC, fetchImpl);
   const messages = new InferhubMessagesAdapter(fetchImpl);
-  // Branch by candidate wire family: Claude-backed models resolve to
-  // messages rows (see INFERHUB_MODELS below) and get native thinking +
-  // tool_use; everything else stays on the OpenAI-compatible chat wire.
-  // The text-tool-call wrapper stays outermost: turn 2+ tool history still
-  // needs text mode because inferhub's bridge drops `tool_use_id`.
-  const branched: ProviderAdapter = {
-    provider_id: INFERHUB_PROVIDER_ID,
-    dispatch(
-      request: CanonicalRequest,
-      candidate: ProviderDispatchTarget,
-      context: ProviderDispatchContext,
-    ): AsyncIterable<CanonicalEvent> {
-      // Agent harnesses reuse long session prefixes turn after turn without
-      // sending a cache opt-in; inferhub bills cache reads far below fresh
-      // input, so default to a stable-prefix breakpoint when the client did
-      // not say otherwise. Explicit hints (including per-block breakpoints)
-      // always win. Other providers are untouched by this default.
-      const effective =
-        request.cache_hint === undefined ? { ...request, cache_hint: "stable_prefix" as const } : request;
-      if (candidate.wire_family === "messages") return messages.dispatch(effective, candidate, context);
-      return chat.dispatch(effective, candidate, context);
-    },
-  };
-  // ag/* agent models emit text-based <tool_call> blocks instead of wire
-  // tool calls; translate them to canonical tool_call_delta events.
-  return withInferhubTextToolCalls(branched);
+  return new InferhubAdapter(chat, messages);
 }
 
 /** InferHub exposes no quota surface; the account test is key validity. */
@@ -571,24 +578,4 @@ export async function* extractInferhubTextToolCalls(
     }
     yield event;
   }
-}
-
-/** Wrap a factory-built inferhub adapter with the agent text convention. */
-export function withInferhubTextToolCalls(base: ProviderAdapter): ProviderAdapter {
-  return {
-    provider_id: base.provider_id,
-    dispatch(
-      request: CanonicalRequest,
-      candidate: ProviderDispatchTarget,
-      context: ProviderDispatchContext,
-    ): AsyncIterable<CanonicalEvent> {
-      const textMode = toInferhubTextModeRequest(request);
-      const effective = textMode ?? request;
-      return extractInferhubTextToolCalls(
-        request,
-        base.dispatch(effective, candidate, context),
-        textMode !== undefined,
-      );
-    },
-  };
 }

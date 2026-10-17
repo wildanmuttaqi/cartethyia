@@ -1,14 +1,9 @@
-import { GatewayError } from "../gateway-error";
-import type { CanonicalRequest, ContentPart, ServiceKind } from "../canonical-model";
+import { GatewayError } from "../../protocol/gateway-error";
+import type { CanonicalRequest, ServiceKind } from "../../protocol/canonical-model";
 import type { ApiKeyAdmissionService } from "../../security/admission/service";
 import type { RouteCandidate as RouteCandidate, InMemoryRouteSnapshotService, RoutePlan } from "../routing/route-model";
 import { resolveAliasTarget, type RoutingEngine } from "../routing/router";
-import {
-  deriveRequiredCapabilities,
-  isWebSearchTool,
-  projectForRoute,
-  routeCapabilitiesFor,
-} from "../translation/capabilities";
+import { projectForRoute, routeCapabilitiesFor } from "../translation/capabilities";
 import type { RequiredCapability } from "../translation/capabilities";
 import { isModelAllowed, type ResolvedApiKey } from "../../security/api-key-auth";
 import { allowsCliToolMappings } from "../../security/cli-client-fingerprint";
@@ -16,357 +11,15 @@ import { dropIncompleteToolRounds, repairRequestToolCalls } from "../translation
 import { sanitizeRequestToolIds } from "../translation/tool-id";
 import { dropCorruptAttachments } from "../translation/attachment-integrity";
 import { parseThinkingSuffix, withThinkingSuffixIntent } from "../translation/thinking";
-import { nativeServicePathFor } from "../dispatch/native-services";
+import { nativeServicePathFor } from "../contracts";
 import { log } from "../../observability/logger";
 import { BUDDY_PROVIDER_IDS } from "../../providers/provider-metadata";
-
-/** Returns true when a canonical request declares or invokes a web-search tool. */
-function requestUsesWebSearch(request: CanonicalRequest): boolean {
-  if (request.tools?.some(isWebSearchTool) === true) return true;
-  return request.messages.some((message) =>
-    message.content.some((part) => part.kind === "toolCall" && isWebSearchTool({ name: part.name })),
-  );
-}
-
-const DEFAULT_ESTIMATED_OUTPUT_TOKENS = 1024;
-
-// Degradation is often sustained — a client that always asks for tools against
-// a tools-less route degrades every single request. An unthrottled warn would
-// flood pino and push unrelated lines out of the bounded in-memory console
-// ring, so each (model, capability-set) pair logs at most once per minute.
-const DEGRADATION_WARN_INTERVAL_MS = 60_000;
-const DEGRADATION_WARN_MAX_KEYS = 256;
-const lastDegradationWarnAt = new Map<string, number>();
-
-function shouldWarnDegradation(key: string, now: number): boolean {
-  const previous = lastDegradationWarnAt.get(key);
-  if (previous !== undefined && now - previous < DEGRADATION_WARN_INTERVAL_MS) return false;
-  if (lastDegradationWarnAt.size >= DEGRADATION_WARN_MAX_KEYS) {
-    for (const [existingKey, at] of lastDegradationWarnAt)
-      if (now - at >= DEGRADATION_WARN_INTERVAL_MS) lastDegradationWarnAt.delete(existingKey);
-    // Still full after pruning: a burst of distinct keys, not sustained
-    // traffic. Reset rather than grow unbounded; the next warn re-establishes.
-    if (lastDegradationWarnAt.size >= DEGRADATION_WARN_MAX_KEYS) lastDegradationWarnAt.clear();
-  }
-  lastDegradationWarnAt.set(key, now);
-  return true;
-}
-
-/**
- * A non-text part's rough token weight, in characters.
- *
- * Tool results, documents, images and audio carry no `text` field, so a
- * text-only walk priced them at zero and a request whose weight was mostly a
- * pasted document or a large tool result could be admitted while its true
- * usage was far above the reserved estimate. Binary payloads have no honest
- * character count, so they get a flat per-part reserve instead — enough that
- * an image- or audio-heavy turn is not free.
- */
-const NON_TEXT_PART_CHARS: Record<string, number> = {
-  image: 1_500,
-  audio: 1_500,
-};
-
-function partChars(part: ContentPart): number {
-  switch (part.kind) {
-    case "text":
-      return part.text.length;
-    case "refusal":
-      return part.text.length;
-    case "reasoning":
-      return part.summary?.length ?? 0;
-    case "toolCall": {
-      // The call name and its arguments both go upstream as text.
-      let length = part.name.length;
-      try {
-        length += JSON.stringify(part.arguments ?? "").length;
-      } catch {
-        // A circular or unserializable argument is priced by its name alone.
-      }
-      return length;
-    }
-    case "toolResult": {
-      if (typeof part.content === "string") return part.content.length;
-      return part.content.reduce((sum, nested) => sum + partChars(nested), 0);
-    }
-    case "file": {
-      // The payload is inlined base64 or a URL reference; neither has a token
-      // count derivable from its length, so price a flat reserve like an image
-      // plus any human-readable label.
-      return (
-        (NON_TEXT_PART_CHARS[part.kind] ?? 1_500) +
-        (part.filename?.length ?? 0) +
-        (part.url?.length ?? 0)
-      );
-    }
-    case "document": {
-      return (
-        (NON_TEXT_PART_CHARS[part.kind] ?? 1_500) +
-        (part.title?.length ?? 0) +
-        (part.url?.length ?? 0)
-      );
-    }
-    case "extension":
-      return 0;
-    default:
-      return NON_TEXT_PART_CHARS[part.kind] ?? 0;
-  }
-}
-
-function estimateInputTokens(request: CanonicalRequest): number {
-  let chars = 0;
-  for (const part of request.system ?? []) chars += partChars(part);
-  for (const part of request.instructions ?? []) chars += partChars(part);
-  for (const message of request.messages)
-    for (const part of message.content) chars += partChars(part);
-  return Math.max(1, Math.ceil(chars / 4));
-}
-
-/**
- * Ordered by blast radius: cheapest to degrade first, most semantic (tools/image)
- * last. Generation controls and extensions are stripped before prompt caching,
- * structured output, reasoning, and finally tools/images. This keeps the happy
- * path lossless while guaranteeing a text-only degraded fallback always exists
- * (unless the model itself is unknown).
- */
-function degradeRequestForCapability(
-  request: CanonicalRequest,
-  capability: RequiredCapability,
-): CanonicalRequest | null {
-  if (capability.startsWith("generation_control:"))
-    return degradeGenerationControl(request, capability);
-  if (capability.startsWith("extension:")) return degradeExtensionPart(request, capability);
-  switch (capability) {
-    case "prompt_caching":
-      return degradePromptCaching(request);
-    case "response_format.json_object":
-    case "response_format.json_schema":
-      return degradeResponseFormat(request);
-    case "reasoning.encrypted_content":
-      return degradeEncryptedReasoning(request);
-    case "reasoning":
-      return degradeReasoning(request);
-    case "parallel_tool_calls":
-      return degradeParallelToolCalls(request);
-    case "tools":
-      return degradeTools(request);
-    case "image":
-    case "document":
-    case "audio":
-      return degradeMediaPart(request, capability);
-    default:
-      return null;
-  }
-}
-
-/** Drops one generation-control key. Passthrough hints, so nothing else moves. */
-function degradeGenerationControl(
-  request: CanonicalRequest,
-  capability: RequiredCapability,
-): CanonicalRequest | null {
-  const key = capability.slice(
-    "generation_control:".length,
-  ) as keyof typeof request.generation_controls;
-  if (!(key in request.generation_controls)) return null;
-  const next = { ...request.generation_controls };
-  delete next[key];
-  return { ...request, generation_controls: next };
-}
-
-/**
- * Strips content parts carrying one named extension.
- *
- * Content-part extension: the `RequiredCapability` namespace. Generation-
- * control keys on `GenerationControls` share the `extension:` prefix but are
- * passthrough hints read by the wire codec; they are not degradable by name and
- * are deliberately left untouched here.
- */
-function degradeExtensionPart(
-  request: CanonicalRequest,
-  capability: RequiredCapability,
-): CanonicalRequest | null {
-  const name = capability.slice("extension:".length);
-  const stripExtensionParts = (parts: readonly ContentPart[]): readonly ContentPart[] =>
-    parts.filter((p) => !(p.kind === "extension" && p.name === name));
-  const nextMessages = request.messages.map((m) => ({
-    ...m,
-    content: stripExtensionParts(m.content),
-  }));
-  const nextSystem = request.system ? stripExtensionParts(request.system) : request.system;
-  const nextInstructions = request.instructions
-    ? stripExtensionParts(request.instructions)
-    : request.instructions;
-  const hasExtension = request.messages.some((m) =>
-    m.content.some((p) => p.kind === "extension" && p.name === name),
-  );
-  if (!hasExtension && !nextSystem?.length && !nextInstructions?.length) return null;
-  return {
-    ...request,
-    messages: nextMessages,
-    ...(nextSystem !== undefined ? { system: nextSystem } : {}),
-    ...(nextInstructions !== undefined ? { instructions: nextInstructions } : {}),
-  };
-}
-
-function degradePromptCaching(request: CanonicalRequest): CanonicalRequest | null {
-  if (!request.cache_hint) return null;
-  const { cache_hint: _ch, ...rest } = request;
-  return rest;
-}
-
-function degradeResponseFormat(request: CanonicalRequest): CanonicalRequest | null {
-  if (!request.response_format) return null;
-  const { response_format: _rf, ...rest } = request;
-  return rest;
-}
-
-/** Drops encrypted reasoning from the request and from every carried part. */
-function degradeEncryptedReasoning(request: CanonicalRequest): CanonicalRequest | null {
-  if (
-    !request.reasoning &&
-    !request.messages.some((m) =>
-      m.content.some(
-        (p) =>
-          p.kind === "reasoning" &&
-          (p as Extract<ContentPart, { kind: "reasoning" }>).encrypted_content,
-      ),
-    )
-  )
-    return null;
-  const nextMessages = request.messages.map((m) => ({
-    ...m,
-    content: m.content.map((p) => {
-      if (
-        p.kind === "reasoning" &&
-        (p as Extract<ContentPart, { kind: "reasoning" }>).encrypted_content
-      ) {
-        const { encrypted_content: _ec, ...rest } = p as Extract<
-          ContentPart,
-          { kind: "reasoning" }
-        >;
-        return rest as ContentPart;
-      }
-      return p;
-    }),
-  }));
-  return { ...request, messages: nextMessages };
-}
-
-function degradeReasoning(request: CanonicalRequest): CanonicalRequest | null {
-  if (!request.reasoning) return null;
-  const { reasoning: _r, ...rest } = request;
-  return rest;
-}
-
-function degradeParallelToolCalls(request: CanonicalRequest): CanonicalRequest | null {
-  if (!request.generation_controls.parallel_tool_calls) return null;
-  return {
-    ...request,
-    generation_controls: { ...request.generation_controls, parallel_tool_calls: false },
-  };
-}
-
-/**
- * Drops the tool catalog and rewrites tool traffic in every message to a text
- * placeholder, so the conversation still reads as a transcript of what
- * happened rather than losing the turns entirely.
- */
-function degradeTools(request: CanonicalRequest): CanonicalRequest | null {
-  if (!request.tools?.length) return null;
-  const nextMessages = request.messages.map((m) => {
-    const hasToolPart = m.content.some((p) => p.kind === "toolCall" || p.kind === "toolResult");
-    if (!hasToolPart) return m;
-    const textFallback = m.content
-      .filter((p) => p.kind === "toolCall")
-      .map((p) => `[tool:${(p as Extract<ContentPart, { kind: "toolCall" }>).name}]`)
-      .join("\n");
-    const remaining: ContentPart[] = m.content.filter((p) => p.kind === "text") as ContentPart[];
-    if (textFallback) remaining.push({ kind: "text", text: textFallback });
-    const content: readonly ContentPart[] = remaining.length
-      ? remaining
-      : [{ kind: "text", text: "[tools removed]" }];
-    return { ...m, content };
-  });
-  const { tools: _t, tool_choice: _tc, ...rest } = request;
-  return { ...rest, messages: nextMessages };
-}
-
-/**
- * Replaces one attached-media kind with a text placeholder. `document` also
- * covers the `file` part kind, which is the same attachment on a different
- * wire family.
- */
-function degradeMediaPart(
-  request: CanonicalRequest,
-  capability: RequiredCapability,
-): CanonicalRequest | null {
-  const placeholder =
-    capability === "image" ? "[image]" : capability === "document" ? "[document]" : "[audio]";
-  const matches = (part: ContentPart): boolean =>
-    capability === "document"
-      ? part.kind === "document" || part.kind === "file"
-      : part.kind === capability;
-  const strip = (parts: readonly ContentPart[]): readonly ContentPart[] =>
-    parts.flatMap((p): ContentPart[] => (matches(p) ? [{ kind: "text", text: placeholder }] : [p]));
-  const hasPart =
-    request.messages.some((m) => m.content.some(matches)) ||
-    (request.system?.some(matches) ?? false);
-  if (!hasPart) return null;
-  const nextMessages = request.messages.map((m) => ({ ...m, content: strip(m.content) }));
-  if (request.system) {
-    return { ...request, messages: nextMessages, system: strip(request.system) };
-  }
-  return { ...request, messages: nextMessages };
-}
-
-/**
- * Ordered request variants for capability-aware routing: the original
- * request first, then progressively degraded copies (same greedy
- * least-impact-first order as before). The planner plans each variant in
- * turn — the router filters candidates per variant, so the first variant
- * with a non-empty plan wins without ever consulting a blind pool.
- */
-/**
- * Yields successively degraded request variants lazily. The common case —
- * first variant plans successfully — never builds the remaining clones.
- */
-function* degradedRequestVariants(
-  original: CanonicalRequest,
-): Generator<{
-  request: CanonicalRequest;
-  degraded: readonly RequiredCapability[];
-  required: readonly RequiredCapability[];
-}> {
-  const required = deriveRequiredCapabilities(original);
-  yield { request: original, degraded: [], required };
-  const priority: RequiredCapability[] = [
-    ...required.filter((c) => c.startsWith("generation_control:") || c.startsWith("extension:")),
-    "prompt_caching",
-    "response_format.json_object",
-    "response_format.json_schema",
-    "reasoning.encrypted_content",
-    "reasoning",
-    "parallel_tool_calls",
-    "tools",
-    "image",
-    "document",
-    "audio",
-  ] as RequiredCapability[];
-  const ordered = priority.filter((c) => required.includes(c));
-  let current: CanonicalRequest = original;
-  const degraded: RequiredCapability[] = [];
-  for (const cap of ordered) {
-    const next = degradeRequestForCapability(current, cap);
-    if (!next) continue;
-    degraded.push(cap);
-    current = next;
-    yield {
-      request: current,
-      degraded: [...degraded],
-      required: required.filter((c) => !degraded.includes(c)),
-    };
-  }
-}
+import {
+  degradedRequestVariants,
+  degradeEncryptedReasoning,
+  shouldWarnDegradation,
+} from "./degradation";
+import { DEFAULT_ESTIMATED_OUTPUT_TOKENS, estimateInputTokens } from "./token-estimate";
 
 /** True when the request carries tools or message parts that need repair/sanitize. */
 function requestNeedsToolRepair(request: CanonicalRequest): boolean {
@@ -389,8 +42,6 @@ export interface PreparedProxyRequest {
   readonly degradedCapabilities?: readonly RequiredCapability[];
   /** Snapshot-consistent plan used to reserve each individual attempt. */
   readonly plan: RoutePlan;
-  /** True when the caller asked for a web-search tool, enabling routed fallback. */
-  readonly webSearch?: boolean;
   readonly estimatedInputTokens: number;
   readonly estimatedOutputTokens: number;
   readonly deadlineMs: number;
@@ -483,7 +134,7 @@ export class ProxyRequestPreparer {
       throw new GatewayError(
         "model_not_found",
         404,
-        "model does not match the key's required prefix",
+        `This key may only use models starting with '${authorization.modelPrefix}'. Ask for one inside that prefix, or have an operator widen the key.`,
         { model: request.model, required_prefix: authorization.modelPrefix },
       );
     if (!allowedForKey) {
@@ -516,7 +167,6 @@ export class ProxyRequestPreparer {
         degraded = ["reasoning.encrypted_content"];
       }
     }
-    const searchRouting = requestUsesWebSearch(variantRequest);
     for (const variant of degradedRequestVariants(variantRequest)) {
       try {
         plan = await this.deps.routingEngine.plan(
@@ -526,7 +176,6 @@ export class ProxyRequestPreparer {
           variant.required,
           allowCliMappings,
           authorization.cliMappingOwnerId ?? authorization.id,
-          searchRouting,
         );
       } catch (error) {
         if (error instanceof GatewayError && error.code === "capability_unsupported") continue;
@@ -564,12 +213,7 @@ export class ProxyRequestPreparer {
     // endpoint (upstream 400). The reverse direction is guarded by the native
     // route's own kind filter.
     const llmCandidates = plan.candidates.filter(
-      (candidate) =>
-        (candidate.service_kind ?? "llm") === "llm" ||
-        // A configured search fallback rides the same chat request to run the
-        // search tool on the caller's behalf; only the dispatcher uses it.
-        (candidate.service_kind === "websearch" &&
-          candidate.search_route === "fallback"),
+      (candidate) => (candidate.service_kind ?? "llm") === "llm",
     );
     if (llmCandidates.length === 0) {
       // Name the actual kind so the message stays correct as more native
@@ -659,7 +303,6 @@ export class ProxyRequestPreparer {
       eligibleRouteCandidates: eligible,
       degradedCapabilities: degraded,
       plan,
-      ...(searchRouting ? { webSearch: true } : {}),
       estimatedInputTokens,
       estimatedOutputTokens,
       deadlineMs: input.deadlineMs,
@@ -712,7 +355,7 @@ export class ProxyRequestPreparer {
       throw new GatewayError(
         "model_not_found",
         404,
-        "model does not match the key's required prefix",
+        `This key may only use models starting with '${input.authorization.modelPrefix}'. Ask for one inside that prefix, or have an operator widen the key.`,
         { model: input.model, required_prefix: input.authorization.modelPrefix },
       );
     if (!allowedForKey)
@@ -796,8 +439,44 @@ export class ProxyRequestPreparer {
       authorization: input.authorization,
       ...(input.signal === undefined ? {} : { signal: input.signal }),
       ...(input.clientUserAgent === undefined ? {} : { clientUserAgent: input.clientUserAgent }),
-      eligible: (candidate) => (candidate.service_kind ?? "llm") === input.serviceKind,
+      eligible: (candidate) => {
+        const kind = candidate.service_kind ?? "llm";
+        // A service route is served by a row that declares that service kind.
+        // An `llm` row never is one, so `/v1/search` is answered only by a
+        // `service_kind: "websearch"` row (Exa, Parallel, Gemini) — the same
+        // set the chat fallback draws from.
+        return kind === input.serviceKind;
+      },
       emptyMessage: `no eligible route serves the '${input.serviceKind}' service for this model`,
+    });
+  }
+
+  /**
+   * Plans a token-count request: the same `llm` route that would serve the
+   * message, restricted to providers that speak Anthropic Messages.
+   *
+   * Deliberately not a `serviceKind`. `/v1/messages/count_tokens` is a sibling
+   * endpoint of `/v1/messages` on the *same* model, so the candidate is an
+   * ordinary `llm` row — inventing a `tokenCounting` catalog kind would make it
+   * selectable on a provider model that can then never serve chat, and would put
+   * it in the console's picker for no reason. `wire_family` is the honest gate:
+   * a count body is Anthropic-shaped, so a chat-completions or responses
+   * provider has no equivalent endpoint and must not be dispatched to.
+   */
+  async prepareNativeTokenCount(input: {
+    readonly model: string;
+    readonly authorization: ResolvedApiKey;
+    readonly signal?: AbortSignal;
+    readonly clientUserAgent?: string;
+  }): Promise<PreparedNativeRequest> {
+    return this.#planNative({
+      model: input.model,
+      authorization: input.authorization,
+      ...(input.signal === undefined ? {} : { signal: input.signal }),
+      ...(input.clientUserAgent === undefined ? {} : { clientUserAgent: input.clientUserAgent }),
+      eligible: (candidate) => candidate.wire_family === "messages",
+      emptyMessage:
+        "no eligible route can count tokens for this model — only an Anthropic Messages provider has /v1/messages/count_tokens",
     });
   }
 }

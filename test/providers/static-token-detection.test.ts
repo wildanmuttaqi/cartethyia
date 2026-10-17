@@ -13,7 +13,7 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { randomUUID } from "node:crypto";
 import { eq } from "drizzle-orm";
-import { getDb } from "../../src/persistence/postgres";
+import { getDb } from "../../src/persistence/boot";
 import { providerAccounts, providerOauthStates } from "../../src/persistence/schema";
 import { encryptCredential, decryptCredentialToString } from "../../src/security/crypto";
 import {
@@ -77,7 +77,14 @@ describe("classifyAccessTokenUsability", () => {
 
 dbDescribe("OAuth refresh: automatic static-token detection", () => {
   let world: GatewayWorld;
-  const db = getDb();
+  // Resolved on first use, not at collection: `getDb()` throws with no booted
+  // database, and calling it here ran even though `dbDescribe` had skipped the
+  // block.
+  let cachedDb: ReturnType<typeof getDb> | undefined;
+  const db = (): ReturnType<typeof getDb> => {
+    cachedDb ??= getDb();
+    return cachedDb;
+  };
 
   beforeAll(async () => {
     world = await createWorld();
@@ -93,7 +100,7 @@ dbDescribe("OAuth refresh: automatic static-token detection", () => {
       credentialKind: "oauth",
       credential: accessToken,
     });
-    await db.insert(providerOauthStates).values({
+    await db().insert(providerOauthStates).values({
       providerAccountId: accountId,
       refreshCiphertext: encryptCredential("stored-refresh-token"),
       expiresAt: new Date(Date.now() + 3_600_000),
@@ -102,7 +109,7 @@ dbDescribe("OAuth refresh: automatic static-token detection", () => {
   }
 
   async function readAccount(accountId: string) {
-    const rows = await db
+    const rows = await db()
       .select()
       .from(providerAccounts)
       .where(eq(providerAccounts.id, accountId))
@@ -114,7 +121,7 @@ dbDescribe("OAuth refresh: automatic static-token detection", () => {
 
   test("a definitive refresh failure with a still-valid access token becomes static", async () => {
     const accountId = await oauthAccount(jwt(3_600));
-    const service = new OAuthRefreshService(db);
+    const service = new OAuthRefreshService(db());
     const result = await service.ensureFreshAccessToken(accountId, revokedRefresher(), {
       force: true,
     });
@@ -130,7 +137,7 @@ dbDescribe("OAuth refresh: automatic static-token detection", () => {
 
   test("a definitive refresh failure with an unusable access token is parked for re-auth", async () => {
     const accountId = await oauthAccount(jwt(-3_600));
-    const service = new OAuthRefreshService(db);
+    const service = new OAuthRefreshService(db());
     await service.ensureFreshAccessToken(accountId, revokedRefresher(), { force: true });
     const row = await readAccount(accountId);
     expect(row.staticToken).toBe(false);
@@ -140,7 +147,7 @@ dbDescribe("OAuth refresh: automatic static-token detection", () => {
 
   test("an opaque access token is treated as unusable and parked for re-auth", async () => {
     const accountId = await oauthAccount("opaque-no-expiry");
-    const service = new OAuthRefreshService(db);
+    const service = new OAuthRefreshService(db());
     await service.ensureFreshAccessToken(accountId, revokedRefresher(), { force: true });
     const row = await readAccount(accountId);
     expect(row.staticToken).toBe(false);
@@ -149,7 +156,7 @@ dbDescribe("OAuth refresh: automatic static-token detection", () => {
 
   test("a successful refresh stays refreshable and is not marked static", async () => {
     const accountId = await oauthAccount(jwt(3_600));
-    const service = new OAuthRefreshService(db);
+    const service = new OAuthRefreshService(db());
     const access = await service.ensureFreshAccessToken(accountId, healthyRefresher(), {
       force: true,
     });
@@ -162,7 +169,7 @@ dbDescribe("OAuth refresh: automatic static-token detection", () => {
 
   test("an API-key account never enters the refresh path", async () => {
     const accountId = await world.addAccount({ credentialKind: "api_key" });
-    const service = new OAuthRefreshService(db);
+    const service = new OAuthRefreshService(db());
     const result = await service.ensureFreshAccessToken(accountId, revokedRefresher(), {
       force: true,
     });
@@ -177,7 +184,7 @@ dbDescribe("OAuth refresh: automatic static-token detection", () => {
     // token still valid. Detection did not exist then; the boot pass is how
     // such a row converges without an operator touching it.
     const recoverable = await oauthAccount(jwt(3_600));
-    await db
+    await db()
       .update(providerAccounts)
       .set({ status: "disabled", lastErrorCategory: "oauth_revoked" })
       .where(eq(providerAccounts.id, recoverable));
@@ -185,12 +192,12 @@ dbDescribe("OAuth refresh: automatic static-token detection", () => {
     // A genuinely dead credential converges the other way: legacy category
     // renamed to the one the console renders as "Re-login required".
     const dead = await oauthAccount(jwt(-3_600));
-    await db
+    await db()
       .update(providerAccounts)
       .set({ status: "disabled", lastErrorCategory: "oauth_revoked" })
       .where(eq(providerAccounts.id, dead));
 
-    await reconcileStaticTokenAccounts(db);
+    await reconcileStaticTokenAccounts(db());
 
     const recovered = await readAccount(recoverable);
     expect(recovered.staticToken).toBe(true);

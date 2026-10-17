@@ -1,7 +1,7 @@
 // Routing snapshot: builds the RouteSnapshot from the persisted model catalog.
 
 import { asc, eq, ne } from "drizzle-orm";
-import type { CartethyiaDatabase } from "../../persistence/postgres";
+import type { CartethyiaDatabase } from "../../persistence/db-handle";
 import {
   models,
   modelAliases,
@@ -15,11 +15,11 @@ import {
   cliToolMappings,
   cliToolSettings,
 } from "../../persistence/schema";
+import { DEFAULT_PROVIDER_MAX_INFLIGHT } from "../../persistence/schema";
 import "../../providers/integrations/claude/claude-oauth";
 import "../../providers/integrations/codex/codex-oauth";
 import { resolveTenantOverride } from "../../persistence/tenant-scope";
 import {
-  DEFAULT_PROVIDER_USER_AGENT,
   type RouteCandidate,
   type ComboDefinition,
   type PoolRoutingSetting,
@@ -27,9 +27,11 @@ import {
   type RouteSnapshot,
   type SnapshotBuilder,
 } from "./route-model";
-import { DEFAULT_PROXY_BYPASS_PROVIDER_IDS, isBundledProviderId } from "../../providers/provider-registry";
-import type { ServiceKind, WireFamily } from "../canonical-model";
-import { providerHasAdapterUserAgent, providerSupportsWebSearch, providerUsesBespokeWire } from "../../providers/provider-metadata";
+import { DEFAULT_PROXY_SKIP_PROVIDER_IDS } from "../../providers/provider-metadata";
+import { buildClaudeCliUserAgent } from "../../providers/operations/custom-cli-headers";
+import { isBundledProviderId } from "../../providers/provider-contracts";
+import type { ServiceKind, WireFamily } from "../../protocol/canonical-model";
+import { providerHasAdapterUserAgent, providerUsesBespokeWire } from "../../providers/provider-metadata";
 
 const CLAUDE_MODEL_FAMILIES = new Set(["opus", "sonnet", "haiku", "fable", "mythos"]);
 
@@ -70,8 +72,15 @@ export function cliMappingSourceKeys(toolId: string, sourceModel: string): reado
  */
 
 type RouteCandidateWithHealth = RouteCandidate & {
-  health_status?: "cooldown" | "model_cooldown" | "credit_floor_reached" | "disabled";
+  health_status?: "cooldown" | "model_cooldown" | "disabled";
   cooldown_kind?: "hard" | "soft";
+  /**
+   * Epoch milliseconds at which this candidate's cooling window ends, when one
+   * is in force. Routing-internal: it is what lets `plan()` report a real reset
+   * on the all-accounts-cooling answer, and it never reaches a client verbatim —
+   * only the derived `retry-after` does.
+   */
+  cooldown_until?: number;
 };
 
 const HARD_COOLDOWN_CATEGORIES: Readonly<Record<string, true>> = {
@@ -103,8 +112,8 @@ export function buildCapabilityProfile(row: {
   const outputMods = Array.isArray(mods.output) ? mods.output : [];
   // The canonical chat and responses codecs encode `image`, `document`/`file`,
   // and `audio` parts; the messages codec encodes the first two but has no
-  // audio block (see `AUDIO_CAPABLE_WIRE_FAMILIES`). A bespoke adapter (Cursor,
-  // Devin) frames its own protocol and has no generic rich-content path.
+  // audio block (see `AUDIO_CAPABLE_WIRE_FAMILIES`). A bespoke adapter (Cursor)
+  // frames its own protocol and has no generic rich-content path.
   // Treating the codec routes as capable by default keeps pass-through behavior
   // instead of degrading a caller's attachment to text on the strength of a
   // metadata guess. An explicit modality still wins, so a catalog can declare
@@ -131,10 +140,9 @@ export function buildCapabilityProfile(row: {
     parallelToolCalls: true,
     reasoning: true,
     reasoningEncryptedContent: true,
-    // Search capability is the provider's, not the model row's: the adapter
-    // either frames a hosted search tool or it does not, and every model it
-    // serves inherits that. See `providerSupportsWebSearch`.
-    webSearch: providerSupportsWebSearch(row.providerId),
+    // Search is its own route: a `websearch` row answers `POST /v1/search`.
+    // A chat row never claims it; a hosted declaration rides through `tools`.
+    webSearch: false,
     responseJsonObject: true,
     responseJsonSchema: true,
     promptCaching: true,
@@ -148,7 +156,16 @@ export function resolveRouteUserAgent(
   globalUserAgent: string | undefined,
 ): string | undefined {
   if (!isBundledProviderId(providerId) || providerHasAdapterUserAgent(providerId)) return undefined;
-  return resolveTenantOverride(tenantUserAgent, globalUserAgent, DEFAULT_PROVIDER_USER_AGENT);
+  // A provider whose operator set no identity of their own gets the Claude Code
+  // CLI identity, resolved live so the stamped version tracks discovery. This
+  // used to be a frozen `codex_cli_rs` literal, which named a different vendor's
+  // client on requests that mostly reached neither.
+  const selected = resolveTenantOverride(
+    tenantUserAgent,
+    globalUserAgent,
+    buildClaudeCliUserAgent(),
+  );
+  return selected.trim() === "" ? undefined : selected;
 }
 
 /** One persisted model row ready for candidate construction. */
@@ -159,11 +176,11 @@ interface MergedModelRow {
   serviceKind: ServiceKind;
   endpointPath: string;
   modalities: unknown;
+  outputLimit: number | null;
   reasoning: boolean;
   toolCall: boolean;
   enabled: boolean;
 }
-
 /**
  * Converts persisted model rows into candidate input. Seed materialization is
  * performed before this function runs, so no static-vs-DB merge is needed.
@@ -180,6 +197,7 @@ function mergeModelCatalog(
       serviceKind: row.serviceKind as ServiceKind,
       endpointPath: row.endpointPath,
       modalities: row.modalities,
+      outputLimit: row.outputLimit,
       reasoning: row.reasoning,
       toolCall: row.toolCall,
       enabled: row.enabled,
@@ -216,11 +234,11 @@ const MODEL_COLUMNS = {
   serviceKind: models.serviceKind,
   endpointPath: models.endpointPath,
   modalities: models.modalities,
+  outputLimit: models.outputLimit,
   reasoning: models.reasoning,
   toolCall: models.toolCall,
   enabled: models.enabled,
 } as const;
-
 const ACCOUNT_COLUMNS = {
   id: providerAccounts.id,
   providerId: providerAccounts.providerId,
@@ -230,8 +248,6 @@ const ACCOUNT_COLUMNS = {
   cooldownUntil: providerAccounts.cooldownUntil,
   modelCooldowns: providerAccounts.modelCooldowns,
   lastErrorCategory: providerAccounts.lastErrorCategory,
-  lastRemainingCredit: providerAccounts.lastRemainingCredit,
-  lastRemainingPercent: providerAccounts.lastRemainingPercent,
 } as const;
 
 const ALIAS_COLUMNS = {
@@ -253,10 +269,11 @@ const ROUTING_COLUMNS = {
   strategy: providerRoutingSettings.strategy,
   rotateCount: providerRoutingSettings.rotateCount,
   maxInflight: providerRoutingSettings.maxInflight,
-  creditLimitEnabled: providerRoutingSettings.creditLimitEnabled,
-  creditLimit: providerRoutingSettings.creditLimit,
+  maxInflightPerProxy: providerRoutingSettings.maxInflightPerProxy,
+  usageFloor: providerRoutingSettings.usageFloor,
+  usageFloorUnit: providerRoutingSettings.usageFloorUnit,
   enabled: providerRoutingSettings.enabled,
-  bypassProxy: providerRoutingSettings.bypassProxy,
+  skipProxy: providerRoutingSettings.skipProxy,
   userAgent: providerRoutingSettings.userAgent,
 } as const;
 
@@ -372,7 +389,7 @@ class RouteCatalogRepository {
     }
 
     // Build per-tenant per-provider routing preferences before the
-    // candidates loop below, since bypassProxy has to be known while
+    // candidates loop below, since skipProxy has to be known while
     // deciding each candidate's network pool set. Global settings
     // (tenant_id IS NULL) are stored under sentinel "__global__".
     const providerRouting: Record<string, Record<string, ProviderRoutingMap[string][string]>> = {};
@@ -383,26 +400,27 @@ class RouteCatalogRepository {
         strategy: row.strategy as ProviderRoutingMap[string][string]["strategy"],
         rotateCount: row.rotateCount ?? 1,
         maxInflight: row.maxInflight,
-        creditLimitEnabled: row.creditLimitEnabled,
-        creditLimit: row.creditLimit,
+        maxInflightPerProxy: row.maxInflightPerProxy,
+        usageFloor: row.usageFloor,
+        usageFloorUnit: row.usageFloorUnit === "credit" ? "credit" : "percent",
         enabled: row.enabled,
-        bypassProxy: row.bypassProxy,
+        skipProxy: row.skipProxy,
         userAgent: row.userAgent,
       };
     }
     /** Tenant-specific setting wins over global; an unconfigured provider
-     * falls back to `DEFAULT_PROXY_BYPASS_PROVIDER_IDS`, mirroring the same
+     * falls back to `DEFAULT_PROXY_SKIP_PROVIDER_IDS`, mirroring the same
      * default `DrizzleProviderDetailStore.getRouting` reports to the API —
      * so the dashboard's displayed default and the real dispatch decision
      * never disagree. */
-    function resolveBypassProxy(providerId: string, rowTenantId: string | null): boolean {
+    function resolveSkipProxy(providerId: string, rowTenantId: string | null): boolean {
       const effectiveTenantId = rowTenantId;
       const tenantSetting = effectiveTenantId ? providerRouting[effectiveTenantId]?.[providerId] : undefined;
       const globalSetting = providerRouting.__global__?.[providerId];
       return resolveTenantOverride(
-        tenantSetting?.bypassProxy,
-        globalSetting?.bypassProxy,
-        DEFAULT_PROXY_BYPASS_PROVIDER_IDS.has(providerId),
+        tenantSetting?.skipProxy,
+        globalSetting?.skipProxy,
+        DEFAULT_PROXY_SKIP_PROVIDER_IDS.has(providerId),
       );
     }
     function resolveUserAgent(providerId: string, rowTenantId: string | null): string | undefined {
@@ -412,11 +430,10 @@ class RouteCatalogRepository {
     }
 
     /** Provider-wide concurrency ceiling shared by every account of the provider.
-     * Tenant setting wins over global, mirroring bypassProxy. `undefined`
-     * means UNLIMITED — an empty field never falls back to the deployment
-     * ceiling. Per-account overrides are intentionally unsupported: the only
-     * per-account column ever to hold one was `provider_accounts.max_inflight`,
-     * dropped by `0029_retire_per_account_max_inflight.sql`. */
+     * Tenant setting wins over global, mirroring skipProxy. A stored `null`
+     * is the explicit unlimited choice; so is the default — a provider with no
+     * routing row at all is unlimited too, because an operator who never
+     * configured a ceiling asked for none. */
     function resolveMaxInflight(
       providerId: string,
       rowTenantId: string | null,
@@ -426,24 +443,26 @@ class RouteCatalogRepository {
         : undefined;
       const globalSetting = providerRouting.__global__?.[providerId]?.maxInflight;
       const resolved = tenantSetting ?? globalSetting;
-      return resolved === null || resolved === undefined ? undefined : resolved;
+      if (resolved === null) return undefined;
+      return resolved ?? DEFAULT_PROVIDER_MAX_INFLIGHT ?? undefined;
     }
 
     /**
-     * Minimum-balance protection for every account of this provider/tenant.
-     * Tenant setting wins over global; an unconfigured provider resolves to
-     * the documented default (disabled, 50) so the floor is opt-in and the
-     * value fits both units — 50 credits or 50%.
+     * This provider's per-pool inflight ceiling, from Routing Strategy.
+     * `undefined` means unlimited — the default, and the state of every
+     * provider nobody has configured. A stored `null` is the same choice made
+     * explicitly; the two are deliberately indistinguishable downstream so the
+     * hot path never branches on which one it read.
      */
-    function resolveCreditProtection(
+    function resolveMaxInflightPerProxy(
       providerId: string,
       rowTenantId: string | null,
-    ): { readonly enabled: boolean; readonly limit: number } {
-      const tenantSetting = rowTenantId ? providerRouting[rowTenantId]?.[providerId] : undefined;
-      const globalSetting = providerRouting.__global__?.[providerId];
-      const enabled = tenantSetting?.creditLimitEnabled ?? globalSetting?.creditLimitEnabled;
-      const limit = tenantSetting?.creditLimit ?? globalSetting?.creditLimit;
-      return { enabled: enabled ?? false, limit: limit ?? 50 };
+    ): number | undefined {
+      const tenantSetting = rowTenantId
+        ? providerRouting[rowTenantId]?.[providerId]?.maxInflightPerProxy
+        : undefined;
+      const globalSetting = providerRouting.__global__?.[providerId]?.maxInflightPerProxy;
+      return tenantSetting ?? globalSetting ?? undefined;
     }
 
     /** Every active pool the account's tenant owns — dispatch picks the
@@ -460,7 +479,7 @@ class RouteCatalogRepository {
           routing?: PoolRoutingSetting & { tenantId: string };
         }
       | undefined {
-      if (!rowTenantId || resolveBypassProxy(providerId, rowTenantId)) return undefined;
+      if (!rowTenantId || resolveSkipProxy(providerId, rowTenantId)) return undefined;
       if (!configuredPoolTenants.has(rowTenantId)) return undefined;
       const pools = activePoolsByTenant.get(rowTenantId) ?? [];
       const limits: Record<string, number> = {};
@@ -476,6 +495,16 @@ class RouteCatalogRepository {
         weights,
         ...(routing ? { routing: { tenantId: rowTenantId, ...routing } } : {}),
       };
+    }
+
+    /** The candidate fragment for a provider ceiling, empty when unlimited —
+     * so an unconfigured provider's candidate is byte-for-byte what it was. */
+    function providerLimitFor(
+      providerId: string,
+      rowTenantId: string | null,
+    ): { network_pool_provider_limit?: number } {
+      const limit = resolveMaxInflightPerProxy(providerId, rowTenantId);
+      return limit === undefined ? {} : { network_pool_provider_limit: limit };
     }
 
     // Group usable accounts per provider (not per provider-tenant). Built-in
@@ -512,6 +541,7 @@ class RouteCatalogRepository {
                 wire_family: model.wireFamily as WireFamily,
                 service_kind: model.serviceKind,
                 endpoint: model.endpointPath,
+                ...(model.outputLimit == null ? {} : { output_limit: model.outputLimit }),
                 capability_profile: capabilityProfile,
                 tenant_id: tId,
                 requires_account: false as const,
@@ -520,6 +550,7 @@ class RouteCatalogRepository {
                 network_pool_limits: tenantPools.limits,
                 network_pool_weights: tenantPools.weights,
                 ...(tenantPools.routing ? { network_pool_routing: tenantPools.routing } : {}),
+                ...providerLimitFor(model.providerId, tId),
               };
               if (tenantId === undefined || tenantId === tId) {
                 candidates.push(tenantCandidate);
@@ -536,6 +567,7 @@ class RouteCatalogRepository {
           wire_family: model.wireFamily as WireFamily,
           service_kind: model.serviceKind,
           endpoint: model.endpointPath,
+          ...(model.outputLimit == null ? {} : { output_limit: model.outputLimit }),
           capability_profile: capabilityProfile,
           tenant_id: providerTenantId,
           ...(providerRequiresAccount
@@ -548,6 +580,7 @@ class RouteCatalogRepository {
                 network_pool_limits: networkPools.limits,
                 network_pool_weights: networkPools.weights,
                 ...(networkPools.routing ? { network_pool_routing: networkPools.routing } : {}),
+                ...providerLimitFor(model.providerId, providerTenantId),
               }
             : {}),
         };
@@ -574,27 +607,11 @@ class RouteCatalogRepository {
           wire_family: model.wireFamily as WireFamily,
           service_kind: model.serviceKind,
           endpoint: model.endpointPath,
+          ...(model.outputLimit == null ? {} : { output_limit: model.outputLimit }),
           capability_profile: capabilityProfile,
           ...(routeUserAgent === undefined ? {} : { user_agent: routeUserAgent }),
           tenant_id: rowTenantId,
           provider_account_id: account.id,
-          ...(() => {
-            const credit = resolveCreditProtection(model.providerId, rowTenantId);
-            return {
-              credit_limit_enabled: credit.enabled,
-              credit_limit: credit.limit,
-            };
-          })(),
-          ...(typeof account.lastRemainingCredit === "string"
-            ? { last_remaining_credit: Number(account.lastRemainingCredit) }
-            : account.lastRemainingCredit === null || account.lastRemainingCredit === undefined
-              ? {}
-              : { last_remaining_credit: account.lastRemainingCredit }),
-          ...(typeof account.lastRemainingPercent === "string"
-            ? { last_remaining_percent: Number(account.lastRemainingPercent) }
-            : account.lastRemainingPercent === null || account.lastRemainingPercent === undefined
-              ? {}
-              : { last_remaining_percent: account.lastRemainingPercent }),
           // Provider-wide concurrency ceiling from Routing Strategy; legacy
           // account overrides are never read here.
           ...(() => {
@@ -608,6 +625,7 @@ class RouteCatalogRepository {
                 network_pool_limits: networkPools.limits,
                 network_pool_weights: networkPools.weights,
                 ...(networkPools.routing ? { network_pool_routing: networkPools.routing } : {}),
+                ...providerLimitFor(model.providerId, rowTenantId),
               }
             : {}),
         };
@@ -620,6 +638,11 @@ class RouteCatalogRepository {
             candidate.cooldown_kind = hardCooldownCategory(account.lastErrorCategory)
               ? "hard"
               : "soft";
+            // The deadline rides with the exclusion it explains. `plan()` reads
+            // it to answer the all-cooling case with the real reset instead of
+            // a bare 429, so a client backs off for the window that is actually
+            // open rather than inventing one.
+            candidate.cooldown_until = account.cooldownUntil.getTime();
           }
         }
 
@@ -642,10 +665,8 @@ class RouteCatalogRepository {
         const modelCooldownUntil = modelCooldowns?.[model.modelId];
         if (modelCooldownUntil && new Date(modelCooldownUntil).getTime() > Date.now()) {
           candidate.health_status = "model_cooldown";
+          candidate.cooldown_until = new Date(modelCooldownUntil).getTime();
         }
-        // Credit protection is evaluated at plan time from the candidate's
-        // global `credit_limit` / `last_remaining_credit` pair, so no health
-        // stamp is materialized here.
         if (tenantId === undefined || candidate.tenant_id === null || candidate.tenant_id === tenantId) {
           candidates.push(candidate);
         }
@@ -704,8 +725,14 @@ class RouteCatalogRepository {
 }
 
 /** Builds a `SnapshotBuilder` reading the live catalog from `db`. */
-export function createDatabaseSnapshotBuilder(db: CartethyiaDatabase): SnapshotBuilder {
+export function createDatabaseSnapshotBuilder(
+  db: CartethyiaDatabase,
+  refreshActiveCatalogs?: () => Promise<void>,
+): SnapshotBuilder {
   const repository = new RouteCatalogRepository(db);
-  return () => repository.loadRouteCatalogSnapshot(undefined);
+  return async () => {
+    await refreshActiveCatalogs?.();
+    return repository.loadRouteCatalogSnapshot(undefined);
+  };
 }
 

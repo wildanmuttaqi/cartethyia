@@ -8,9 +8,8 @@ const iconAssets: Record<string, { file: string; ext: "svg" | "webp" }> = {
   openai: { file: "openai-light", ext: "svg" },
   codex: { file: "codex", ext: "webp" },
   opencode: { file: "opencode", ext: "webp" },
-  opencodeft: { file: "opencode", ext: "webp" },
-  opencodezen: { file: "opencode", ext: "webp" },
-  opencodego: { file: "opencode-go", ext: "webp" },
+  "opencode-zen": { file: "opencode", ext: "webp" },
+  "opencode-go": { file: "opencode-go", ext: "webp" },
   "google-antigravity": { file: "antigravity", ext: "svg" },
   antigravity: { file: "antigravity", ext: "svg" },
   blackbox: { file: "blackbox", ext: "svg" },
@@ -21,7 +20,10 @@ const iconAssets: Record<string, { file: string; ext: "svg" | "webp" }> = {
   inferhub: { file: "inferhub", ext: "svg" },
   gemini: { file: "gemini", ext: "webp" },
   alibaba: { file: "alibaba", ext: "svg" },
-  alibabacp: { file: "alibaba-coding-plan", ext: "svg" },
+  alibabacp: { file: "alibaba", ext: "svg" },
+  // The mainland DashScope host is Alibaba Cloud's own console, so it reuses
+  // the Alibaba mark rather than introducing a second one for the same company.
+  dashscope: { file: "alibaba", ext: "svg" },
   fireworks: { file: "fireworks", ext: "webp" },
   exa: { file: "exa", ext: "svg" },
   perplexity: { file: "perplexity", ext: "webp" },
@@ -35,19 +37,14 @@ const iconAssets: Record<string, { file: string; ext: "svg" | "webp" }> = {
   copilot: { file: "copilot", ext: "webp" },
   xiaomipg: { file: "mimo", ext: "webp" },
   xiaomitp: { file: "mimo", ext: "webp" },
-  mimodesktop: { file: "mimo", ext: "webp" },
-  mimostudio: { file: "mimo", ext: "webp" },
   mimo: { file: "mimo", ext: "webp" },
   cb: { file: "codebuddy", ext: "webp" },
   cbcn: { file: "codebuddy", ext: "webp" },
-  // The buddy-family gateways share one brand mark, so WorkBuddy reuses it the
-  // same way cbcn does. Without this entry `assetFor` fell through to
-  // `workbuddy.webp`, which does not exist, and every WorkBuddy row rendered
-  // the initials fallback instead of a logo.
+  // WorkBuddy variants share the CodeBuddy family brand mark. Without these
+  // entries `assetFor` falls through to missing provider-specific assets.
   workbuddy: { file: "codebuddy", ext: "webp" },
+  workbuddycn: { file: "codebuddy", ext: "webp" },
   agentrouter: { file: "agentrouter", ext: "svg" },
-  "devin-search": { file: "devin-search", ext: "svg" },
-  devin: { file: "devin", ext: "webp" },
   parallel: { file: "parallel", ext: "svg" },
   gmi: { file: "gmi-cloud", ext: "svg" },
   hermes: { file: "hermes", ext: "webp" },
@@ -99,17 +96,20 @@ export const ProviderIcon = memo(function ProviderIcon({
   icon,
   name,
   size = 32,
+  imageSize,
   style,
   className,
 }: {
   icon: string;
   name: string;
   size?: number;
+  imageSize?: number;
   style?: React.CSSProperties;
   className?: string;
 }) {
   const [failed, setFailed] = useState(() => failedIcons.has(icon));
   const asset = assetFor(icon);
+  const renderedImageSize = imageSize ?? size;
   return (
     <div
       className={className}
@@ -140,13 +140,18 @@ export const ProviderIcon = memo(function ProviderIcon({
         </span>
       ) : (
         <img
-          src={`${import.meta.env.BASE_URL}providers/${asset.file}.${asset.ext}`}
+          src={`${import.meta.env.BASE_URL}assets/providers/${asset.file}.${asset.ext}`}
           alt=""
-          width={size}
-          height={size}
+          width={renderedImageSize}
+          height={renderedImageSize}
           loading="lazy"
           decoding="async"
-          style={{ width: "100%", height: "100%", objectFit: "contain", padding: asset.ext === "svg" ? "1px" : "2px" }}
+          style={{
+            width: `${renderedImageSize}px`,
+            height: `${renderedImageSize}px`,
+            objectFit: "contain",
+            padding: asset.ext === "svg" ? "1px" : "2px",
+          }}
           onError={() => {
             failedIcons.add(icon);
             setFailed(true);

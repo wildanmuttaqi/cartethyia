@@ -19,16 +19,19 @@
  * responses-only SKU is registered against `/responses` instead of being
  * mislabelled as chat.
  */
-import type { ModelDefinition } from "../../provider-registry";
-import { isRecord } from "../../../protocol/primitives";
-import {
-  boundedUpstreamArray,
-  boundedUpstreamNumber,
-  sanitizeUpstreamLabel,
-} from "../../provider-metadata";
+import type { ModelDefinition } from "../../provider-model-definition";
+import { isRecord } from "../../../protocol/codecs";
+import { boundedUpstreamArray, boundedUpstreamNumber, sanitizeUpstreamLabel } from "../../provider-sanitize";
 import { modelsDevCatalog } from "../../discovery/models-dev-catalog";
 import type { DiscoveryInput } from "../../discovery/discovery-types";
-import { GITHUB_PROVIDER_ID, GITHUB_ENDPOINT_PATH, GITHUB_RESPONSES_ENDPOINT_PATH, recordGithubLongContextModels } from "./github";
+import {
+  GITHUB_EXCLUDED_MODEL_IDS,
+  GITHUB_PROVIDER_ID,
+  GITHUB_ENDPOINT_PATH,
+  GITHUB_RESPONSES_ENDPOINT_PATH,
+  GITHUB_AUTO_MODELS,
+  recordGithubModelRoutes,
+} from "./github";
 import { GITHUB_REQUEST_HEADERS, parseGithubCredential } from "./github-oauth";
 
 /** A context window above this is unsatisfiable headroom, not a real limit. */
@@ -132,17 +135,27 @@ export async function discoverGithubModels(
     const entries = boundedUpstreamArray(payload.data);
     if (!entries) return null;
     const byId = new Map<string, ModelDefinition>();
+    const discoveredModels: ModelDefinition[] = [];
     for (const entry of entries) {
       if (!isRecord(entry)) continue;
       const definition = toModelDefinition(entry);
-      if (definition !== undefined) byId.set(definition.modelId, definition);
+      if (definition === undefined) continue;
+      discoveredModels.push(definition);
+      if (!GITHUB_EXCLUDED_MODEL_IDS.has(definition.modelId)) byId.set(definition.modelId, definition);
     }
+
+    recordGithubModelRoutes(input.credential, discoveredModels);
     if (byId.size === 0) return null;
+    // The static virtual roster fills ids the account's catalog did not report.
+    // It must not overwrite a discovered row: the account is served per model,
+    // and a stale static output ceiling is what made a client carrying 200k
+    // tokens of another chat's history compact a turn the upstream would have
+    // accepted — Copilot's own measured ceiling for luna is 872k prompt tokens,
+    // not the 64k the static row publishes.
+    for (const model of GITHUB_AUTO_MODELS) {
+      if (!byId.has(model.modelId)) byId.set(model.modelId, model);
+    }
     const models = [...byId.values()].sort((a, b) => a.modelId.localeCompare(b.modelId));
-    // The dispatch-time request builder cannot see a catalog row, so the
-    // qualifying ids are handed to the adapter here, where the account's real
-    // window is known.
-    recordGithubLongContextModels(models);
     return models;
   } catch {
     return null;

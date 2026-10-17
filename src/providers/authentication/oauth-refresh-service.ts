@@ -21,11 +21,12 @@
  * losing process's write touches zero rows in either table.
  */
 import { randomUUID } from "node:crypto";
-import { and, eq, isNull, lt, or, sql } from "drizzle-orm";
-import type { CartethyiaDatabase } from "../../persistence/postgres";
+import { and, eq, inArray, isNull, lt, or, sql } from "drizzle-orm";
+import type { CartethyiaDatabase } from "../../persistence/db-handle";
 import { providerAccounts, providerOauthStates } from "../../persistence/schema";
 import { decryptCredentialToString, encryptCredential } from "../../security/crypto";
 import { invalidateCredentialCache } from "../operations/provider-credential-service";
+import { resolveAccountDisabledRecoveryMs } from "../../config/cooldowns";
 import { record } from "./oauth-flow-store";
 import {
   loadAccountWithFreshness,
@@ -269,6 +270,15 @@ async function disableAccount(
         // be shown to still work, so this is exactly that state.
         lastErrorCategory: "auth_invalidated",
         lastErrorAt: new Date(),
+        // Carries a recovery deadline so `sweepExpiredCooldowns` can bring this
+        // account back once it elapses. `disabled` used to be terminal, which
+        // parked a credential for good on one definitive rejection; the deadline
+        // is also what distinguishes this (machine-disabled) from an operator's
+        // own disable, which leaves `cooldownUntil` null and is therefore never
+        // swept. See `resolveAccountDisabledRecoveryMs`.
+        ...(resolveAccountDisabledRecoveryMs() > 0
+          ? { cooldownUntil: new Date(Date.now() + resolveAccountDisabledRecoveryMs()) }
+          : {}),
       })
       .where(eq(providerAccounts.id, accountId));
     invalidateCredentialCache(accountId);
@@ -414,6 +424,12 @@ export async function reconcileStaticTokenAccounts(db: CartethyiaDatabase): Prom
  * Accounts with no recorded expiry are always due — an account the sweep cannot
  * see is one whose token dies silently, which is the failure this guards.
  */
+/**
+ * Rows one due-scan reads. The expiry test runs in JS because the lead is per
+ * provider, so the bound has to sit on the query itself.
+ */
+const OAUTH_DUE_SCAN_LIMIT = 2_000;
+
 export async function loadDueOAuthAccounts(
   db: CartethyiaDatabase,
   skewMs?: number,
@@ -430,9 +446,19 @@ export async function loadDueOAuthAccounts(
     .where(
       and(
         eq(providerAccounts.credentialKind, "oauth"),
-        eq(providerAccounts.status, "active"),
+        // `cooldown` is included: a cooling account's token still expires, and
+        // a refresh that lands while it is parked is what lets it serve the
+        // moment the cooldown ends. `disabled` stays out — that is an
+        // operator decision, and refreshing it would spend a grant on an
+        // account that must not return to rotation on its own.
+        inArray(providerAccounts.status, ["active", "cooldown"]),
       ),
-    );
+    )
+    // The due test is applied in JS, so this limit bounds the scan, not the
+    // result. One pass cannot read the whole table; accounts past the limit
+    // are reached on a later tick once the ones in front have been refreshed
+    // and dropped out of the window.
+    .limit(OAUTH_DUE_SCAN_LIMIT);
   const now = Date.now();
   return rows
     .filter((row) => {

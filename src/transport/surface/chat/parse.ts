@@ -1,10 +1,10 @@
-import type { CanonicalMessage, ContentPart, GenerationControls } from "../../canonical-model";
+import type { CanonicalMessage, ContentPart, GenerationControls } from "../../../protocol/canonical-model";
 import type { SurfaceInput } from "../adapters";
-import { isRecord } from "../../../protocol/primitives";
+import { isRecord } from "../../../protocol/codecs";
 import { textPart, normalizeInlineFile } from "../content-parts";
 import { SERVICE_TIERS } from "../dialects";
-import { readNumber, readString } from "../../../protocol/primitives";
-import type { OpenAiUsage } from "../../../providers/usage";
+import { readNumber, readString } from "../../../protocol/codecs";
+import type { OpenAiUsage } from "../../../providers/provider-usage";
 
 export interface ChatEncodeOptions {
   response_id?: string;
@@ -36,10 +36,11 @@ export interface ParsedToolCall {
   name: string;
   arguments: string;
   index: number;
+  namespace?: string;
 }
 
 // Tool-call index pinning + arguments accumulation live in the shared
-// `ToolCallTracker` (transport/tool-identity.ts), also used by the Messages
+// `ToolCallTracker` (protocol/tool-identity.ts), also used by the Messages
 // ledger — this surface keeps only its wire encoding.
 
 export interface ChunkBase {
@@ -191,11 +192,13 @@ export function parseToolCall(value: unknown, index: number): ParsedToolCall | u
   // too — the Messages wire requires `input` to be an object, and a raw ""
   // is not valid JSON for the Chat/Responses history either.
   const args = readString(functionValue, "arguments");
+  const namespace = readString(functionValue, "namespace");
   return {
     id,
     name,
     arguments: args === undefined || args.trim().length === 0 ? "{}" : args,
     index,
+    ...(namespace === undefined ? {} : { namespace }),
   };
 }
 
@@ -242,6 +245,7 @@ export function parseMessage(value: unknown): CanonicalMessage {
           name: parsed.name,
           arguments: parsed.arguments,
           index: parsed.index,
+          ...(parsed.namespace === undefined ? {} : { namespace: parsed.namespace }),
         },
       ];
     });

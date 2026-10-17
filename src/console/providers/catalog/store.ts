@@ -1,22 +1,33 @@
 // Drizzle-backed provider, account, model, routing, and API-key repositories.
-import { and, asc, eq, gte, inArray, isNull, sql } from "drizzle-orm";
+import { and, asc, eq, inArray, isNull, or, sql, type SQL } from "drizzle-orm";
 import { ConsoleDomainError } from "../../shared/errors";
-import { parseCustomProviderId, isBundledProviderId, type ModelDefinition, type ProviderRegistry } from "../../../providers/provider-registry";
+import { parseCustomProviderId, isBundledProviderId } from "../../../providers/provider-contracts";
+import type { ModelDefinition } from "../../../providers/provider-model-definition";
+import type { ProviderRegistry } from "../../../providers/provider-registry";
+import { BUNDLED_PROVIDER_MODULES } from "../../../providers/default-registry";
+import { modelsDevCatalog } from "../../../providers/discovery/models-dev-catalog";
 import { globalOrOwnedBy, ownedByOnly } from "../../../persistence/tenant-scope";
-import type { CartethyiaDatabase } from "../../../persistence/postgres";
-import { models, providerAccounts, providerOauthStates, providers, telemetryEvents, telemetryUsageTotals, tenantDisabledModels } from "../../../persistence/schema";
-import type { WireFamily } from "../../../transport/canonical-model";
+import { nextSortIndex, reorderSortIndex } from "../../../persistence/sort-order";
+import type { CartethyiaDatabase } from "../../../persistence/db-handle";
+import { buddyTaskLedger, models, providerAccounts, providerOauthStates, providers, telemetryUsageTotals, tenantDisabledModels } from "../../../persistence/schema";
+import { queryTelemetryEvents } from "../../../observability/event-log";
+import { isGatewayError } from "../../../observability/telemetry-status";
+import type { WireFamily } from "../../../protocol/canonical-model";
 import { listAccountHealthEvents, recoverAccount, type AccountHealthEventRecord } from "../../../providers/operations/account-health-service";
 import { invalidateCredentialCache } from "../../../providers/operations/provider-credential-service";
 import { encryptCredential, hashSecret } from "../../../security/crypto";
 import type { TelemetryBatchBuffer } from "../../../observability/telemetry-buffer";
-import { gatewayErrorSql } from "../../../observability/telemetry-status";
 import type { BundledProviderCatalog } from "../../../providers/operations/provider-catalog-service";
-import type { AccountInflightReading, ByokConnectionTestRequest, ByokConnectionTestResult, CreateProviderAccountRequest, CredentialMode, ModelCatalogEntry, ProbeAllAccountsResult, ProbeAllModelsResult, ProbeModelRequest, ProbeModelResult, ProviderAccountResponse, ProviderAccountTokenUsage, ProviderCatalogStore, ProviderRecord, SetModelEnabledRequest, UpdateProviderAccountRequest } from "./contracts";
+import type { AccountInflightReading, BuddyGrowthTaskLedgerEntry, ByokConnectionTestRequest, ByokConnectionTestResult, CreateProviderAccountBatchItemResult, CreateProviderAccountBatchResult, CreateProviderAccountRequest, CredentialMode, ModelCatalogEntry, ProbeAllAccountsResult, ProbeAllModelsResult, ProbeModelRequest, ProbeModelResult, ProviderAccountResponse, ProviderAccountTokenUsage, ProviderCatalogStore, ProviderRecord, SetModelEnabledRequest, UpdateModelMetadataRequest, UpdateProviderAccountRequest, ModelMetadataOverride } from "./contracts";
 import { isServiceKind, validateCompatibilityProfile } from "./contracts";
 import { ProviderProbingService, type ProbeOutboundResolver } from "../../../providers/discovery/probing-service";
-import { resolveManualModelMetadata } from "../../../providers/model-definition";
-import { isUniqueViolation } from "../../../persistence/postgres";
+import {
+  applyModelMetadataOverride,
+  FALLBACK_CONTEXT_LIMIT,
+  FALLBACK_OUTPUT_LIMIT,
+  resolveManualModelMetadata,
+} from "../../../providers/provider-model-definition";
+import { isUniqueViolation } from "../../../persistence/boot";
 import { DEFAULT_ENDPOINT_BY_WIRE_FAMILY, endpointPathForProviderModel, mapProviderRow } from "./catalog-projections";
 import { pushStructuredConsoleLog } from "../../../observability/log-ring";
 import { decodeJwtPayload } from "../../../providers/authentication/oauth-flow-store";
@@ -69,10 +80,62 @@ function parseJwtCredential(raw: string): { readonly expiresAt?: Date } | undefi
  * with it but cannot be refreshed, so the caller stores it as a static
  * API credential instead of sending the access token to a refresh endpoint.
  */
+/**
+ * Middle segment of an auto-generated account label, from how the credential
+ * was actually detected.
+ *
+ * Only the two kinds that arrive with no name of their own are named here. An
+ * OAuth paste carries its own identity in `authState` (the account it was
+ * exported from), so it keeps whatever the export or the operator supplied —
+ * generating a name for it would overwrite an identity that was already there.
+ * An unrecognized mode falls back to `key`, matching the mode it is stored as.
+ */
+export function accountLabelKindSegment(credentialMode: CredentialMode): string {
+  return credentialMode === "jwt" ? "jwt" : "key";
+}
+
+/**
+ * First unused `dcint-key-N` / `dcint-jwt-N` label for one provider.
+ *
+ * Polished tokens and plain JWTs are the credentials that arrive nameless: an
+ * operator pastes several into one provider and every row came out as
+ * "<providerId> account", so five accounts were five identical labels and the
+ * list could not tell them apart — which account failed, or is cooling, was
+ * unreadable.
+ *
+ * Numbering runs per kind, so the first JWT is `jwt-1` rather than inheriting
+ * whatever number the api_key rows reached (`jwt-3` with no `jwt-1` reads as
+ * two missing accounts). Counting is case-insensitive on the whole label, so a
+ * hand-typed `DCINT-KEY-2` still reserves its number.
+ *
+ * Pure, so the numbering can be pinned without a database.
+ */
+export function nextGeneratedAccountLabel(
+  providerId: string,
+  credentialMode: CredentialMode,
+  existingLabels: readonly string[],
+): string {
+  const kind = accountLabelKindSegment(credentialMode);
+  const prefix = `${providerId}-${kind}-`;
+  const taken = new Set(
+    existingLabels.map((label) => label.trim().toLowerCase()),
+  );
+  for (let n = 1; ; n += 1) {
+    const candidate = `${prefix}${n}`;
+    if (!taken.has(candidate.toLowerCase())) return candidate;
+  }
+}
+
 export function parsePastedOAuthCredential(raw: string): {
   readonly accessToken: string;
   readonly refreshToken: string;
   readonly expiresAt: Date | undefined;
+  /**
+   * Non-secret account configuration the export carried — the profile the
+   * account is bound to, how it authenticates, the region it was minted in.
+   * Empty for a bare token, which carries none.
+   */
+  readonly authState: Readonly<Record<string, unknown>>;
 } {
   let record: Record<string, unknown> | undefined;
   try {
@@ -90,6 +153,7 @@ export function parsePastedOAuthCredential(raw: string): {
       accessToken: raw,
       refreshToken: raw,
       expiresAt: jwt?.expiresAt,
+      authState: {},
     };
   }
   // A nested `data` object is unwrapped the same way the dashboard's parser does.
@@ -113,7 +177,88 @@ export function parsePastedOAuthCredential(raw: string): {
         record["expires"] ??
         (nested ? nested["expires"] : undefined),
     ) ?? parseJwtCredential(accessToken)?.expiresAt;
-  return { accessToken, refreshToken, expiresAt };
+  return { accessToken, refreshToken, expiresAt, authState: pastedAuthState(record, nested) };
+}
+
+/**
+ * The account configuration a pasted export carries beside its tokens.
+ *
+ * Kiro refuses a generation request that omits the profile the account is bound
+ * to, and legacy exports carry that profile under a different key. Reading
+ * neither is how an imported account probes with no
+ * profile and is answered `400 profileArn is required`.
+ */
+function pastedAuthState(
+  record: Record<string, unknown>,
+  nested: Record<string, unknown> | undefined,
+): Readonly<Record<string, unknown>> {
+  const sources = [record, nested, asRecord(record["providerSpecificData"]), asRecord(record["authState"]), asRecord(nested?.["authState"])];
+  const profileArn = firstStringFrom(sources, ["profileArn", "profile_arn"]);
+  const authMethod = firstStringFrom(sources, ["authMethod", "auth_method"]);
+  const region = firstStringFrom(sources, ["region"]);
+  return {
+    ...(profileArn === undefined ? {} : { profileArn }),
+    ...(authMethod === undefined ? {} : { authMethod }),
+    ...(region === undefined ? {} : { region }),
+  };
+}
+
+function asRecord(value: unknown): Record<string, unknown> | undefined {
+  return value !== null && typeof value === "object" && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : undefined;
+}
+
+/**
+ * Adds or removes the `image` input modality on a stored modalities blob.
+ *
+ * The blob is a JSON string whose shape varies by source (bundled seed,
+ * discovery, manual add), so it is normalized rather than pattern-matched: an
+ * unparseable blob is replaced with the minimal text shape rather than left to
+ * corrupt capability preflight.
+ */
+export function withImageModality(stored: string | null | undefined, image: boolean): string {
+  const parsed = asRecord(safeParseJson(stored));
+  const input = Array.isArray(parsed?.input)
+    ? (parsed.input as unknown[]).filter((m): m is string => typeof m === "string")
+    : ["text"];
+  const output = Array.isArray(parsed?.output)
+    ? (parsed.output as unknown[]).filter((m): m is string => typeof m === "string")
+    : ["text"];
+  const nextInput = image
+    ? Array.from(new Set([...input, "image"]))
+    : input.filter((m) => m !== "image");
+  return JSON.stringify({
+    ...(parsed ?? {}),
+    input: nextInput.length > 0 ? nextInput : ["text"],
+    output: output.length > 0 ? output : ["text"],
+  });
+}
+
+function safeParseJson(value: string | null | undefined): unknown {
+  if (typeof value !== "string" || value.length === 0) return undefined;
+  try {
+    return JSON.parse(value) as unknown;
+  } catch {
+    return undefined;
+  }
+}
+
+/** Normalizes a text column read as `unknown` back to a string or null. */
+function asStoredText(value: unknown): string | null {
+  return typeof value === "string" ? value : null;
+}
+
+function firstStringFrom(
+  sources: readonly (Record<string, unknown> | undefined)[],
+  fields: readonly string[],
+): string | undefined {
+  for (const source of sources) {
+    if (source === undefined) continue;
+    const value = firstString(source, fields);
+    if (value !== undefined) return value;
+  }
+  return undefined;
 }
 
 /**
@@ -145,8 +290,11 @@ function liveModelCooldowns(
  * the bulk read has to look it up across every provider at once while the
  * single-provider read looks it up for one; the projection itself is identical
  * either way, so it lives here rather than being written twice.
+ *
+ * Exported so a test can pin the unsized-model substitution without a database:
+ * which rows get the fallback, and that they are the same rows marked estimated.
  */
-function mapModelRow(
+export function mapModelRow(
   row: typeof models.$inferSelect,
   disabled: boolean,
 ): ModelCatalogEntry {
@@ -156,6 +304,16 @@ function mapModelRow(
       : undefined;
   const inputModalities = Array.isArray(modalities?.input) ? modalities.input : [];
   const outputModalities = Array.isArray(modalities?.output) ? modalities.output : [];
+  // Nothing filed this model — not its own row, not the base catalog under this
+  // provider's id, not a majority across the catalog's other resellers. The
+  // fallback is substituted here rather than persisted: the stored `null` is the
+  // honest record of what upstream said, and substituting at the write would
+  // make a guess indistinguishable from a measurement on the next read. The
+  // marker rides along so the card can say which one it is showing.
+  const unfiled =
+    row.contextLimit === null &&
+    modelsDevCatalog.resolve(row.providerId, row.modelId) === undefined &&
+    modelsDevCatalog.majorityFor(row.modelId) === undefined;
   return {
     modelId: row.modelId,
     route: row.endpointPath,
@@ -163,8 +321,11 @@ function mapModelRow(
     wireFamily: row.wireFamily,
     serviceKind: row.serviceKind,
     enabled: disabled ? false : row.enabled,
-    contextLimit: row.contextLimit,
-    outputLimit: row.outputLimit,
+    // A fetched model that published no context size read `n/a ctx · n/a out`
+    // while still being routable — a working model that looked unusable. These
+    // rows get the same ceilings a manual add is offered, flagged as estimated.
+    contextLimit: unfiled ? FALLBACK_CONTEXT_LIMIT : row.contextLimit,
+    outputLimit: unfiled ? FALLBACK_OUTPUT_LIMIT : row.outputLimit,
     reasoning: row.reasoning,
     toolCall: row.toolCall,
     vision: inputModalities.includes("image"),
@@ -173,6 +334,7 @@ function mapModelRow(
     mediaGeneration: outputModalities.includes("image"),
     cost: row.cost as ModelCatalogEntry["cost"],
     source: row.source,
+    ...(unfiled ? { limitsEstimated: true } : {}),
     sourceUpdatedAt: row.sourceUpdatedAt?.toISOString() ?? null,
   } satisfies ModelCatalogEntry;
 }
@@ -219,12 +381,18 @@ export class DrizzleProviderCatalogStore implements ProviderCatalogStore {
     });
   }
   async list(tenantId: string): Promise<readonly ProviderRecord[]> {
+    const bundledIds = BUNDLED_PROVIDER_MODULES.map((provider) => provider.id);
     const rows = await this.db
       .select()
       .from(providers)
-      .where(globalOrOwnedBy(providers.tenantId, tenantId))
+      .where(
+        and(
+          globalOrOwnedBy(providers.tenantId, tenantId),
+          or(inArray(providers.id, bundledIds), eq(providers.tenantId, tenantId)),
+        ),
+      )
       .orderBy(asc(providers.id));
-    return rows.map(mapProviderRow);
+    return rows.map((row) => mapProviderRow(row, this.providerRegistry));
   }
   async get(tenantId: string, providerId: string): Promise<ProviderRecord | undefined> {
     const rows = await this.db
@@ -238,7 +406,7 @@ export class DrizzleProviderCatalogStore implements ProviderCatalogStore {
       )
       .limit(1);
     const row = rows[0];
-    return row ? mapProviderRow(row) : undefined;
+    return row ? mapProviderRow(row, this.providerRegistry) : undefined;
   }
   async create(record: ProviderRecord): Promise<void> {
     if (isBundledProviderId(record.providerId))
@@ -299,7 +467,7 @@ export class DrizzleProviderCatalogStore implements ProviderCatalogStore {
               ),
             );
     const row = rows[0];
-    return row ? mapProviderRow(row) : undefined;
+    return row ? mapProviderRow(row, this.providerRegistry) : undefined;
   }
   async delete(tenantId: string, providerId: string): Promise<boolean> {
     if (isBundledProviderId(providerId))
@@ -353,7 +521,7 @@ export class DrizzleProviderCatalogStore implements ProviderCatalogStore {
             .from(providers)
             .where(and(eq(providers.id, providerId), isNull(providers.tenantId)));
     const row = rows[0];
-    return row ? mapProviderRow(row) : undefined;
+    return row ? mapProviderRow(row, this.providerRegistry) : undefined;
   }
 
   async deleteGlobal(providerId: string): Promise<boolean> {
@@ -435,6 +603,7 @@ export class DrizzleProviderCatalogStore implements ProviderCatalogStore {
     providerId: string,
     modelIds: readonly string[],
     wireFamily?: string,
+    metadata?: ModelMetadataOverride,
   ): Promise<void> {
     const owner = await this.db
       .select({
@@ -449,16 +618,16 @@ export class DrizzleProviderCatalogStore implements ProviderCatalogStore {
       throw new ConsoleDomainError("provider_not_found", 404, `Provider ${providerId} not found`);
     }
     const family = (wireFamily ?? "chat") as WireFamily;
-    // Resolve the endpoint from the provider's static catalog or registry
-    // contract through the same startup-built map probes use. Without this,
-    // providers on versioned bases can get a generic path that is unreachable.
-    const providerEndpoint = await this.probing.resolveProviderEndpoint(providerId, family);
+    // Static endpoint from the provider's own bundled catalog via the probing
+    // service (the same startup-built map this store is constructed with).
+    // Without this, bundled providers on versioned bases (cline) get the
+    // generic `/v1/…` default, which joins into an unreachable path and every
+    // probe/dispatch 404s.
+    const staticEndpoint = await this.probing.resolveStaticEndpoint(providerId, family);
     const endpointPath = endpointPathForProviderModel(
-      providerId,
       family,
       owner[0].compatibilityProfile,
-      owner[0].baseUrl,
-      providerEndpoint === undefined ? undefined : { [family]: providerEndpoint },
+      staticEndpoint === undefined ? undefined : { [family]: staticEndpoint },
     );
     if (modelIds.length === 0) return;
     // Single multi-row insert (was N sequential round-trips) and upsert the
@@ -475,7 +644,10 @@ export class DrizzleProviderCatalogStore implements ProviderCatalogStore {
           modelId,
           wireFamily: family,
           endpointPath,
-          ...resolveManualModelMetadata(providerId, modelId),
+          ...applyModelMetadataOverride(
+            resolveManualModelMetadata(providerId, modelId),
+            metadata,
+          ),
           source: "manual",
           sourceUpdatedAt: new Date(),
           enabled: true,
@@ -624,6 +796,82 @@ export class DrizzleProviderCatalogStore implements ProviderCatalogStore {
     return true;
   }
 
+  /**
+   * Updates one model's limits and capability flags.
+   *
+   * Two row kinds are writable. A tenant-owned (BYOK) row is updated directly.
+   * A model belonging to a *global* provider row is also updated directly:
+   * bundled providers are seeded once with `tenant_id IS NULL` and `providers.id`
+   * is the primary key, so a bundled provider can only ever have that one row —
+   * there is no tenant-scoped row to edit instead. Auto-fetched rows
+   * (`discovered` / `auto_free`) live on exactly those providers, which is why
+   * the previous `ownedByOnly` filter answered `not_found` for every model the
+   * operator had just fetched and could not be edited at all.
+   *
+   * A global `builtin` row is rejected: it is re-seeded from the bundle on every
+   * boot, so an edit there would be silently reverted, and `deleteModel` refuses
+   * it for the same reason.
+   *
+   * Absent override fields leave the stored value untouched — an edit that only
+   * sets the context ceiling must not reset the capability flags.
+   */
+  async updateModelMetadata(
+    tenantId: string,
+    providerId: string,
+    request: UpdateModelMetadataRequest,
+  ): Promise<boolean> {
+    const findRow = (ownership: SQL) =>
+      this.db
+        .select({ id: models.id, modalities: models.modalities, source: models.source })
+        .from(models)
+        .innerJoin(providers, eq(models.providerId, providers.id))
+        .where(
+          and(
+            eq(models.providerId, providerId),
+            eq(models.modelId, request.modelId),
+            eq(models.endpointPath, request.route),
+            ownership,
+          ),
+        )
+        .limit(1);
+    const owned = await findRow(ownedByOnly(providers.tenantId, tenantId));
+    let row = owned[0];
+    if (row === undefined) {
+      const global = await findRow(isNull(providers.tenantId));
+      const candidate = global[0];
+      if (candidate === undefined) return false;
+      if (candidate.source === "builtin") {
+        throw new ConsoleDomainError(
+          "builtin_model_immutable",
+          403,
+          `Built-in model ${providerId}/${request.modelId} cannot be edited — the bundle re-seeds it on every boot`,
+        );
+      }
+      row = candidate;
+    }
+
+    const override = request.metadata;
+    const set: Record<string, unknown> = { sourceUpdatedAt: new Date() };
+    if (override?.contextLimit !== undefined) set.contextLimit = override.contextLimit;
+    if (override?.outputLimit !== undefined) set.outputLimit = override.outputLimit;
+    // Passthrough grants every capability and cannot be partly revoked by a
+    // per-flag field: the point of the flag is that the operator does not know
+    // which capabilities the model has, so an explicit `false` alongside it is
+    // either stale or a mistake.
+    if (override?.passthrough === true) {
+      set.reasoning = true;
+      set.toolCall = true;
+      set.modalities = withImageModality(asStoredText(row.modalities), true);
+    } else {
+      if (override?.reasoning !== undefined) set.reasoning = override.reasoning;
+      if (override?.toolCall !== undefined) set.toolCall = override.toolCall;
+      if (override?.image !== undefined)
+        set.modalities = withImageModality(asStoredText(row.modalities), override.image);
+    }
+    await this.db.update(models).set(set).where(eq(models.id, row.id));
+    return true;
+  }
+
   async deleteModel(
     tenantId: string,
     providerId: string,
@@ -698,27 +946,18 @@ export class DrizzleProviderCatalogStore implements ProviderCatalogStore {
     const todayStart = new Date();
     todayStart.setUTCHours(0, 0, 0, 0);
     const accountIds = rows.map((row) => row.id);
-    const [todayRows, lifetimeRows] = await Promise.all([
-      this.db
-        .select({
-          accountId: telemetryEvents.accountId,
-          requests: sql<number>`count(*)`,
-          // The same predicate the lifetime arm reads out of
-          // `telemetry_usage_totals`, so the "today" and "all time" error
-          // counts shown side by side cannot disagree about what an error is.
-          errors: sql<number>`count(*) filter (where ${gatewayErrorSql(telemetryEvents.status, telemetryEvents.httpStatus)})`,
-          inputTokens: sql<number>`coalesce(sum(${telemetryEvents.inputTokens}), 0)`,
-          outputTokens: sql<number>`coalesce(sum(${telemetryEvents.outputTokens}), 0)`,
-        })
-        .from(telemetryEvents)
-        .where(
-          and(
-            eq(telemetryEvents.tenantId, tenantId),
-            inArray(telemetryEvents.accountId, accountIds),
-            gte(telemetryEvents.createdAt, todayStart),
-          ),
-        )
-        .groupBy(telemetryEvents.accountId),
+    const todayEvents = await queryTelemetryEvents({ tenantId, accountIds, since: todayStart });
+    const todayByAccount = new Map<string, { requests: number; errors: number; inputTokens: number; outputTokens: number }>();
+    for (const event of todayEvents) {
+      if (!event.accountId) continue;
+      const bucket = todayByAccount.get(event.accountId) ?? { requests: 0, errors: 0, inputTokens: 0, outputTokens: 0 };
+      bucket.requests += 1;
+      if (isGatewayError(event.status, event.httpStatus)) bucket.errors += 1;
+      bucket.inputTokens += event.inputTokens ?? 0;
+      bucket.outputTokens += event.outputTokens ?? 0;
+      todayByAccount.set(event.accountId, bucket);
+    }
+    const [lifetimeRows] = await Promise.all([
       this.db
         .select()
         .from(telemetryUsageTotals)
@@ -730,10 +969,6 @@ export class DrizzleProviderCatalogStore implements ProviderCatalogStore {
           ),
         ),
     ]);
-    const todayByAccount = new Map<string, (typeof todayRows)[number]>();
-    for (const row of todayRows) {
-      if (row.accountId !== null) todayByAccount.set(row.accountId, row);
-    }
     const lifetimeByAccount = new Map(lifetimeRows.map((row) => [row.entityId, row]));
     const mapUsage = (row: {
       readonly requests: number | string | null;
@@ -784,18 +1019,47 @@ export class DrizzleProviderCatalogStore implements ProviderCatalogStore {
    * with accounts under two providers must not have the second provider's
    * first account land at a high index.
    */
+  /**
+   * Labels already in use for one provider, for numbering a generated name.
+   *
+   * Scoped to this provider and tenant: `dcint-key-1` and `other-key-1` belong
+   * to different providers and must not collide with each other.
+   */
+  private async generateAccountLabel(
+    db: CartethyiaDatabase | Parameters<Parameters<CartethyiaDatabase["transaction"]>[0]>[0],
+    providerId: string,
+    tenantId: string,
+    credentialMode: CredentialMode,
+  ): Promise<string> {
+    const rows = await db
+      .select({ label: providerAccounts.label })
+      .from(providerAccounts)
+      .where(
+        and(
+          eq(providerAccounts.providerId, providerId),
+          globalOrOwnedBy(providerAccounts.tenantId, tenantId),
+        ),
+      );
+    return nextGeneratedAccountLabel(
+      providerId,
+      credentialMode,
+      rows.map((row) => row.label).filter((label): label is string => typeof label === "string"),
+    );
+  }
+
   private async nextAccountSortIndex(
     db: CartethyiaDatabase | Parameters<Parameters<CartethyiaDatabase["transaction"]>[0]>[0],
     providerId: string,
     tenantId: string,
   ): Promise<number> {
-    const rows = await db
-      .select({ max: sql<number>`coalesce(max(${providerAccounts.sortIndex}), -1)` })
-      .from(providerAccounts)
-      .where(
-        and(eq(providerAccounts.providerId, providerId), globalOrOwnedBy(providerAccounts.tenantId, tenantId)),
-      );
-    return Number(rows[0]?.max ?? -1) + 1;
+    return nextSortIndex(
+      db,
+      { table: providerAccounts, idColumn: providerAccounts.id, sortIndexColumn: providerAccounts.sortIndex },
+      and(
+        eq(providerAccounts.providerId, providerId),
+        globalOrOwnedBy(providerAccounts.tenantId, tenantId),
+      ),
+    );
   }
 
   /** Rewrites one provider's account order; `accountIds` is the full order. */
@@ -804,20 +1068,15 @@ export class DrizzleProviderCatalogStore implements ProviderCatalogStore {
     providerId: string,
     accountIds: readonly string[],
   ): Promise<void> {
-    await this.db.transaction(async (tx) => {
-      for (const [index, accountId] of accountIds.entries()) {
-        await tx
-          .update(providerAccounts)
-          .set({ sortIndex: index })
-          .where(
-            and(
-              eq(providerAccounts.providerId, providerId),
-              eq(providerAccounts.id, accountId),
-              globalOrOwnedBy(providerAccounts.tenantId, tenantId),
-            ),
-          );
-      }
-    });
+    await reorderSortIndex(
+      this.db,
+      { table: providerAccounts, idColumn: providerAccounts.id, sortIndexColumn: providerAccounts.sortIndex },
+      and(
+        eq(providerAccounts.providerId, providerId),
+        globalOrOwnedBy(providerAccounts.tenantId, tenantId),
+      ),
+      accountIds,
+    );
   }
 
   async listAccounts(
@@ -853,10 +1112,16 @@ export class DrizzleProviderCatalogStore implements ProviderCatalogStore {
     tenantId: string,
     providerId: string,
     request: CreateProviderAccountRequest,
+    existingTx?: Parameters<Parameters<CartethyiaDatabase["transaction"]>[0]>[0],
+    includeUsage = true,
+    sortIndexOverride?: number,
   ): Promise<ProviderAccountResponse> {
-    try {
-      return await this.db.transaction(async (tx) => {
-        let effectiveSecret = request.secret;
+    // Callers inside an existing transaction pass it in so the account lands in
+    // that unit of work (the batch path); otherwise this opens its own.
+    const run = async (
+      tx: Parameters<Parameters<CartethyiaDatabase["transaction"]>[0]>[0],
+    ): Promise<ProviderAccountResponse> => {
+    let effectiveSecret = request.secret;
         let effectiveCredentialKind = request.credentialKind;
         const requestedCredentialMode: CredentialMode = request.credentialMode ?? "auto";
         let effectiveCredentialMode: CredentialMode = requestedCredentialMode;
@@ -864,68 +1129,50 @@ export class DrizzleProviderCatalogStore implements ProviderCatalogStore {
         let oauthRefreshCiphertext: Buffer | undefined;
         let oauthExpiresAt: Date | undefined;
         let oauthHasRefreshToken = false;
+        let pastedAuthState: Readonly<Record<string, unknown>> = {};
 
         if (
           (request.credentialKind === "oauth" || request.credentialKind === "api_key") &&
           request.secret.trim().length > 0
         ) {
           const trimmed = request.secret.trim();
-          if (request.credentialKind === "oauth" && providerId === "mimodesktop") {
-            const { parseMimoCredential, encodeMimoCredential } = await import(
-              "../../../providers/integrations/xiaomi-mimo/mimodesktop-oauth"
+          const parts = parsePastedOAuthCredential(trimmed);
+          pastedAuthState = parts.authState;
+          const hasRefreshToken = parts.refreshToken !== parts.accessToken;
+          const parsedJwt =
+            requestedCredentialMode === "api_key"
+              ? undefined
+              : parseJwtCredential(parts.accessToken);
+          if (requestedCredentialMode === "jwt" && parsedJwt === undefined) {
+            throw new ConsoleDomainError(
+              "invalid_request",
+              400,
+              "credentialMode jwt requires a valid three-part JWT",
             );
-            const creds = parseMimoCredential(trimmed);
-            oauthRefreshCiphertext = encryptCredential(creds.passToken);
-            oauthExpiresAt = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000);
-            effectiveSecret = encodeMimoCredential(creds);
-            oauthHasRefreshToken = true;
-          } else if (request.credentialKind === "oauth" && providerId === "mimostudio") {
-            const { parseMimoStudioCredential, encodeMimoStudioCredential } = await import(
-              "../../../providers/integrations/xiaomi-mimo/mimostudio-auth"
-            );
-            const creds = parseMimoStudioCredential(trimmed);
-            oauthRefreshCiphertext = encryptCredential(encodeMimoStudioCredential(creds));
-            oauthExpiresAt = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000);
-            effectiveSecret = encodeMimoStudioCredential(creds);
-            oauthHasRefreshToken = true;
+          }
+          if (requestedCredentialMode === "api_key") {
+            effectiveSecret = parts.accessToken;
+            effectiveCredentialKind = "api_key";
+            effectiveCredentialMode = "api_key";
+          } else if (
+            parsedJwt !== undefined &&
+            (requestedCredentialMode === "jwt" || !hasRefreshToken)
+          ) {
+            effectiveSecret = parts.accessToken;
+            effectiveCredentialKind = "api_key";
+            effectiveCredentialMode = "jwt";
+            tokenExpiresAt = parsedJwt.expiresAt;
+          } else if (request.credentialKind === "oauth" || hasRefreshToken) {
+            effectiveSecret = parts.accessToken;
+            effectiveCredentialKind = hasRefreshToken ? "oauth" : "api_key";
+            effectiveCredentialMode = hasRefreshToken ? "auto" : "api_key";
+            if (hasRefreshToken) {
+              oauthRefreshCiphertext = encryptCredential(parts.refreshToken);
+              oauthHasRefreshToken = true;
+            }
+            oauthExpiresAt = parts.expiresAt;
           } else {
-            const parts = parsePastedOAuthCredential(trimmed);
-            const hasRefreshToken = parts.refreshToken !== parts.accessToken;
-            const parsedJwt =
-              requestedCredentialMode === "api_key"
-                ? undefined
-                : parseJwtCredential(parts.accessToken);
-            if (requestedCredentialMode === "jwt" && parsedJwt === undefined) {
-              throw new ConsoleDomainError(
-                "invalid_request",
-                400,
-                "credentialMode jwt requires a valid three-part JWT",
-              );
-            }
-            if (requestedCredentialMode === "api_key") {
-              effectiveSecret = parts.accessToken;
-              effectiveCredentialKind = "api_key";
-              effectiveCredentialMode = "api_key";
-            } else if (
-              parsedJwt !== undefined &&
-              (requestedCredentialMode === "jwt" || !hasRefreshToken)
-            ) {
-              effectiveSecret = parts.accessToken;
-              effectiveCredentialKind = "api_key";
-              effectiveCredentialMode = "jwt";
-              tokenExpiresAt = parsedJwt.expiresAt;
-            } else if (request.credentialKind === "oauth" || hasRefreshToken) {
-              effectiveSecret = parts.accessToken;
-              effectiveCredentialKind = hasRefreshToken ? "oauth" : "api_key";
-              effectiveCredentialMode = hasRefreshToken ? "auto" : "api_key";
-              if (hasRefreshToken) {
-                oauthRefreshCiphertext = encryptCredential(parts.refreshToken);
-                oauthHasRefreshToken = true;
-              }
-              oauthExpiresAt = parts.expiresAt;
-            } else {
-              effectiveCredentialMode = "api_key";
-            }
+            effectiveCredentialMode = "api_key";
           }
         }
 
@@ -936,18 +1183,26 @@ export class DrizzleProviderCatalogStore implements ProviderCatalogStore {
             ? undefined
             : hashSecret(effectiveSecret);
         const accountAuthState = {
+          ...pastedAuthState,
           ...(request.authState ?? {}),
           credentialMode: effectiveCredentialMode,
           ...(tokenExpiresAt === undefined ? {} : { tokenExpiresAt: tokenExpiresAt.toISOString() }),
         };
-        const nextSortIndex = await this.nextAccountSortIndex(tx, providerId, tenantId);
+        const nextSortIndex =
+          sortIndexOverride ?? (await this.nextAccountSortIndex(tx, providerId, tenantId));
+        // Read existing labels only when one has to be generated: a named
+        // account costs no extra query, and this is the path a large batch
+        // paste walks once per row.
+        const label =
+          request.label ??
+          (await this.generateAccountLabel(tx, providerId, tenantId, effectiveCredentialMode));
         const rows = await tx
           .insert(providerAccounts)
           .values({
             providerId,
             tenantId,
             sortIndex: nextSortIndex,
-            label: request.label ?? `${providerId} account`,
+            label,
             credentialCiphertext: encryptCredential(effectiveSecret),
             ...(credentialFingerprint ? { credentialFingerprint } : {}),
             credentialKind: effectiveCredentialKind,
@@ -988,10 +1243,20 @@ export class DrizzleProviderCatalogStore implements ProviderCatalogStore {
           );
         }
 
+        if (!includeUsage) {
+          const emptyUsage = { requests: 0, errors: 0, inputTokens: 0, outputTokens: 0, totalTokens: 0 };
+          return this.mapAccount(row, { today: emptyUsage, allTime: emptyUsage });
+        }
         const [account] = await this.accountsWithUsage(tenantId, [row]);
         if (!account) throw new Error("created provider account could not be mapped");
         return account;
-      });
+    };
+
+    try {
+      if (existingTx !== undefined) {
+        return await run(existingTx);
+      }
+      return await this.db.transaction(run);
     } catch (error) {
       if (isUniqueViolation(error)) {
         throw new ConsoleDomainError(
@@ -1002,6 +1267,60 @@ export class DrizzleProviderCatalogStore implements ProviderCatalogStore {
       }
       throw error;
     }
+  }
+
+  /**
+   * Creates many accounts in one round-trip.
+   *
+   * The whole batch shares one transaction, so a paste of 40 credentials costs
+   * one connection checkout rather than 40. Each item is created through the
+   * same `createAccount` path the single route uses — there is no second
+   * implementation of credential detection to drift.
+   *
+   * Items are created sequentially inside that transaction: the unique
+   * credential fingerprint makes two identical pastes collide, and a nested
+   * transaction per item keeps that collision from aborting the whole batch.
+   * Outcomes are reported per index, so a partial paste still lands the
+   * accounts that were fine — an operator fixing one bad line should not have
+   * to re-import 39.
+   */
+  async createAccountBatch(
+    tenantId: string,
+    providerId: string,
+    requests: readonly CreateProviderAccountRequest[],
+  ): Promise<CreateProviderAccountBatchResult> {
+    if (requests.length === 0) {
+      return { created: 0, failed: 0, results: [] };
+    }
+    const results: CreateProviderAccountBatchItemResult[] = [];
+    let created = 0;
+    let failed = 0;
+
+    await this.db.transaction(async (tx) => {
+      let nextSortIndex = await this.nextAccountSortIndex(tx, providerId, tenantId);
+      for (const [index, request] of requests.entries()) {
+        try {
+          // A nested transaction acts as a savepoint: a duplicate-fingerprint
+          // violation rolls back only this item, not the accounts before it.
+          const account = await tx.transaction(async (inner) =>
+            this.createAccount(tenantId, providerId, request, inner, false, nextSortIndex),
+          );
+          created += 1;
+          nextSortIndex += 1;
+          results.push({ index, ok: true, ...(account ? { account } : {}) });
+        } catch (error) {
+          failed += 1;
+          results.push({
+            index,
+            ok: false,
+            error: error instanceof Error ? error.message : String(error),
+            code: error instanceof ConsoleDomainError ? error.code : "create_failed",
+          });
+        }
+      }
+    });
+
+    return { created, failed, results };
   }
 
   async updateAccount(
@@ -1045,7 +1364,7 @@ export class DrizzleProviderCatalogStore implements ProviderCatalogStore {
     const where = and(
       eq(providerAccounts.id, accountId),
       eq(providerAccounts.providerId, providerId),
-      eq(providerAccounts.tenantId, tenantId),
+      globalOrOwnedBy(providerAccounts.tenantId, tenantId),
     );
     try {
       const rows =
@@ -1115,14 +1434,6 @@ export class DrizzleProviderCatalogStore implements ProviderCatalogStore {
       createdAt: row.createdAt.toISOString(),
       sortIndex: row.sortIndex,
       ...(row.staticToken ? { staticToken: true } : {}),
-      lastRemainingCredit:
-        row.lastRemainingCredit === null || row.lastRemainingCredit === undefined
-          ? null
-          : Number(row.lastRemainingCredit),
-      lastRemainingPercent:
-        row.lastRemainingPercent === null || row.lastRemainingPercent === undefined
-          ? null
-          : Number(row.lastRemainingPercent),
     };
   }
 
@@ -1145,6 +1456,43 @@ export class DrizzleProviderCatalogStore implements ProviderCatalogStore {
     if (owned.length === 0) return [];
     return listAccountHealthEvents(this.db, accountId);
   }
+  async listBuddyGrowthTasks(
+    tenantId: string,
+    providerId: string,
+    accountId: string,
+    dayKey: string,
+  ): Promise<readonly BuddyGrowthTaskLedgerEntry[]> {
+    const owned = await this.db
+      .select({ id: providerAccounts.id })
+      .from(providerAccounts)
+      .where(
+        and(
+          eq(providerAccounts.id, accountId),
+          eq(providerAccounts.providerId, providerId),
+          globalOrOwnedBy(providerAccounts.tenantId, tenantId),
+        ),
+      )
+      .limit(1);
+    if (owned.length === 0) return [];
+    const rows = await this.db
+      .select({
+        accountId: buddyTaskLedger.accountId,
+        task: buddyTaskLedger.task,
+        claimedAt: buddyTaskLedger.claimedAt,
+      })
+      .from(buddyTaskLedger)
+      .where(
+        and(
+          eq(buddyTaskLedger.accountId, accountId),
+          eq(buddyTaskLedger.dayKey, dayKey),
+        ),
+      );
+    return rows.map((row) => ({
+      accountId: row.accountId,
+      task: row.task,
+      claimedAt: row.claimedAt.toISOString(),
+    }));
+  }
 
   async recoverAccount(
     tenantId: string,
@@ -1158,7 +1506,7 @@ export class DrizzleProviderCatalogStore implements ProviderCatalogStore {
         and(
           eq(providerAccounts.id, accountId),
           eq(providerAccounts.providerId, providerId),
-          eq(providerAccounts.tenantId, tenantId),
+          globalOrOwnedBy(providerAccounts.tenantId, tenantId),
         ),
       )
       .limit(1);

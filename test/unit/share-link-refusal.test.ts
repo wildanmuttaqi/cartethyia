@@ -16,17 +16,24 @@
  * Rows are written through the real pool and deleted in `afterAll`: the store
  * needs a Drizzle handle, which a rolled-back `PoolClient` cannot provide.
  */
-import { afterAll, describe, expect, test } from "bun:test";
+import { afterAll, expect, test } from "bun:test";
 import { randomUUID } from "node:crypto";
-import { DrizzleShareLinkStore, type ShareLinkRefusal } from "../../src/persistence/share-store";
+import { DrizzleShareLinkStore, type ShareLinkRefusal } from "../../src/persistence/stores/share-store";
 import { hashSecret } from "../../src/security/crypto";
-import { getDb } from "../../src/persistence/postgres";
-import { getTestPool, requireDatabase } from "../helpers/database";
+import { getDb } from "../../src/persistence/boot";
+import { dbDescribe, getTestPool, requireDatabase } from "../helpers/database";
 
 requireDatabase();
 
 const TOKEN_HASH_LENGTH = 64;
-const db = getDb();
+// Resolved on first use, not at collection: `getDb()` throws when the process
+// has no booted database, and collecting it here made the whole file fail —
+// including the blocks that never touch a database — on a machine with none.
+let cachedDb: ReturnType<typeof getDb> | undefined;
+function db(): ReturnType<typeof getDb> {
+  cachedDb ??= getDb();
+  return cachedDb;
+}
 
 /** One tenant shared by every seeded row, so teardown is a single delete. */
 let tenantId = "";
@@ -95,11 +102,11 @@ async function seedLink(options: SeedOptions = {}): Promise<string> {
 
 /** The refusal a token reports, or "resolved" if the link serves. */
 async function refusalFor(tokenHash: string): Promise<ShareLinkRefusal | "resolved"> {
-  const outcome = await new DrizzleShareLinkStore(db).resolveShareLinkOutcome(tokenHash);
+  const outcome = await new DrizzleShareLinkStore(db()).resolveShareLinkOutcome(tokenHash);
   return outcome.ok ? "resolved" : outcome.refusal;
 }
 
-describe("share link refusal", () => {
+dbDescribe("share link refusal", () => {
   test("a paused key refuses with `disabled`", async () => {
     expect(await refusalFor(await seedLink({ enabled: false }))).toBe("disabled");
   });
@@ -123,7 +130,7 @@ describe("share link refusal", () => {
 
   test("a healthy link resolves, and `resolveShareLink` still collapses to null", async () => {
     expect(await refusalFor(await seedLink())).toBe("resolved");
-    const store = new DrizzleShareLinkStore(db);
+    const store = new DrizzleShareLinkStore(db());
     expect(await store.resolveShareLink(await seedLink({ enabled: false }))).toBeNull();
   });
 

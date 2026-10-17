@@ -1,6 +1,6 @@
 import Redis from "ioredis";
 import { log } from "../observability/logger";
-import { timeoutAfter } from "../runtime/timeout";
+import { cancellableTimeout } from "../boot/timeout";
 import { encodeConnectionComponent, formatConnectionHost, requireConnectionUrl } from "./connection-url";
 
 export type RedisClient = InstanceType<typeof Redis>;
@@ -106,22 +106,18 @@ export async function closeRedis(options: CloseRedisOptions = {}): Promise<void>
   const c = globalThis.__cartethyiaRedis;
   if (!c) return;
   globalThis.__cartethyiaRedis = undefined;
+  const guard = cancellableTimeout(options.quitTimeoutMs ?? DEFAULT_QUIT_TIMEOUT_MS, "redis quit timed out");
   try {
-    await Promise.race([
-      c.quit(),
-      timeoutAfter(options.quitTimeoutMs ?? DEFAULT_QUIT_TIMEOUT_MS, "redis quit timed out"),
-    ]);
+    await Promise.race([c.quit(), guard.promise]);
   } catch {
     try {
       c.disconnect();
     } catch (error) {
       log.error("[redis] disconnect after quit timeout failed", error as Error);
     }
+  } finally {
+    guard.cancel();
   }
-}
-
-export function setRedisForTesting(testClient: RedisClient): void {
-  globalThis.__cartethyiaRedis = testClient;
 }
 
 /**

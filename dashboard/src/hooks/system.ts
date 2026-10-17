@@ -2,8 +2,8 @@ import { consoleRequest, fetchSessionUser } from "../data/api";
 import type { ApiErrorShape } from "../data/api";
 import { queryKeys } from "../data/query-keys";
 import type { SessionUser, UsageDimension } from "../data/contracts";
-import { assertAuditListPage, assertSystemHealth, assertUsageBy, assertUsageChart, assertUsageRequestDetail, assertUsageRequests, assertUsageSummary, querySignal } from "./common";
-import { DASHBOARD_QUERY_OPTIONS } from "../data/query-policy";
+import { assertAuditListPage, assertLatestRelease, assertSystemHealth, assertUsageBy, assertUsageChart, assertUsageRequestDetail, assertUsageRequests, assertUsageSummary, querySignal } from "../data/assert";
+import { DASHBOARD_QUERY_OPTIONS, POLL } from "../data/query-policy";
 import { useQuery } from "@tanstack/react-query";
 
 
@@ -30,7 +30,29 @@ export function useSystemHealth() {
         assertSystemHealth,
       ),
     ...DASHBOARD_QUERY_OPTIONS,
-    refetchInterval: 15_000,
+    refetchInterval: POLL.status,
+  });
+}
+
+/**
+ * Loads the latest public GitHub release, or `null` when none is known.
+ *
+ * Proxied through the console API rather than fetched from the browser, so a
+ * GitHub outage or rate limit is not one operator's console error. Checked on
+ * a slow cadence and never retried: a release is published rarely, and a failed
+ * check has no answer to retry into existence.
+ */
+export function useLatestRelease() {
+  return useQuery({
+    queryKey: queryKeys.releases.githubLatest,
+    queryFn: (context) =>
+      consoleRequest<unknown>("/updates/release", { signal: querySignal(context) }).then(
+        assertLatestRelease,
+      ),
+    ...DASHBOARD_QUERY_OPTIONS,
+    staleTime: 30 * 60_000,
+    refetchInterval: 30 * 60_000,
+    retry: false,
   });
 }
 
@@ -43,7 +65,7 @@ export function useUsageSummary(period: string) {
         signal: querySignal(context),
       }).then(assertUsageSummary),
     ...DASHBOARD_QUERY_OPTIONS,
-    refetchInterval: 10_000,
+    refetchInterval: POLL.status,
   });
 }
 
@@ -56,7 +78,7 @@ export function useUsageChart(period: string) {
         signal: querySignal(context),
       }).then(assertUsageChart),
     ...DASHBOARD_QUERY_OPTIONS,
-    refetchInterval: 10_000,
+    refetchInterval: POLL.status,
   });
 }
 
@@ -70,7 +92,7 @@ export function useUsageBy(period: string, dimension: UsageDimension) {
         { signal: querySignal(context) },
       ).then(assertUsageBy),
     ...DASHBOARD_QUERY_OPTIONS,
-    refetchInterval: 10_000,
+    refetchInterval: POLL.status,
   });
 }
 
@@ -91,7 +113,12 @@ export function useUsageRequests(
         { signal: querySignal(context) },
       ).then(assertUsageRequests),
     ...DASHBOARD_QUERY_OPTIONS,
-    refetchInterval: 5_000,
+    // Keep the previous page's rows visible while a larger `limit` loads. The
+    // key includes the limit, so without this a scroll-triggered page bump is
+    // treated as a brand-new query with no data: the table empties, the scroll
+    // container collapses, and the operator is thrown back to the top.
+    placeholderData: (previous) => previous,
+    refetchInterval: POLL.live,
   });
 }
 

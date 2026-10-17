@@ -4,7 +4,7 @@
  * names once through the SSRF policy and hands dispatch a validated fetch
  * (direct or pool-bound).
  */
-import type { CartethyiaDatabase } from "../../persistence/postgres";
+import type { CartethyiaDatabase } from "../../persistence/db-handle";
 import {
   isAddressAllowed,
   resolveAllAddresses,
@@ -12,22 +12,24 @@ import {
   type ValidatedDestination,
 } from "../ssrf";
 import { createValidatedFetch, type ValidatedFetch } from "../outbound-fetch";
-import { GatewayError } from "../../transport/gateway-error";
-import type { SsrfPolicy } from "../../config";
+import { GatewayError } from "../../protocol/gateway-error";
+import type { SsrfPolicy } from "../../config/network";
 import { log } from "../../observability/logger";
 import type { TransportKind, PoolAgent } from "./agent";
 import { isIP } from "node:net";
 import * as tls from "node:tls";
 import WebSocket, { type ClientOptions, type RawData } from "ws";
-import { isProxyAgentPair, createHttpProxyAgent, createSocks5Agent, createBridgeAgent, normalizeBridgeEndpoint, PoolBindingError } from "./agent";
+import { isProxyAgentPair, createHttpProxyAgent, createSocks5Agent, PoolBindingError } from "./agent";
 import { Agent as HttpsAgent } from "node:https";
 import { parseAgentConfig, ProxyConfigError, type AgentConfig } from "../types";
-import type { ProviderWebSocketSession, ValidatedOutboundWebSocket } from "../../providers/provider-registry";
+import type { ProviderWebSocketSession, ValidatedOutboundWebSocket } from "../../providers/provider-contracts";
 
 /** Idle time after which an unused pool agent is destroyed. */
 const POOL_AGENT_IDLE_MS = 10 * 60_000;
 /** Maximum number of concurrent pool agents to prevent unbounded growth. */
 const MAX_POOL_AGENTS = 1000;
+/** Minimum gap between idle-time sweeps; the per-resolve scan is the hot cost. */
+const POOL_AGENT_SWEEP_INTERVAL_MS = 30_000;
 
 export interface PoolAgentResolverDeps {
   readonly ssrfPolicy?: SsrfPolicy;
@@ -91,13 +93,6 @@ function endpointHostname(kind: TransportKind, endpoint: string): string | undef
       const url = new URL(authority);
       return url.hostname || undefined;
     }
-    if (kind === "bridge") {
-      // A bridge endpoint may be written bare (`relay.example.com`) or with the
-      // explicit `bridge://` marker; `normalizeBridgeEndpoint` folds both to the
-      // http(s) URL the pool dials, so this reads the same host the agent will.
-      const url = new URL(normalizeBridgeEndpoint(endpoint));
-      return url.hostname || undefined;
-    }
   } catch {
     return undefined;
   }
@@ -143,6 +138,7 @@ export class PoolAgentResolver {
   private readonly agents = new Map<string, Promise<PoolAgent>>();
   private readonly lastUsed = new Map<string, number>();
   private readonly ssrfPolicy: SsrfPolicy;
+  private lastIdleSweepAt = 0;
   private readonly resolveFn: (
     hostname: string,
     signal: AbortSignal,
@@ -182,18 +178,26 @@ export class PoolAgentResolver {
    *
    * Also enforces a hard cardinality ceiling (MAX_POOL_AGENTS) by evicting
    * the least-recently-used entries when the cache exceeds the cap.
+   *
+   * The idle-time scan is throttled to once per 30 s: it walks the whole map
+   * on every dispatch otherwise. The over-cap eviction still runs per call —
+   * it only allocates when actually over the ceiling.
    */
   private evictIdleAgents(): void {
-    const cutoff = Date.now() - POOL_AGENT_IDLE_MS;
-    for (const [key, usedAt] of this.lastUsed) {
-      if (usedAt >= cutoff) continue;
-      this.lastUsed.delete(key);
-      const pending = this.agents.get(key);
-      this.agents.delete(key);
-      if (pending) {
-        void pending
-          .then((agent) => destroyAgent(agent))
-          .catch(() => undefined);
+    const now = Date.now();
+    if (now - this.lastIdleSweepAt >= POOL_AGENT_SWEEP_INTERVAL_MS) {
+      this.lastIdleSweepAt = now;
+      const cutoff = now - POOL_AGENT_IDLE_MS;
+      for (const [key, usedAt] of this.lastUsed) {
+        if (usedAt >= cutoff) continue;
+        this.lastUsed.delete(key);
+        const pending = this.agents.get(key);
+        this.agents.delete(key);
+        if (pending) {
+          void pending
+            .then((agent) => destroyAgent(agent))
+            .catch(() => undefined);
+        }
       }
     }
     // Evict oldest entries if over the cardinality ceiling
@@ -211,6 +215,12 @@ export class PoolAgentResolver {
         }
       }
     }
+  }
+
+  /** Drops agents idle past the retention window. Safe to call from maintenance. */
+  sweepIdleAgents(): void {
+    this.lastIdleSweepAt = 0;
+    this.evictIdleAgents();
   }
 
   async closeAll(): Promise<void> {
@@ -259,8 +269,7 @@ export class PoolAgentResolver {
     switch (row.kind) {
       case "http":
       case "https":
-      case "socks5":
-      case "bridge": {
+      case "socks5": {
         const hostname = endpointHostname(row.kind, row.endpoint);
         if (hostname) await validateDialHost(hostname, this.ssrfPolicy, this.resolveFn);
         // The policy is handed to the agent too: both flavors re-resolve and
@@ -270,8 +279,6 @@ export class PoolAgentResolver {
         // pool that carried them.
         if (row.kind === "socks5")
           return createSocks5Agent(row.endpoint, row.credential, this.ssrfPolicy, agentConfig, poolId);
-        if (row.kind === "bridge")
-          return createBridgeAgent(row.endpoint, row.credential, this.ssrfPolicy, agentConfig, poolId);
         return createHttpProxyAgent(row.endpoint, row.credential, this.ssrfPolicy, agentConfig, poolId);
       }
       default:

@@ -1,12 +1,12 @@
-import type { ApiKeyProviderSpec } from "../configured-provider";
+import type { ApiKeyProviderSpec } from "../../configured-provider";
 
 const XIAOMIPG_PROVIDER_ID = "xiaomipg" as const;
 const XIAOMITP_PROVIDER_ID = "xiaomitp" as const;
 
 
 
-import { defineModel } from "../../model-definition";
-import type { ModelDefinition } from "../../provider-registry";
+import { defineModel } from "../../provider-model-definition";
+import type { ModelDefinition } from "../../provider-model-definition";
 
 export const XIAOMI_MODELS: readonly ModelDefinition[] = [
   defineModel({

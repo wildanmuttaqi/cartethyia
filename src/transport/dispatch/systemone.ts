@@ -1,9 +1,9 @@
-import type { ProviderAdapter, ProviderDispatchTarget } from "../../providers/provider-registry";
-import { GatewayError } from "../gateway-error";
+import type { ProviderAdapter, ProviderDispatchTarget } from "../../providers/provider-contracts";
+import { GatewayError } from "../../protocol/gateway-error";
 import { resolveCredentialForAccount } from "../../providers/operations/provider-credential-service";
 import type { OAuthTokenRefresher, OAuthRefreshService } from "../../providers/authentication/oauth-refresh-service";
 import type { ValidatedNetworkBindingFactory } from "../../network/pool/resolver";
-import type { CartethyiaDatabase } from "../../persistence/postgres";
+import type { CartethyiaDatabase } from "../../persistence/db-handle";
 import type { RouteSnapshotService } from "../routing/route-model";
 import { metrics } from "../../observability/metrics";
 import type { NetworkPoolSelector } from "../../network/pool/selector";
@@ -12,7 +12,7 @@ import { ProxyRequestStateStore } from "../request/state";
 import { ProxyRequestPreparer } from "../request/preparer";
 import { parseThinkingSuffix } from "../translation/thinking";
 import { completeAttempt, estimatedUsage } from "./attempt-finalize";
-import { repriceUsage, usageFromProvider } from "../../providers/usage";
+import { repriceUsage, usageFromProvider } from "../../providers/provider-usage";
 import { runAttemptLoop } from "./attempt-loop";
 
 /**
@@ -134,11 +134,12 @@ export function createSystemoneHandler(deps: SystemoneHandlerDeps) {
           provider_id: candidate.provider_id as ProviderAdapter["provider_id"],
           model_id: candidate.model_id,
           wire_family: candidate.wire_family,
+          ...(candidate.output_limit == null ? {} : { output_limit: candidate.output_limit }),
           endpoint_path: candidate.endpoint,
           capabilities: candidate.capability_profile,
         };
         // The caller names the model with its provider prefix
-        // (`opencodeft/jev-1.13-free`); upstream expects the row's own bare id.
+        // (`opencode/jev-1.13-free`); upstream expects the row's own bare id.
         // Every canonical dispatch rewrites `model` to `candidate.model_id`
         // (via the codecs), so the native body must do the same or the decision
         // endpoint answers "Model … is not supported".

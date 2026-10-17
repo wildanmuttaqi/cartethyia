@@ -5,18 +5,24 @@ import {
   primaryKey, text, timestamp, uniqueIndex, uuid, type AnyPgColumn,
 } from "drizzle-orm/pg-core";
 
-// Exactly id, name, status, created_at — no status enum/default or extra
-// lifecycle column.
-export const tenants = pgTable("tenants", {
-  id: uuid("id").primaryKey().defaultRandom(),
-  name: text("name").notNull(),
-  status: text("status").notNull(),
-  // Intentionally inline (not createdAtColumn()): this root table is imported
-  // by the helpers below sharing the helper here would make a use-before-define.
-  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
-});
+export const TENANT_STATUSES = ["active", "suspended", "deleted"] as const;
+export type TenantStatus = (typeof TENANT_STATUSES)[number];
 
-export type Tenant = typeof tenants.$inferSelect;
+export const tenants = pgTable(
+  "tenants",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    name: text("name").notNull(),
+    status: text("status").$type<TenantStatus>().notNull(),
+    // Intentionally inline (not createdAtColumn()): this root table is imported
+    // by the helpers below; sharing the helper here would make a use-before-define.
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => [
+    check("tenants_status_check", sql`${table.status} IN ('active', 'suspended', 'deleted')`),
+  ],
+);
 
 // Canonical tenant/timestamp column definitions shared by every table.
 
@@ -79,15 +85,39 @@ export const bytea = customType<{ data: Buffer }>({
 // deadline the sweep honors), and a fault that needs an operator is `disabled`.
 export const healthStatus = pgEnum("health_status", ["active", "cooldown", "disabled"]);
 
+/**
+ * The health state machine shared by `provider_accounts` and `network_pools`.
+ * One definition, because the two tables are driven by the same transitions and
+ * a column added to one of them by hand is how they drift.
+ */
+export function healthColumns() {
+  return {
+    status: healthStatus("status").notNull().default("active"),
+    consecutiveFailures: integer("consecutive_failures").notNull().default(0),
+    lastSuccessAt: timestamp("last_success_at", { withTimezone: true }),
+    lastError: text("last_error"),
+    lastErrorCategory: text("last_error_category"),
+    lastErrorAt: timestamp("last_error_at", { withTimezone: true }),
+    cooldownUntil: timestamp("cooldown_until", { withTimezone: true }),
+    lastRecoveredAt: timestamp("last_recovered_at", { withTimezone: true }),
+  };
+}
+
 export const credentialKind = pgEnum("credential_kind", ["api_key", "oauth", "none"]);
 
 // Shared wire-family domain used by providers.wire_family_default and
 // models.wire_family.
-export const wireFamily = pgEnum("wire_family", ["chat", "responses", "messages"]);
+//
+// `gemini` is Factory's native generateContent wire. Added by forward
+// migration `0002_add_gemini_wire_family.sql`; the enum here must stay in
+// step with what that migration applies, or a fresh database (built from the
+// baseline) and a migrated one would disagree.
+export const wireFamily = pgEnum("wire_family", ["chat", "responses", "messages", "gemini"]);
 
-// `bridge` is a carte-bridge instance dialed as an application relay (or a
-// CONNECT tunnel where the runtime holds a socket) rather than an RFC proxy.
-export const networkPoolKind = pgEnum("network_pool_kind", ["http", "socks5", "bridge"]);
+// `https` is a hosted relay front door (Vercel, Cloudflare, Deno, Netlify):
+// plain HTTP CONNECT to an origin that terminates TLS itself, so the transport
+// is recorded as what it speaks rather than as a generic proxy.
+export const networkPoolKind = pgEnum("network_pool_kind", ["http", "https", "socks5"]);
 
 //  health_events.entity_kind — distinguishes which owning
 // table entity_id/account_id/network_pool_id references.
@@ -108,7 +138,7 @@ export const telemetryStatus = pgEnum("telemetry_status", [
 ]);
 
 // The id matches the seven canonical builtin IDs (openai, anthropic, claude,
-// codex, opencodezen, ollamacloud, cerebras) or a custom/BYOK slug
+// codex, opencode-zen, ollamacloud, cerebras) or a custom/BYOK slug
 // rejected at the identity boundary when it collides case-insensitively with
 // a reserved ID — that rejection is application-layer, not a DB constraint
 // here. `capability_profile` is a JSONB routing-capability map with no index:
@@ -140,14 +170,11 @@ export const providers = pgTable(
   },
 );
 
-export type Provider = typeof providers.$inferSelect;
-
 // Upstream account credentials plus the full health state machine.
 // `tenant_id` null means the account is shared pool-wide; populated means
 // tenant-owned/BYOK. The concurrency ceiling lives in provider routing
 // (`provider_routing_settings.max_inflight`) and network pools
-// (`network_pools.max_inflight`); the per-account override that once sat here
-// was retired by `0029_retire_per_account_max_inflight.sql`.
+// (`network_pools.max_inflight`); the per-account override no longer exists.
 export const providerAccounts = pgTable("provider_accounts", {
   id: uuid("id").primaryKey().defaultRandom(),
   providerId: text("provider_id")
@@ -173,16 +200,20 @@ export const providerAccounts = pgTable("provider_accounts", {
   authState: jsonb("auth_state"),
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
 
-  // Health state machine columns.
-  status: healthStatus("status").notNull().default("active"),
-  consecutiveFailures: integer("consecutive_failures").notNull().default(0),
-  lastSuccessAt: timestamp("last_success_at", { withTimezone: true }),
-  lastError: text("last_error"),
-  lastErrorCategory: text("last_error_category"),
-  lastErrorAt: timestamp("last_error_at", { withTimezone: true }),
-  cooldownUntil: timestamp("cooldown_until", { withTimezone: true }),
-  lastRecoveredAt: timestamp("last_recovered_at", { withTimezone: true }),
+  ...healthColumns(),
   modelCooldowns: jsonb("model_cooldowns").notNull().default({}),
+  /**
+   * How many times each model has been reported unsupported for this account:
+   * `{ [modelId]: hits }`. Written only by the unsupported-model path, and it
+   * is the escalation level for that pair's cooldown.
+   *
+   * Deliberately a separate column from `model_cooldowns`: that value is
+   * `{ [modelId]: deadline }`, read by routing (`route-catalog.ts`) and by the
+   * console, and widening it to `{until, hits}` would have changed a shape two
+   * independent readers parse. Nullable — an account that never hit an
+   * unsupported model has nothing to count.
+   */
+  modelBlockHits: jsonb("model_block_hits").$type<Readonly<Record<string, number>>>(),
   /**
    * Stable list position within (tenant, provider). Accounts were ordered by
    * `created_at`, which let two same-millisecond rows swap between loads; this
@@ -201,26 +232,32 @@ export const providerAccounts = pgTable("provider_accounts", {
    */
   staticToken: boolean("static_token").notNull().default(false),
   /**
-   * Last remaining credit fetched by the quota sweep, cached on the row so the
-   * request path can compare it against the provider's minimum balance
-   * without a live provider round trip. `null` means no credit figure has ever
-   * been fetched.
+   * When this account's credential was last read for its own identity (email,
+   * display name). Null means never read.
+   *
+   * This is the convergence stamp for the enrichment sweep, and the reason an
+   * import can be instant: the batch path persists the credential without
+   * parsing it, and the sweep fills the identity in afterwards. An account is
+   * only listed while this is null, so a completed pass never re-decrypts a
+   * credential it already read.
    */
-  lastRemainingCredit: numeric("last_remaining_credit", { precision: 16, scale: 4 }),
+  identityCheckedAt: timestamp("identity_checked_at", { withTimezone: true }),
   /**
-   * Lowest remaining quota percent fetched by the quota sweep (Codex weekly,
-   * Muse rolling/weekly), for providers that report percent windows instead
-   * of absolute credits. The minimum-balance floor compares in whichever unit
-   * the account reported — credits when present, otherwise this percent.
-   * `null` means no percent figure has ever been fetched.
+   * Email read out of the account's own JWT claims. Cosmetic: it names the
+   * account in the console and is never used to authenticate or route.
    */
-  lastRemainingPercent: numeric("last_remaining_percent", { precision: 8, scale: 3 }),
+  accountEmail: text("account_email"),
 
   },
   (table) => [
     uniqueIndex("provider_accounts_identity_uidx").on(
       table.providerId,
-      sql`coalesce(${table.tenantId}, '00000000-0000-0000-0000-000000000000'::uuid)`,
+      // No `::uuid` cast: the migrations create this index without one on
+      // SQLite (baseline l.440) and with one on Postgres (l.423), and the
+      // Drizzle definition is what a test's in-memory database is built
+      // from — a Postgres-only cast there made every account insert fail
+      // with `unrecognized token: ":"`.
+      sql`coalesce(${table.tenantId}, '00000000-0000-0000-0000-000000000000')`,
       table.credentialFingerprint,
     ),
     index("provider_accounts_status_cooldown_idx").on(table.status, table.cooldownUntil),
@@ -305,10 +342,12 @@ export const models = pgTable(
       table.endpointPath,
     ),
     index("models_provider_enabled_idx").on(table.providerId, table.enabled),
+    // Bare-id lookups, with no provider named: see migration
+    // `0003_add_models_model_id_index`. Without it those seq-scan this table,
+    // which carries one row per provider x model x route.
+    index("models_model_id_idx").on(table.modelId),
   ],
 );
-
-export type Model = typeof models.$inferSelect;
 
 // Tenant-scoped suppression of a GLOBAL/built-in model. Tenants cannot mutate
 // the shared `models` row (see `DrizzleProviderCatalogStore.setModelEnabled`),
@@ -342,6 +381,13 @@ export const networkPools = pgTable("network_pools", {
   id: uuid("id").primaryKey().defaultRandom(),
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
   kind: networkPoolKind("kind").notNull(),
+  /**
+   * Operator-set family/tag for this pool, e.g. `residential-id` or
+   * `datacenter-sg`. Purely organisational: it names which family the node
+   * belongs to and nothing in routing or dispatch reads it. Null when the
+   * operator has not tagged the pool.
+   */
+  family: text("family"),
   endpointConfig: jsonb("endpoint_config").notNull(),
   credentialCiphertext: bytea("credential_ciphertext"),
   maxInflight: integer("max_inflight"),
@@ -349,15 +395,8 @@ export const networkPools = pgTable("network_pools", {
   weight: integer("weight"),
   tenantId: tenantRefRequired(),
 
-  status: healthStatus("status").notNull().default("active"),
-  consecutiveFailures: integer("consecutive_failures").notNull().default(0),
-  lastSuccessAt: timestamp("last_success_at", { withTimezone: true }),
+  ...healthColumns(),
   lastLatencyMs: integer("last_latency_ms"),
-  lastError: text("last_error"),
-  lastErrorCategory: text("last_error_category"),
-  lastErrorAt: timestamp("last_error_at", { withTimezone: true }),
-  cooldownUntil: timestamp("cooldown_until", { withTimezone: true }),
-  lastRecoveredAt: timestamp("last_recovered_at", { withTimezone: true }),
   lastHealthCheckAt: timestamp("last_health_check_at", { withTimezone: true }),
   /** Public egress address reported by the last successful probe; null until probed. */
   egressIp: text("egress_ip"),
@@ -373,6 +412,32 @@ export const networkPools = pgTable("network_pools", {
   lastSpeedtestError: text("last_speedtest_error"),
   /** When the last speed-test ran. */
   lastSpeedtestAt: timestamp("last_speedtest_at", { withTimezone: true }),
+  /**
+   * Provider-scoped probe verdict, stored beside the other last-known facts
+   * (`egress_ip`, `last_latency_ms`, the speed-test columns) rather than in the
+   * browser.
+   *
+   * It lived in `localStorage` first, and that made it decorative: the verdict
+   * was visible to the operator who ran it and to nobody else — not to another
+   * machine, not to the gateway, and not to admission. A pool could read
+   * "OpenCode blocked" on screen while dispatch kept sending traffic through
+   * it, because nothing outside that one browser had ever heard the verdict.
+   *
+   * `null` means never probed. These describe the *address* recorded in
+   * `egress_ip` at the time, so a changed endpoint clears them.
+   */
+  providerProbeProviderId: text("provider_probe_provider_id"),
+  /** `allowed` | `blocked` | `throttled` | `unreachable`; null until probed. */
+  providerProbeStatus: text("provider_probe_status"),
+  /** Upstream HTTP status when a response arrived. */
+  providerProbeHttpStatus: integer("provider_probe_http_status"),
+  /** Operator-facing reason: the upstream's own words, or why the probe failed. */
+  providerProbeReason: text("provider_probe_reason"),
+  providerProbeLatencyMs: integer("provider_probe_latency_ms"),
+  providerProbeAt: timestamp("provider_probe_at", { withTimezone: true }),
+  /** The endpoint the verdict was measured against. Compared on read, so an
+   * edited endpoint reports "never probed" instead of a stale verdict. */
+  providerProbeEndpoint: text("provider_probe_endpoint"),
   /** Metered egress totals, flushed from the in-memory socket counters on
    * every pool-touching write so the quota bar survives a restart. */
   bytesSentTotal: bigint("bytes_sent_total", { mode: "number" }).notNull().default(0),
@@ -382,6 +447,7 @@ export const networkPools = pgTable("network_pools", {
   (table) => [
     index("network_pools_tenant_id_idx").on(table.tenantId),
     index("network_pools_status_cooldown_idx").on(table.status, table.cooldownUntil),
+    index("network_pools_family_idx").on(table.family),
   ],
 );
 
@@ -407,6 +473,7 @@ export const healthEvents = pgTable(
   },
   (table) => [
     index("health_events_account_id_created_at_idx").on(table.accountId, table.createdAt),
+    index("health_events_account_model_created_idx").on(table.accountId, table.modelId, table.createdAt),
     index("health_events_network_pool_id_created_at_idx").on(table.networkPoolId, table.createdAt),
     check(
       "health_events_entity_reference_check",
@@ -419,11 +486,10 @@ export const healthEvents = pgTable(
 // Model aliasing & combos: replaces the dormant, disconnected
 // `routing_policies` scaffolding. Aliases resolve a client-facing name to a
 // real model; combos back a client-facing name with >=1 real models,
-// auto-selected via `fallback`, `round_robin`, or `fusion`.
+// auto-selected via `fallback` or `round_robin`.
 export const modelComboStrategy = pgEnum("model_combo_strategy", [
   "fallback",
   "round_robin",
-  "fusion",
 ]);
 
 /** Canonical `ComboStrategy` union, derived from the enum above. Console
@@ -439,7 +505,7 @@ export const modelAliases = pgTable(
     tenantId: tenantRefRequired(),
     alias: text("alias").notNull(),
     targetModel: text("target_model").notNull(),
-    /** Explicit list position; see `0019_list_sort_index.sql`. */
+    /** Explicit list position. */
     sortIndex: integer("sort_index").notNull().default(0),
     ...timestampColumns(),
   },
@@ -455,7 +521,7 @@ export const modelCombos = pgTable(
     name: text("name").notNull(),
     members: jsonb("members").notNull().$type<string[]>(),
     strategy: modelComboStrategy("strategy").notNull().default("fallback"),
-    /** Explicit list position; see `0019_list_sort_index.sql`. */
+    /** Explicit list position. */
     sortIndex: integer("sort_index").notNull().default(0),
     ...timestampColumns(),
   },
@@ -467,6 +533,23 @@ export const providerRoutingStrategy = pgEnum("provider_routing_strategy", [
   "fallback",
   "round_robin",
 ]);
+
+/**
+ * Canonical provider-routing strategy union, derived from the enum above so
+ * the persisted values and the type cannot drift. The console catalog and the
+ * routing engine both import this instead of restating the two literals.
+ */
+export type ProviderRoutingStrategy = (typeof providerRoutingStrategy.enumValues)[number];
+
+/**
+ * Per-account inflight ceiling applied when a provider has no routing row yet.
+ * One literal: the console default and the route catalog's fallback both read
+ * it. `null` is the "unlimited" choice, and it is also this default — an
+ * operator who has never opened the routing card asked for no ceiling, and
+ * inventing one silently capped their concurrency. A ceiling they *did* set is
+ * still honoured, so this only decides the untouched case.
+ */
+export const DEFAULT_PROVIDER_MAX_INFLIGHT: null = null;
 
 export const providerRoutingSettings = pgTable(
   "provider_routing_settings",
@@ -483,22 +566,42 @@ export const providerRoutingSettings = pgTable(
      * `null` = UNLIMITED concurrency per account. */
     maxInflight: integer("max_inflight"),
     /**
-     * Minimum-balance protection for every account of this provider/tenant:
-     * when enabled, routing skips any account whose last fetched remaining
-     * balance is at or below `creditLimit` — credits for credit providers,
-     * percent for quota-percent providers. Opt-in per provider; off unless the
-     * operator enables it.
+     * Per-pool inflight ceiling for this provider: how many concurrent
+     * requests one proxy pool may carry *for this provider*.
+     *
+     * A second, independent axis from `maxInflight`. That one bounds a single
+     * account; `network_pools.max_inflight` bounds a pool across every
+     * provider; this one bounds one provider's share of one pool. All three
+     * are enforced together — none replaces another.
+     *
+     * `null` = unlimited, and that is the default: a provider nobody has
+     * configured behaves exactly as it did before this column existed, with no
+     * extra Redis key and no extra round trip.
      */
-    creditLimitEnabled: boolean("credit_limit_enabled").notNull().default(false),
-    /** Minimum balance to keep unused on every account; credits or percent. */
-    creditLimit: integer("credit_limit").notNull().default(50),
+    maxInflightPerProxy: integer("max_inflight_per_proxy"),
+    /**
+     * Minimum remaining allowance an account must hold to stay routable, for
+     * this provider. `null` means no floor. Compared against the account's own
+     * unit: absolute remaining credit when the provider reports credits, the
+     * aggregate credit percentage and lowest independent percentage window
+     * otherwise. An account below it is skipped and the request fails over to
+     * the next account instead of erroring.
+     */
+    usageFloor: integer("usage_floor"),
+    /** `credit` compares the summed remaining credit; `percent` compares the
+     * aggregate credit percentage and lowest independent percentage-only
+     * window. Ignored while `usageFloor` is null. */
+    usageFloorUnit: text("usage_floor_unit").$type<"credit" | "percent">().notNull().default("percent"),
     enabled: boolean("enabled").notNull().default(false),
     // Route-selected User-Agent for built-in API-key providers; OAuth and BYOK identities stay native.
-    userAgent: text("user_agent").notNull().default("codex_cli_rs/0.156.1"),
+    // The column default is the Claude Code CLI identity; the live default for a
+    // row that never set one is `buildClaudeCliUserAgent()` in
+    // providers/operations/custom-cli-headers.ts, which this mirrors.
+    userAgent: text("user_agent").notNull().default("claude-cli/2.1.293 (external, cli)"),
     // When true, this provider's requests always dial direct. When false,
     // dispatch automatically selects among every active network pool the
     // tenant owns (least-loaded/non-cooldown) — never an admin-pinned pool.
-    bypassProxy: boolean("bypass_proxy").notNull().default(false),
+    skipProxy: boolean("skip_proxy").notNull().default(false),
   },
   (table) => ({
     tenantProviderUnique: uniqueIndex("provider_routing_settings_tenant_provider_idx").on(
@@ -532,7 +635,6 @@ export const poolRoutingSettings = pgTable("pool_routing_settings", {
   /** Requests served by one pool before round robin advances. */
   rotateCount: integer("rotate_count").notNull().default(1),
 });
-export type PoolRoutingSettings = typeof poolRoutingSettings.$inferSelect;
 
 
 export const API_KEY_MODES = ["personal", "share"] as const;
@@ -570,22 +672,14 @@ export const apiKeys = pgTable(
     scopes: jsonb("scopes").notNull().$type<readonly string[]>(),
     // Only the non-secret public key prefix is returned to the owner.
     keyPrefix: text("key_prefix"),
-    // Personal keys retain an encrypted copy for the Studio handoff. Shared
+    // Personal keys retain an encrypted copy for the CLI handoff. Shared
     // children are revealed once and persist only their authentication hash.
     keyEncrypted: bytea("key_encrypted"),
     notesTitle: text("notes_title"),
     notesSubtitle: text("notes_subtitle"),
     notesBody: text("notes_body"),
-    /** Explicit list position; see `0019_list_sort_index.sql`. */
+    /** Explicit list position. */
     sortIndex: integer("sort_index").notNull().default(0),
-    // One popup, no donation/information type: the owner edits its copy freely.
-    sharePopupEnabled: boolean("share_popup_enabled").notNull().default(false),
-    // The popup art is uploaded and served from this row; a remote URL would
-    // leak the visitor's IP to a third party and rot when the host moves.
-    sharePopupImage: bytea("share_popup_image"),
-    sharePopupImageMime: text("share_popup_image_mime"),
-    sharePopupTitle: text("share_popup_title"),
-    sharePopupBody: text("share_popup_body"),
     requestsPerMinute: integer("requests_per_minute"),
     dailyTokenLimit: bigint("daily_token_limit", { mode: "number" }),
     monthlyTokenLimit: bigint("monthly_token_limit", { mode: "number" }),
@@ -618,13 +712,19 @@ export const apiKeys = pgTable(
     createdAt: createdAtColumn(),
     enabled: boolean("enabled").notNull().default(true),
     revokedAt: timestamp("revoked_at", { withTimezone: true }),
+    /**
+     * The tenant's mandatory gateway key. Seeded at first boot whether or not
+     * `CARTETHYIA_API_KEY` was configured, and the one key the console refuses
+     * to revoke — it may only be rotated. A column rather than a label match,
+     * so renaming the key cannot break the CLI lookup or let a second
+     * default be created.
+     */
+    isDefault: boolean("is_default").notNull().default(false),
   },
   (table) => [
     uniqueIndex("api_keys_key_hash_idx").on(table.keyHash),
-    uniqueIndex("api_keys_active_shared_ip_uidx")
-      .on(table.issuedClientIpKey)
-      .where(sql`${table.parentKeyId} IS NOT NULL AND ${table.revokedAt} IS NULL`),
     index("api_keys_tenant_id_idx").on(table.tenantId),
+    index("api_keys_enabled_tenant_idx").on(table.tenantId).where(sql`${table.enabled} = true`),
     index("api_keys_parent_key_id_idx").on(table.parentKeyId),
     check(
       "api_keys_mode_shape_check",
@@ -647,7 +747,37 @@ export const apiKeys = pgTable(
   ],
 );
 
-export type ApiKey = typeof apiKeys.$inferSelect;
+/**
+ * The optional popup a share link shows its recipient. Kept off `api_keys`
+ * because the auth path reads that row on every request and the popup is
+ * absent for nearly all of them. One row per key, present only when the owner
+ * configured one.
+ */
+export const sharePopups = pgTable(
+  "share_popups",
+  {
+    apiKeyId: uuid("api_key_id")
+      .primaryKey()
+      .references(() => apiKeys.id, { onDelete: "cascade" }),
+    enabled: boolean("enabled").notNull().default(false),
+    image: bytea("image"),
+    imageMime: text("image_mime"),
+    title: text("title"),
+    body: text("body"),
+  },
+  (table) => [
+    check(
+      "share_popups_image_mime_check",
+      sql`${table.imageMime} IS NULL OR ${table.imageMime} IN ('image/png', 'image/jpeg', 'image/webp', 'image/gif')`,
+    ),
+    check(
+      "share_popups_image_size_check",
+      sql`${table.image} IS NULL OR octet_length(${table.image}) <= 2097152`,
+      // SQLite has no octet_length. The generator rewrites this check to
+      // `length(`; both count bytes for a blob column.
+    ),
+  ],
+);
 
 
 // Public bearer links for enrolling one shared key per resolved client IP, and
@@ -680,14 +810,12 @@ export const shareLinks = pgTable(
     active: boolean("active").notNull().default(true),
     createdAt: createdAtColumn(),
     expiresAt: timestamp("expires_at", { withTimezone: true }),
-    // Retained for historical rows from the retired one-time setup-link flow.
-    usedAt: timestamp("used_at", { withTimezone: true }),
     lastViewedAt: timestamp("last_viewed_at", { withTimezone: true }),
   },
   (table) => [
     uniqueIndex("share_links_token_hash_idx").on(table.tokenHash),
-    index("idx_share_links_api_key").on(table.apiKeyId),
-    index("idx_share_links_active").on(table.active, table.kind, table.expiresAt),
+    index("share_links_api_key_idx").on(table.apiKeyId),
+    index("share_links_active_kind_expires_idx").on(table.active, table.kind, table.expiresAt),
     check("share_links_kind_check", sql`${table.kind} IN ('enroll', 'handoff')`),
   ],
 );
@@ -711,8 +839,8 @@ export const consoleUsers = pgTable(
     ...timestampColumns(),
   },
   (table) => [
-    index("idx_console_users_tenant_id").on(table.tenantId),
-    uniqueIndex("idx_console_users_username").on(table.username),
+    index("console_users_tenant_id_idx").on(table.tenantId),
+    uniqueIndex("console_users_tenant_username_uidx").on(table.tenantId, table.username),
   ],
 );
 
@@ -736,7 +864,7 @@ export const consoleSessions = pgTable(
     createdAt: createdAtColumn(),
   },
   (table) => [
-    index("idx_console_sessions_user_id").on(table.userId),
+    index("console_sessions_user_id_idx").on(table.userId),
   ],
 );
 
@@ -811,7 +939,7 @@ export interface ConsoleSettingsPreferences {
   /** PonyTail directive intensity; `full` when unset. Only applied when enabled. */
   ponyTailLevel?: "lite" | "full" | "ultra" | null;
   /**
-   * Payload capture mode (default `metadata` when unset):
+   * Payload capture mode (default `none` when unset):
    * - `metadata` — Proxy→Provider method + allowlisted headers only
    * - `full` — full redacted bodies up to the configured capture limit
    * - `none` — no drawer capture (request metadata events still retained)
@@ -821,8 +949,8 @@ export interface ConsoleSettingsPreferences {
    * Capture depth for `full` mode (default `minimum` when unset). Fixed size
    * tiers so every debug sees all four drawer panels — only the cap changes:
    * - `minimum` — 1 MiB combined cap, light enough to leave on
-   * - `moderate` — 16 MiB combined cap, expect CPU/memory spikes while active
-   * - `maximum` — 32 MiB combined cap, expect CPU/memory spikes while active
+   * - `moderate` — 8 MiB combined cap, expect CPU/memory spikes while active
+   * - `maximum` — 16 MiB combined cap, expect CPU/memory spikes while active
    */
   telemetryPayloadDepth?: "minimum" | "moderate" | "maximum";
   privacyMode?: "masked" | "full";
@@ -894,10 +1022,20 @@ export const telemetryEvents = pgTable(
   {
     id: uuid("id").primaryKey().defaultRandom(),
     createdAt: createdAtColumn(),
-    tenantId: uuid("tenant_id").notNull().references(() => tenants.id, { onDelete: "cascade" }),
+    tenantId: tenantRefRequired(),
     requestId: uuid("request_id").notNull(),
     sourceSurface: telemetrySourceSurface("source_surface"),
     requestedModel: text("requested_model"),
+    /**
+     * The `model` the upstream put in its own response, verbatim.
+     *
+     * Separate from `requested_model` because they answer different questions:
+     * one is what the client asked for, the other is what the provider said it
+     * ran. A provider that answers `muse-spark` as `deepseek-v4.1-flash` is
+     * telling the operator something, and overwriting one with the other would
+     * erase it. NULL when the response carried no model.
+     */
+    reportedModel: text("reported_model"),
     /** Canonical reasoning effort the client asked for; NULL when it asked for none. */
     requestedEffort: text("requested_effort"),
     providerId: text("provider_id"),
@@ -950,9 +1088,17 @@ export const telemetryEvents = pgTable(
     // and keeps the columns JSON-safe like the token-budget bigints above.
     firstContentDeltaAtMs: bigint("first_content_delta_at_ms", { mode: "number" }),
     lastEventAtMs: bigint("last_event_at_ms", { mode: "number" }),
+    /**
+     * Why this request's drawer payloads were not captured, or `captured` when
+     * they were. Remote-diagnosis column: the drawer reads empty for reasons
+     * that are invisible from the client — the tenant's capture mode, a missing
+     * tenant, a non-terminal attempt — and without this an operator could not
+     * tell "not configured" from "broken".
+     */
+    payloadCaptureState: text("payload_capture_state"),
   },
   (table) => [
-    index("idx_telemetry_created_at").on(table.createdAt),
+    index("telemetry_events_created_at_idx").on(table.createdAt),
     index("telemetry_events_tenant_created_idx").on(table.tenantId, table.createdAt),
     index("telemetry_events_request_id_idx").on(table.requestId),
     index("telemetry_events_tenant_account_created_idx").on(
@@ -976,9 +1122,7 @@ export type TelemetryUsageIdentityType = (typeof TELEMETRY_USAGE_IDENTITY_TYPES)
 export const telemetryUsageTotals = pgTable(
   "telemetry_usage_totals",
   {
-    tenantId: uuid("tenant_id")
-      .notNull()
-      .references(() => tenants.id, { onDelete: "cascade" }),
+    tenantId: tenantRefRequired(),
     identityType: text("identity_type").$type<TelemetryUsageIdentityType>().notNull(),
     entityId: uuid("entity_id").notNull(),
     requests: bigint("requests", { mode: "number" }).notNull().default(0),
@@ -1005,7 +1149,7 @@ export const telemetryPayloads = pgTable(
   "telemetry_payloads",
   {
     id: uuid("id").primaryKey().defaultRandom(),
-    tenantId: uuid("tenant_id").notNull().references(() => tenants.id, { onDelete: "cascade" }),
+    tenantId: tenantRefRequired(),
     requestId: uuid("request_id"),
     capturedAt: timestamp("captured_at", { withTimezone: true }).notNull().defaultNow(),
     expiresAt: timestamp("expires_at", { withTimezone: true }).notNull(),
@@ -1026,7 +1170,7 @@ export const telemetryPayloads = pgTable(
     index("telemetry_payloads_request_id_idx").on(table.requestId),
     index("telemetry_payloads_tenant_request_idx").on(table.tenantId, table.requestId),
     index("telemetry_payloads_expires_idx").on(table.expiresAt),
-    check("telemetry_payloads_storage_check", sql`${table.storage} = 'jsonb-file'`),
+    check("telemetry_payloads_storage_check", sql`${table.storage} IN ('jsonb-file', 'jsonl-file')`),
     check("telemetry_payloads_version_check", sql`${table.version} = 1`),
     check("telemetry_payloads_offset_check", sql`${table.offset} >= 0`),
     check("telemetry_payloads_length_check", sql`${table.length} > 0`),
@@ -1034,21 +1178,80 @@ export const telemetryPayloads = pgTable(
 );
 
 
-// Studio playground sessions: per-tenant saved chats (+ generated-media refs)
-// for the console Studio page. Message/media shapes are validated at the API
-// boundary (console/domains/studio.ts), not in Postgres — rows stay opaque
-// JSONB so the playground can evolve without migrations.
-export const studioSessions = pgTable(
-  "studio_sessions",
+
+// Daily check-in ledger: one row per (account, calendar day) once the sweep has
+// attempted that account's claim.
+//
+// The day-scoped composite PK is the claim guard — an insert that conflicts is
+// exactly the "already settled today" answer — so it replaces the Redis
+// `SET NX EX` the Lite backend never had. The console reads the same table to
+// answer "was this attempted today", which is what makes the Quota page show
+// the real state instead of a permanent "Check-in due" when Redis is absent.
+export const dailyCheckinLedger = pgTable(
+  "daily_checkin_ledger",
   {
-    id: uuid("id").primaryKey().defaultRandom(),
-    tenantId: tenantRefRequired(),
-    title: text("title").notNull().default("New session"),
-    model: text("model").notNull().default(""),
-    systemPrompt: text("system_prompt").notNull().default(""),
-    messagesJson: jsonb("messages_json").notNull().default([]),
-    mediaJson: jsonb("media_json").notNull().default([]),
-    ...timestampColumns(),
+    dayKey: text("day_key").notNull(),
+    accountId: uuid("account_id").notNull(),
+    claimedAt: timestamp("claimed_at", { withTimezone: true }).notNull().defaultNow(),
   },
-  (table) => [index("studio_sessions_tenant_updated_idx").on(table.tenantId, table.updatedAt)],
+  (table) => [
+    primaryKey({ columns: [table.dayKey, table.accountId] }),
+  ],
+);
+
+
+/**
+ * Per-day, per-model credit deductions the buddy billing meter reported.
+ *
+ * A snapshot, not a ledger: the upstream is the source of truth and answers the
+ * whole window on every call, so a row is upserted rather than appended. What it
+ * buys is that the console renders a *stored* figure — without it every page
+ * open would re-hit the billing endpoint for every account, and a failed read
+ * would show nothing at all instead of the last number obtained.
+ *
+ * Keyed (account, day, model): one row per bucket, and the conflict target is
+ * what makes the write idempotent across passes.
+ */
+export const buddyUsageSnapshots = pgTable(
+  "buddy_usage_snapshots",
+  {
+    accountId: uuid("account_id")
+      .notNull()
+      .references(() => providerAccounts.id, { onDelete: "cascade" }),
+    /** Calendar day the requests were metered on, `YYYY-MM-DD`. */
+    dayKey: text("day_key").notNull(),
+    model: text("model").notNull(),
+    /** Credits deducted across every request in this bucket. */
+    credit: numeric("credit", { precision: 14, scale: 4 }).notNull(),
+    syncedAt: timestamp("synced_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => [
+    primaryKey({ columns: [table.accountId, table.dayKey, table.model] }),
+    index("buddy_usage_snapshots_day_idx").on(table.dayKey),
+  ],
+);
+
+/**
+ * One row per (day, account, growth task) once that day's claim was attempted.
+ *
+ * The composite PK is the idempotency guard: an insert that conflicts is
+ * exactly the "already settled today" answer, which is what stops a sweep from
+ * re-POSTing a claim on every pass. Same shape as `daily_checkin_ledger`
+ * because it is the same problem — one claim per account per day — widened by
+ * the task name now that there is more than one thing to claim.
+ */
+export const buddyTaskLedger = pgTable(
+  "buddy_task_ledger",
+  {
+    dayKey: text("day_key").notNull(),
+    accountId: uuid("account_id")
+      .notNull()
+      .references(() => providerAccounts.id, { onDelete: "cascade" }),
+    task: text("task").notNull(),
+    claimedAt: timestamp("claimed_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => [
+    primaryKey({ columns: [table.dayKey, table.accountId, table.task] }),
+    index("buddy_task_ledger_account_idx").on(table.accountId),
+  ],
 );

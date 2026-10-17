@@ -1,8 +1,8 @@
 /** Durable materialization of bundled provider model metadata. */
 import { and, eq, sql } from "drizzle-orm";
-import type { CartethyiaDatabase } from "../../persistence/postgres";
+import type { CartethyiaDatabase } from "../../persistence/db-handle";
 import { models } from "../../persistence/schema";
-import type { ModelDefinition } from "../provider-registry";
+import type { ModelDefinition } from "../provider-model-definition";
 
 /** Persists compiled provider model metadata and reconciles drifted capability flags. */
 export async function seedBundledModels(

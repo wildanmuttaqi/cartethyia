@@ -22,6 +22,34 @@
 const OPEN_TAGS = ["<thinking>", "<think>"] as const;
 const CLOSE_TAGS = ["</thinking>", "</think>"] as const;
 
+/**
+ * Removes stray thinking tags from a settled string.
+ *
+ * Call sites that stream `reasoning_content` through to the client as a
+ * canonical `reasoning` part forward the field verbatim, so when the upstream
+ * double-wraps its own reasoning in `<think>…</think>` the tag bytes reach the
+ * client. The hy4-preview-f buddy model does this intermittently: the real
+ * answer appears inside the reasoning stream between `<think>` markers and the
+ * `content` stream reads blank, which is why the model is sometimes read as
+ * "not thinking" even though it was.
+ *
+ * The function is for a value that has already settled — a non-stream message
+ * body, or a stream delta that is not being tracked across chunks — so it is
+ * not stateful; a tag split across two chunks is a job for `MimoThinkSplitter`.
+ * Both case variants pass through: `<Think>` and `<THINK>` survived everyone's
+ * normalizer long enough for them not to be the leak this closes.
+ */
+export function stripThinkingTags(value: string): string {
+  if (!value.includes("<")) return value;
+  // Both the open-close pair and a stray marker on its own: an upstream that
+  // dropped the opening tag before `reasoning_content` was committed still
+  // leaves the closing one behind, and the lone tag reads just as badly to the
+  // client as a paired one.
+  return value
+    .replace(/<think(?:ing)?\b[^>]*>/g, "")
+    .replace(/<\/think(?:ing)?\s*>/g, "");
+}
+
 /** The longest suffix of `text` that is a proper prefix of any tag. */
 function danglingTagPrefix(text: string): string {
   const tags = [...OPEN_TAGS, ...CLOSE_TAGS];
@@ -82,8 +110,13 @@ export class MimoThinkSplitter {
     const held = danglingTagPrefix(this.#buffer);
     const settled = held.length > 0 ? this.#buffer.slice(0, -held.length) : this.#buffer;
     this.#buffer = held;
+    // A lone closing tag lands here when the upstream dropped the opener before
+    // committing the answer — the same quirk `stripThinkingTags` handles for
+    // settled values, and just as bad to forward: the tag bytes are rendered in
+    // the chat. Inside a reasoning span the text is already tag-free, so only
+    // the answer side is swept.
     if (this.#inReasoning) reasoning += settled;
-    else text += settled;
+    else text += stripThinkingTags(settled);
 
     return { text, reasoning };
   }
@@ -92,7 +125,9 @@ export class MimoThinkSplitter {
   flush(): ThinkSplit {
     const rest = this.#buffer;
     this.#buffer = "";
-    return this.#inReasoning ? { text: "", reasoning: rest } : { text: rest, reasoning: "" };
+    return this.#inReasoning
+      ? { text: "", reasoning: rest }
+      : { text: stripThinkingTags(rest), reasoning: "" };
   }
 
   #findOpen(): { index: number; length: number } | undefined {
@@ -116,10 +151,3 @@ export class MimoThinkSplitter {
   }
 }
 
-/** Non-streaming helper: strips reasoning spans and returns answer text only. */
-export function stripMimoThinking(raw: string): string {
-  const splitter = new MimoThinkSplitter();
-  const first = splitter.push(raw);
-  const rest = splitter.flush();
-  return first.text + rest.text;
-}

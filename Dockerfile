@@ -10,8 +10,6 @@ FROM oven/bun:alpine AS builder
 WORKDIR /build
 
 # Dependency layer: source changes do not invalidate Bun installation.
-# Do not use BuildKit cache mounts here: Railway and other builders may not
-# provide cache-mount support. The image must build with a standard builder.
 COPY package.json bun.lock tsconfig.json ./
 COPY dashboard/package.json ./dashboard/package.json
 RUN bun install --frozen-lockfile
@@ -25,6 +23,10 @@ RUN bun run dashboard:build
 # Backend build layer: AOT output is required before standalone compilation.
 COPY scripts ./scripts
 COPY migrations ./migrations
+RUN test -f migrations/full-postgres/0000_baseline.sql \
+    && test -f migrations/lite-sqlite3/0000_baseline.sql \
+    && test -f migrations/full-postgres/0001_allow_multiple_shared_keys_per_ip.sql \
+    && test -f migrations/lite-sqlite3/0001_allow_multiple_shared_keys_per_ip.sql
 RUN bun run build:aot && bun run build:binary --outfile /build/dist/cartethyia
 
 # Runtime: only the binary, dashboard assets, migrations, and entrypoint ship.
@@ -40,13 +42,17 @@ RUN apk add --no-cache ca-certificates curl libgcc libstdc++ util-linux \
     && chown -R cartethyia:cartethyia /app
 
 COPY --from=builder --chown=cartethyia:cartethyia /build/migrations ./migrations
+RUN test -f /app/migrations/full-postgres/0000_baseline.sql \
+    && test -f /app/migrations/lite-sqlite3/0000_baseline.sql \
+    && test -f /app/migrations/full-postgres/0001_allow_multiple_shared_keys_per_ip.sql \
+    && test -f /app/migrations/lite-sqlite3/0001_allow_multiple_shared_keys_per_ip.sql
 COPY --from=builder --chown=cartethyia:cartethyia /build/dist/dashboard ./dist/dashboard
 COPY --chmod=755 docker-entrypoint.sh ./entrypoint.sh
 COPY --from=builder --chown=cartethyia:cartethyia /build/dist/cartethyia ./cartethyia
 
-ENV CARTETHYIA_VERSION=2.0 \
-    NODE_ENV=production \
+ENV NODE_ENV=production \
     DASHBOARD_DIST=/app/dist/dashboard \
+    CARTETHYIA_PACKAGE_ROOT=/app \
     CARTETHYIA_DATA_DIR=/app/data \
     CARTETHYIA_INSTALL_ID_DIR=/app/data/.cartethyia
 

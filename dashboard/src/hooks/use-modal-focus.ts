@@ -3,6 +3,35 @@ import { useEffect, useRef } from "react";
 const FOCUSABLE_SELECTOR =
   'button:not([disabled]), [href], input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])';
 
+interface BodyScrollLockTarget {
+  readonly style: { overflow: string };
+}
+
+const bodyScrollLocks = new WeakMap<BodyScrollLockTarget, { count: number; previousOverflow: string }>();
+
+/** Locks body scrolling until every mounted modal has released its lock. */
+export function acquireBodyScrollLock(body: BodyScrollLockTarget): () => void {
+  const active = bodyScrollLocks.get(body);
+  if (active === undefined) {
+    bodyScrollLocks.set(body, { count: 1, previousOverflow: body.style.overflow });
+    body.style.overflow = "hidden";
+  } else {
+    active.count += 1;
+  }
+
+  let released = false;
+  return () => {
+    if (released) return;
+    released = true;
+    const lock = bodyScrollLocks.get(body);
+    if (lock === undefined) return;
+    lock.count -= 1;
+    if (lock.count > 0) return;
+    body.style.overflow = lock.previousOverflow;
+    bodyScrollLocks.delete(body);
+  };
+}
+
 function focusablesIn(root: HTMLElement): HTMLElement[] {
   return Array.from(root.querySelectorAll<HTMLElement>(FOCUSABLE_SELECTOR)).filter(
     (el) => el.offsetParent !== null || el === document.activeElement,
@@ -59,11 +88,7 @@ export function useModalFocus({ open, mounted, panelRef, onClose }: ModalFocusOp
   // it from the same place rather than each one remembering to add it.
   useEffect(() => {
     if (!mounted) return;
-    const previousOverflow = document.body.style.overflow;
-    document.body.style.overflow = "hidden";
-    return () => {
-      document.body.style.overflow = previousOverflow;
-    };
+    return acquireBodyScrollLock(document.body);
   }, [mounted]);
 
   // Initial focus + Tab containment + Escape handling.

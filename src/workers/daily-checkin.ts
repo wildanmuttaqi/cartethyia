@@ -5,7 +5,7 @@
 // operator can confirm each account got its daily login credit.
 //
 // It deliberately has no timer of its own: it rides along with the quota
-// refresh sweep (`quota-refresh-worker.ts`), which already resolves a fresh
+// refresh sweep (`quota-refresh-sweep.ts`), which already resolves a fresh
 // credential for each account every few minutes. Adding a second scheduled
 // task would just duplicate that credential work for a once-a-day action.
 //
@@ -15,21 +15,90 @@
 // pass instead of forfeiting that day's grant.
 //
 
+import { and, eq, inArray } from "drizzle-orm";
+import type { ValidatedFetch } from "../network/outbound-fetch";
+import type { ValidatedNetworkBindingFactory } from "../network/pool/resolver";
 import type { RedisClient } from "../persistence/redis";
-import type { ProviderId } from "../providers/provider-registry";
+import type { CartethyiaDatabase } from "../persistence/db-handle";
+import { dailyCheckinLedger, networkPools } from "../persistence/schema";
+import type { ProviderId } from "../providers/provider-contracts";
 import { log } from "../observability/logger";
-import { buddyAccountUid } from "../providers/integrations/buddy/buddy-oauth-shared";
 import {
   DAILY_CHECKIN_PROVIDER_IDS,
   checkinDayKey,
-  fetchBuddyActivityReport,
   fetchDailyCheckin,
-  type BuddyActivityReportResult,
   type DailyCheckinResult,
 } from "../providers/integrations/buddy/buddy-checkin";
 
 export { DAILY_CHECKIN_PROVIDER_IDS, checkinDayKey };
-export type { BuddyActivityReportResult, DailyCheckinResult };
+export type { DailyCheckinResult };
+
+/**
+ * Pending check-in requests handed to the sweep by a caller outside it.
+ *
+ * A newly imported account is the reason this exists: the import path is
+ * deliberately free of upstream calls so a paste of forty credentials lands as
+ * one local write, and the credit claim therefore has to happen later. Rather
+ * than giving it a second timer — which would duplicate the credential
+ * resolution the quota sweep already does — the import enqueues here and the
+ * sweep drains this on its next pass.
+ *
+ * Bounded: an import bigger than the cap drops the excess instead of growing
+ * without limit, because every entry is still subject to the day marker and a
+ * later pass picks the account up anyway. This queue is a nudge, not a
+ * guarantee — it says "worth trying on the next pass", never "must run".
+ */
+const QUEUE_MAX = 200;
+const checkinQueue = new Map<string, PendingCheckinRequest>();
+
+/** One account a caller asked the sweep to consider for a check-in. */
+export interface PendingCheckinRequest {
+  readonly accountId: string;
+  readonly providerId: string;
+  readonly tenantId: string | null;
+}
+
+/** Accounts a caller has asked the sweep to check in, oldest request first. */
+export function pendingCheckinRequests(): readonly PendingCheckinRequest[] {
+  return [...checkinQueue.values()];
+}
+
+/** Number of accounts currently waiting. Bounded by `QUEUE_MAX`. */
+export function pendingCheckinCount(): number {
+  return checkinQueue.size;
+}
+
+/** Drops every queued request. Tests only. */
+export function clearPendingCheckinRequests(): void {
+  checkinQueue.clear();
+}
+
+/**
+ * Queues a check-in for a newly added account.
+ *
+ * Non-blocking by construction: it records the id and returns, so an import
+ * that adds a hundred accounts still answers as one local write. Returns
+ * `false` for an account the check-in cannot serve at all (wrong provider, or
+ * a queue already at its cap) so the caller can skip the work rather than
+ * enqueue something the sweep would silently drop.
+ */
+export function enqueueCheckin(request: PendingCheckinRequest): boolean {
+  if (!supportsDailyCheckin(request.providerId)) return false;
+  // Already queued: keep the original position rather than re-inserting, which
+  // in a Map would move it to the back and let a repeated import starve it.
+  if (checkinQueue.has(request.accountId)) return true;
+  // Oldest requests drain first, so a bounded queue drops the newest rather
+  // than the ones that have already waited a pass. A dropped request is not a
+  // lost check-in: the sweep reaches the account through its normal listing.
+  if (checkinQueue.size >= QUEUE_MAX) return false;
+  checkinQueue.set(request.accountId, request);
+  return true;
+}
+
+/** Removes one account's queued request once the sweep has acted on it. */
+export function dequeueCheckin(accountId: string): void {
+  checkinQueue.delete(accountId);
+}
 
 const LEDGER_KEY_PREFIX = "cartethyia:daily-checkin";
 /**
@@ -44,20 +113,175 @@ export function ledgerKey(dayKey: string, accountId: string): string {
   return `${LEDGER_KEY_PREFIX}:${dayKey}:${accountId}`;
 }
 
-/** True when this pass won the account's day slot and must do the work. */
+/**
+ * True when this pass won the account's day slot and must do the work.
+ *
+ * Two guards, because the deployment shape decides which one is authoritative.
+ * With Redis the `SET NX EX` is the cross-process guard (two gateway instances
+ * cannot both attempt the same account). Without it the ledger *table* is the
+ * guard, and its composite PK makes the insert atomic — so Lite records the
+ * attempt it just made instead of silently returning `true`, which is what left
+ * the console unable to answer "attempted today" and showing "Check-in due"
+ * forever.
+ */
 async function reserveDaySlot(
+  db: CartethyiaDatabase | undefined,
   redis: RedisClient | undefined,
   dayKey: string,
   accountId: string,
 ): Promise<boolean> {
-  // Memory backend: one process needs no distributed guard — the slot is
-  // always won, and the sweep's once-a-day cadence is the only throttle.
-  if (redis === undefined) return true;
-  // `SET NX EX` is the whole coordination mechanism: one Redis round trip that
-  // is atomic across processes, so two gateway instances cannot both attempt
-  // the same account on the same day.
+  if (redis === undefined) {
+    if (db === undefined) {
+      // No ledger at all: one process needs no distributed guard, so the slot is
+      // always won and the sweep's once-a-day cadence is the only throttle.
+      return true;
+    }
+    // A handle without a query builder (the SQLite lite backend wraps its own)
+    // cannot write the ledger. Fall back to "always won" rather than throwing:
+    // the day marker is bookkeeping, and losing it costs a possible duplicate
+    // claim tomorrow instead of forfeiting today's grant.
+    if (typeof db.insert !== "function") return true;
+    try {
+      const inserted = await db
+        .insert(dailyCheckinLedger)
+        .values({ dayKey, accountId })
+        .onConflictDoNothing()
+        .returning({ accountId: dailyCheckinLedger.accountId });
+      return inserted.length > 0;
+    } catch (error) {
+      log.warn(`[daily-checkin] ledger reserve failed for account=${accountId}`, error as Error);
+      return true;
+    }
+  }
   const set = await redis.set(ledgerKey(dayKey, accountId), "1", "EX", LEDGER_TTL_SECONDS, "NX");
   return set !== null;
+}
+/**
+ * Releases today's slot for many accounts in one round-trip.
+ *
+ * The sweep reserves a slot per account as it walks the wave; releasing them
+ * one at a time on the error path turned every failed pass into a Redis RTT per
+ * failed account. A pass that budgets out with twenty failures paid twenty
+ * round-trips for bookkeeping that has no bearing on the claim itself.
+ *
+ * A pipeline is used when Redis is present (one `MULTI/DEL` for the whole
+ * batch). The DB path issues one `DELETE ... WHERE (day_key, account_id) IN (...)`
+ * instead of N single deletes.
+ */
+export async function releaseDaySlotsBatch(
+  db: CartethyiaDatabase | undefined,
+  redis: RedisClient | undefined,
+  dayKey: string,
+  accountIds: readonly string[],
+): Promise<void> {
+  if (accountIds.length === 0) return;
+  if (redis !== undefined) {
+    const pipeline = redis.pipeline();
+    for (const accountId of accountIds) {
+      pipeline.del(ledgerKey(dayKey, accountId));
+    }
+    await pipeline.exec().catch(() => undefined);
+    return;
+  }
+  if (db === undefined) return;
+  try {
+    await db
+      .delete(dailyCheckinLedger)
+      .where(
+        and(
+          inArray(dailyCheckinLedger.dayKey, [dayKey]),
+          inArray(dailyCheckinLedger.accountId, [...accountIds]),
+        ),
+      );
+  } catch (error) {
+    log.warn(
+      `[daily-checkin] batch ledger release failed for ${accountIds.length} account(s)`,
+      error as Error,
+    );
+  }
+}
+
+/**
+ * Stamps today's check-in slot for an account.
+ * Exists so a caller that deliberately bypasses the ledger — an operator
+ * pressing "check in now" — still leaves the evidence that today's attempt
+ * happened. Without the stamp the sweep re-POSTs the claim on its next pass
+ * and the console reads "Check-in due" for an account that was checked in
+ * minutes ago; the request itself is harmless (`forceClaim` answers
+ * `already_claimed` upstream) but the day's budget is spent twice.
+ *
+ * Only writes the slot; it never releases one. A caller that attempted the
+ * check-in is asserting "this account is settled for today", which is exactly
+ * what the slot means.
+ */
+export async function markCheckinAttempted(args: {
+  readonly db: CartethyiaDatabase | undefined;
+  readonly redis: RedisClient | undefined;
+  readonly accountId: string;
+  readonly now?: () => Date;
+}): Promise<void> {
+  const dayKey = checkinDayKey(args.now?.() ?? new Date());
+  if (args.redis !== undefined) {
+    await args.redis
+      .set(ledgerKey(dayKey, args.accountId), "1", "EX", LEDGER_TTL_SECONDS)
+      .catch((error: unknown) => {
+        log.warn(`[daily-checkin] ledger stamp failed for account=${args.accountId}`, error as Error);
+      });
+    return;
+  }
+  if (args.db === undefined) return;
+  try {
+    await args.db
+      .insert(dailyCheckinLedger)
+      .values({ dayKey, accountId: args.accountId })
+      .onConflictDoNothing();
+  } catch (error) {
+    log.warn(`[daily-checkin] ledger stamp failed for account=${args.accountId}`, error as Error);
+  }
+}
+
+/**
+ * Reads whether today's check-in slot is settled for an account.
+ *
+ * The read belongs next to the writes because there are two places the marker
+ * can live — the Redis key when Redis is present, the `daily_checkin_ledger`
+ * row when it is not — and only this module knows which one its own writes
+ * used. A caller that read the Redis key directly answered "not attempted" on
+ * every Lite deployment, where the sweep had written the row.
+ *
+ * Absent or unreadable means unknown, never "not claimed": the sweep may
+ * simply not have reached the account yet.
+ */
+export async function checkinAttemptedToday(args: {
+  readonly db: CartethyiaDatabase | undefined;
+  readonly redis: RedisClient | undefined;
+  readonly accountId: string;
+  readonly now?: () => Date;
+}): Promise<boolean> {
+  const dayKey = checkinDayKey(args.now?.() ?? new Date());
+  if (args.redis !== undefined) {
+    try {
+      return (await args.redis.get(ledgerKey(dayKey, args.accountId))) !== null;
+    } catch {
+      return false;
+    }
+  }
+  if (args.db === undefined) return false;
+  try {
+    const rows = await args.db
+      .select({ dayKey: dailyCheckinLedger.dayKey })
+      .from(dailyCheckinLedger)
+      .where(
+        and(
+          eq(dailyCheckinLedger.dayKey, dayKey),
+          eq(dailyCheckinLedger.accountId, args.accountId),
+        ),
+      )
+      .limit(1);
+    return rows.length > 0;
+  } catch {
+    return false;
+  }
 }
 
 /** Providers whose billing facade exposes the daily check-in routes. */
@@ -65,28 +289,46 @@ export function supportsDailyCheckin(providerId: string): boolean {
   return (DAILY_CHECKIN_PROVIDER_IDS as readonly string[]).includes(providerId);
 }
 
+/**
+ * Wraps a proxy-bound fetcher so a 403 falls back to a direct connection once.
+ *
+ * A proxy that answers 403 (auth, expired pool credential, a provider that
+ * rejects the egress) used to fail the whole claim even though the account's
+ * own credential was fine — the proxy was the only thing wrong. One direct
+ * retry costs nothing when the proxy was healthy (the first attempt already
+ * succeeded) and rescues the claim when it was not.
+ *
+ * The fallback only fires on 403, not on every error: a 401 means the account
+ * credential itself is rejected, and retrying that direct would only burn the
+ * same round-trip to the same verdict. When the caller already passed
+ * `globalThis.fetch` (no proxy in play) the wrapper is a pass-through.
+ */
+export function withDirectFallback(fetcher: typeof fetch): typeof fetch {
+  if (fetcher === globalThis.fetch) return fetcher;
+  const wrapped: typeof fetch = (async (input, init) => {
+    const viaProxy = await fetcher(input, init);
+    if (viaProxy.status !== 403) return viaProxy;
+    return globalThis.fetch(input, init);
+  }) as typeof fetch;
+  return wrapped;
+}
+/**
+ * The outcome of one daily check-in pass: the claim alone.
+ *
+ * The growth-activity report is no longer part of this pass — it moved to its
+ * own once-a-day growth task (`buddy-activity-report`) with its own ledger, so
+/**
+ * Runs the full daily growth pass for one account, once per calendar day: the
+ * check-in claim alone. The growth-activity report moved to its own once-a-day
+ * growth task (`buddy-activity-report`) with its own ledger, so it is not
+ * re-POSTed on every sweep. See `buddy-growth-tasks.ts`.
+ */
 export type DailyGrowthPassResult = {
   readonly checkin: DailyCheckinResult;
-  readonly report: BuddyActivityReportResult;
 };
 
-/**
- * Runs the full daily growth pass for one account: check-in claim first, then
- * (buddy only) the growth-activity report — same order as the dashboard's
- * growth button.
- *
- * The day slot is reserved here, so a caller cannot double-claim. The report
- * leg exists only for the buddy family, so any other provider's pass is the
- * check-in alone and the report field carries a "not supported" marker rather
- * than a fabricated success. The report fires only when the check-in step does
- * not hard-fail — reporting activity for an account whose credential just died
- * is noise at best. A report-side failure never releases the day slot: the
- * credit grant is the valuable half, and a failed report retries tomorrow
- * rather than spinning every sweep pass today.
- *
- * Returns `null` when no slot could be reserved (already settled today).
- */
 export async function attemptDailyGrowthPass(args: {
+  readonly db: CartethyiaDatabase | undefined;
   readonly redis: RedisClient | undefined;
   readonly providerId: ProviderId;
   readonly accountId: string;
@@ -95,12 +337,13 @@ export async function attemptDailyGrowthPass(args: {
   readonly fetcher?: typeof fetch;
   readonly now?: () => Date;
 }): Promise<DailyGrowthPassResult | null> {
-  const { redis, providerId, accountId, resolveCredential } = args;
+  const fetcher = withDirectFallback(args.fetcher ?? globalThis.fetch);
+  const { db, redis, providerId, accountId, resolveCredential } = args;
   const dayKey = checkinDayKey(args.now?.() ?? new Date());
 
   let reserved = false;
   try {
-    reserved = await reserveDaySlot(redis, dayKey, accountId);
+    reserved = await reserveDaySlot(db, redis, dayKey, accountId);
   } catch (error) {
     log.warn(`[daily-checkin] ledger unavailable for account=${accountId}`, error as Error);
     reserved = true;
@@ -111,7 +354,6 @@ export async function attemptDailyGrowthPass(args: {
   try {
     credential = await resolveCredential(providerId, accountId);
   } catch (error) {
-    if (redis !== undefined) await redis.del(ledgerKey(dayKey, accountId)).catch(() => undefined);
     return {
       checkin: {
         providerId,
@@ -121,22 +363,15 @@ export async function attemptDailyGrowthPass(args: {
         streakDays: null,
         error: error instanceof Error ? error.message : "Daily check-in failed.",
       },
-      report: {
-        providerId,
-        accountId,
-        state: "error",
-        error: "Skipped (check-in failed).",
-      },
     };
   }
-
   let checkin: DailyCheckinResult;
   try {
     checkin = await fetchDailyCheckin({
       providerId,
       accountId,
       credential,
-      fetcher: args.fetcher ?? globalThis.fetch,
+      fetcher,
     });
   } catch (error) {
     checkin = {
@@ -149,49 +384,50 @@ export async function attemptDailyGrowthPass(args: {
     };
   }
 
-  if (checkin.state === "error") {
-    // Same release rule as the check-in-only path: a transient failure retries
-    // on a later pass today, and the report is skipped with it.
-    if (redis !== undefined) await redis.del(ledgerKey(dayKey, accountId)).catch(() => undefined);
-    return {
-      checkin,
-      report: { providerId, accountId, state: "error", error: "Skipped (check-in failed)." },
-    };
-  }
-
-  // The growth event scores by uid, and only a JWT carries one. An opaque API
-  // key fails closed here — the sweep must never report one account's activity
-  // under another account's uid.
-  const userId = buddyAccountUid(credential);
-  if (!userId) {
-    return {
-      checkin,
-      report: {
-        providerId,
-        accountId,
-        state: "error",
-        error: "Skipped (no uid in this credential).",
-      },
-    };
-  }
-
-  let report: BuddyActivityReportResult;
-  try {
-    report = await fetchBuddyActivityReport({
-      providerId,
-      accountId,
-      credential,
-      userId,
-      fetcher: args.fetcher ?? globalThis.fetch,
-    });
-  } catch (error) {
-    report = {
-      providerId,
-      accountId,
-      state: "error",
-      error: error instanceof Error ? error.message : "Activity report failed.",
-    };
-  }
-  return { checkin, report };
+  // Only a transient `error` releases the slot so a later pass today can retry
+  // (network, 5xx). `unavailable` is the status probe answering that no
+  // activity is running — retrying that every pass spent the account's daily
+  // slot on a door the provider had closed, and releasing the marker was also
+  // what erased the evidence that anything had been attempted: the console then
+  // read "Check-in due" forever while the sweep retried once a minute.
+  // `already_claimed`, `not_eligible`, and `event_ended` are terminal for the
+  // day and keep the slot.
+  return { checkin };
 }
+export function dailyCheckinEgressForPass(args: {
+  readonly db: CartethyiaDatabase;
+  readonly networkBindingFactory: ValidatedNetworkBindingFactory;
+}): (accountId: string, tenantId?: string | null) => Promise<ValidatedFetch> {
+  const { db, networkBindingFactory } = args;
+  let poolsPromise: Promise<readonly { id: string; tenantId: string | null }[]> | undefined;
+  const cursors = new Map<string, number>();
 
+  return async (_accountId, tenantId) => {
+    poolsPromise ??= Promise.resolve()
+      .then(() =>
+        db
+          .select({ id: networkPools.id, tenantId: networkPools.tenantId })
+          .from(networkPools)
+          .where(eq(networkPools.status, "active")),
+      )
+      .catch(() => []);
+    const pools = await poolsPromise;
+    const global = pools.filter((pool) => pool.tenantId === null);
+    const owned =
+      tenantId === undefined || tenantId === null
+        ? []
+        : pools.filter((pool) => pool.tenantId === tenantId);
+    const candidates = [...owned, ...global];
+    if (candidates.length === 0) return globalThis.fetch;
+
+    const cursorKey = tenantId ?? "global";
+    const cursor = cursors.get(cursorKey) ?? 0;
+    const pool = candidates[cursor % candidates.length]!;
+    cursors.set(cursorKey, cursor + 1);
+    try {
+      return networkBindingFactory.fetch(pool.id, tenantId ?? undefined);
+    } catch {
+      return globalThis.fetch;
+    }
+  };
+}

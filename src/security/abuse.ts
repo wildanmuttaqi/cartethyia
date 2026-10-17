@@ -1,4 +1,4 @@
-import { GatewayError } from "../transport/gateway-error";
+import { GatewayError } from "../protocol/gateway-error";
 import { redisEvalTuple, type RedisClient } from "../persistence/redis";
 
 export interface ClientIdentity {
@@ -397,7 +397,7 @@ export class IpAbuseProtectionService {
     readonly signal?: AbortSignal;
   }): Promise<void> {
     if (input.signal?.aborted) {
-      throw new GatewayError("admission_unavailable", 503, "ip check aborted", {
+      throw new GatewayError("admission_unavailable", 503, "The abuse check never ran because the request was already cancelled.", {
         reason: "admission-unavailable",
       });
     }
@@ -420,7 +420,7 @@ export class IpAbuseProtectionService {
       });
 
       if (outcome.banned) {
-        throw new GatewayError("quota_exceeded", 429, "ip banned", {
+        throw new GatewayError("quota_exceeded", 429, "This address is temporarily banned for too many failed requests. Wait for the ban to lift, then slow down.", {
           reason: "admission-unavailable",
           ip,
           route: input.route,
@@ -432,7 +432,7 @@ export class IpAbuseProtectionService {
       }
 
       if (outcome.count > this.maxRequestsPerWindow) {
-        throw new GatewayError("quota_exceeded", 429, "ip rate limit exceeded", {
+        throw new GatewayError("quota_exceeded", 429, "This address is sending requests faster than the abuse limit allows. Back off and retry after the window rolls over.", {
           reason: "admission-unavailable",
           ip,
           route: input.route,
@@ -442,7 +442,7 @@ export class IpAbuseProtectionService {
       }
     } catch (err) {
       if (err instanceof GatewayError) throw err;
-      throw new GatewayError("admission_unavailable", 503, "ip abuse store error", {
+      throw new GatewayError("admission_unavailable", 503, "The abuse-tracking store is unreachable, so requests from this address cannot be checked. Retry shortly.", {
         reason: "admission-unavailable",
         cause: (err as Error).message,
       });
@@ -474,6 +474,19 @@ export class IpAbuseProtectionService {
  * instead of a fixed one-hour value that over-stated every wait.
  */
 const IP_ADMISSION_SCRIPT = `
+  local function asSortedSet(key)
+    local kind = redis.call('TYPE', key)
+    local name = kind['ok'] or kind
+    if name ~= 'none' and name ~= 'zset' then redis.call('DEL', key) end
+  end
+  local function asString(key)
+    local kind = redis.call('TYPE', key)
+    local name = kind['ok'] or kind
+    if name ~= 'none' and name ~= 'string' then redis.call('DEL', key) end
+  end
+  asString(KEYS[3])
+  asSortedSet(KEYS[1])
+  asSortedSet(KEYS[2])
   local banned = redis.call('GET', KEYS[3])
   if banned and tonumber(banned) > tonumber(ARGV[1]) then
     local ttl = redis.call('PTTL', KEYS[3])

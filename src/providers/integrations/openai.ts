@@ -1,9 +1,9 @@
-import type { ModelDefinition } from "../provider-registry";
-import type { ApiKeyProviderSpec } from "./configured-provider";
+import type { ModelDefinition } from "../provider-model-definition";
+import type { ApiKeyProviderSpec } from "../configured-provider";
 
 /**
  * OpenAI (API-key). Model catalog is declared in code (not DB-seeded) — see the
- * `ModelDefinition` doc comment in `providers/provider-registry.ts`.
+ * `ModelDefinition` doc comment in `providers/model-definition.ts`.
  */
 /** OpenAI (API-key) adapter spec; the registry builds it via `createApiKeyAdapter`. */
 export const OPENAI_SPEC: ApiKeyProviderSpec = {
@@ -14,7 +14,7 @@ export const OPENAI_SPEC: ApiKeyProviderSpec = {
   },
 };
 
-import { defineModel } from "../model-definition";
+import { defineModel } from "../provider-model-definition";
 
 export const OPENAI_MODELS: readonly ModelDefinition[] = [
   defineModel({ id: "gpt-6-astra", wireFamily: "responses", endpoint: "/v1/responses", ctx: 1050000, out: 128000, vision: true, reasoning: true }),

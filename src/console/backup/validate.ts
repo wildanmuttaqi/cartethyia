@@ -7,13 +7,13 @@
  * offending name instead of writing a partial row, and a hostile payload cannot
  * name a column that does not exist.
  *
- * Detection is by shape, not by a flag, because the user imports one file and
- * the file says what it is: our own backups carry `app: "cartethyia"`, and a
- * 9Router export carries the table names it dumps (`providerConnections`,
- * `providerNodes`, `apiKeys`, …).
+ * Detection is by shape, not by a flag: native backups carry
+ * `app: "cartethyia"`, while supported legacy exports carry their own table
+ * names.
  */
 import type { Table } from "drizzle-orm";
 import { getTableColumns } from "drizzle-orm";
+import { decryptCredentialToString } from "../../security/crypto";
 import {
   BACKUP_APP,
   BACKUP_SECTIONS,
@@ -25,14 +25,49 @@ import {
   columnNames,
   droppedColumns,
   findTable,
+  payloadNameOf,
+  sealedAliases,
+  sealedColumns,
   tableName,
   type BackupRow,
   type BackupSection,
   type RestoreValidation,
+  type RestoreWarning,
   type ValidatedRestore,
   type ValidatedTable,
 } from "./contracts";
-import { apiKeys, shareLinks } from "../../persistence/schema";
+import { DEFAULT_API_KEY_LABEL } from "../api-keys/contracts";
+import {
+  apiKeys,
+  modelCombos,
+  networkPools,
+  providerRoutingSettings,
+  shareLinks,
+} from "../../persistence/schema";
+
+const LEGACY_PROVIDER_USER_AGENT = "codex_cli_rs/0.156.1";
+const CURRENT_PROVIDER_USER_AGENT = "claude-cli/2.1.293 (external, cli)";
+
+/**
+ * Provider ids that were renamed, old spelling to current.
+ *
+ * A backup exported before the rename still names the old ids, and a restore
+ * that inserted them verbatim would create rows the registry does not serve —
+ * they would render as unknown providers with no models. Normalizing on import
+ * keeps those backups restorable, which is the same job the other legacy
+ * mappings in this function do.
+ */
+const RENAMED_PROVIDER_IDS: Readonly<Record<string, string>> = {
+  opencodeft: "opencode",
+  opencodezen: "opencode-zen",
+  opencodego: "opencode-go",
+};
+
+function currentProviderId(value: unknown): unknown {
+  if (typeof value !== "string") return value;
+  return RENAMED_PROVIDER_IDS[value] ?? value;
+}
+
 function legacyModelList(value: unknown): readonly string[] | undefined {
   if (!Array.isArray(value) || !value.every((entry) => typeof entry === "string")) return undefined;
   return value;
@@ -51,6 +86,62 @@ function normalizeLegacyApiKeyPolicy(row: Record<string, unknown>): Record<strin
   return row;
 }
 
+function normalizeLegacyRow(table: Table, row: Record<string, unknown>): Record<string, unknown> {
+  if (row["provider_id"] !== undefined) {
+    const renamed = currentProviderId(row["provider_id"]);
+    if (renamed !== row["provider_id"]) row = { ...row, provider_id: renamed };
+  }
+  if (
+    table === apiKeys &&
+    row["is_default"] === undefined &&
+    (row["key_mode"] === undefined || row["key_mode"] === "personal") &&
+    row["parent_key_id"] == null &&
+    row["label"] === DEFAULT_API_KEY_LABEL
+  ) {
+    return { ...row, is_default: true };
+  }
+  if (table === providerRoutingSettings) {
+    const { bypass_proxy: legacySkipProxy, ...current } = row;
+    let normalized = current;
+    if (normalized["skip_proxy"] === undefined && legacySkipProxy !== undefined) {
+      normalized = { ...normalized, skip_proxy: legacySkipProxy };
+    }
+    if (normalized["provider_id"] === "cline") {
+      normalized = { ...normalized, skip_proxy: true };
+    }
+    if (normalized["user_agent"] === LEGACY_PROVIDER_USER_AGENT) {
+      normalized = { ...normalized, user_agent: CURRENT_PROVIDER_USER_AGENT };
+    }
+    return normalized;
+  }
+  if (table === networkPools && row["kind"] === "bridge") {
+    return { ...row, kind: "https" };
+  }
+  if (table === modelCombos && row["strategy"] === "fusion") {
+    return { ...row, strategy: "fallback" };
+  }
+  return row;
+}
+
+function normalizeLegacyCiphertext(table: Table, row: Record<string, unknown>): Record<string, unknown> {
+  const normalized = { ...row };
+  for (const column of sealedColumns(table)) {
+    const cell = normalized[column];
+    if (!isPlainObject(cell) || Object.keys(cell).length !== 1 || typeof cell["__bytes"] !== "string") continue;
+    try {
+      normalized[payloadNameOf(table, column)] = decryptCredentialToString(
+        Buffer.from(cell["__bytes"], "base64"),
+      );
+      delete normalized[column];
+    } catch {
+      // Old exports carry ciphertext rather than portable plaintext. Only the
+      // original encryption key can open it; otherwise the validator reports
+      // and drops the credential instead of inserting unusable bytes.
+    }
+  }
+  return normalized;
+}
+
 function isPlainObject(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
@@ -64,6 +155,31 @@ function columnTypes(table: Table): ReadonlyMap<string, string> {
   return out;
 }
 
+/**
+ * Columns a row must carry or the insert cannot succeed at all.
+ *
+ * `NOT NULL` with no default and no identity: the database has nothing to fill
+ * in, so a row that omits one is unusable. An old export is exactly where such
+ * a row comes from — a column that was once optional became required, or the
+ * export predates it.
+ *
+ * Skipped rather than defaulted: inventing a value for `scopes` or `label`
+ * would write a row the operator never had, and guessing wrong on a credential
+ * column is worse than not restoring that one row.
+ */
+function requiredColumns(table: Table): ReadonlySet<string> {
+  const out = new Set<string>();
+  for (const column of Object.values(getTableColumns(table))) {
+    if (!column.notNull || column.hasDefault) continue;
+    if (column.generated !== undefined || column.generatedIdentity !== undefined) continue;
+    // `tenant_id` is not the file's to supply: every tenant-scoped row is
+    // re-assigned to the importing tenant below, so it can never be missing.
+    if (column.name === "tenant_id") continue;
+    out.add(column.name);
+  }
+  return out;
+}
+
 /** Detection outcome for an uploaded file. */
 export type DetectedFormat =
   | { readonly kind: "native"; readonly payload: Record<string, unknown> }
@@ -71,9 +187,9 @@ export type DetectedFormat =
   | { readonly kind: "unknown"; readonly reason: string };
 
 /**
- * Table names a 9Router export always writes. Requiring several keeps a
- * coincidental key from misclassifying a file — a lone `apiKeys` key is not
- * enough, and neither is `settings`, which both formats could plausibly carry.
+ * Table names used to recognize a supported legacy export. Requiring several
+ * keeps a coincidental key from misclassifying a file — a lone `apiKeys` key is
+ * not enough, and neither is `settings`, which both formats could plausibly carry.
  */
 const NINE_ROUTER_MARKERS = ["providerConnections", "providerNodes", "apiKeys", "combos"] as const;
 
@@ -112,13 +228,20 @@ function orderedTables(section: BackupSection): readonly Table[] {
 /**
  * Validates a native backup payload.
  *
- * Returns every problem it can find rather than the first, so an operator
- * fixing a hand-edited file sees the whole list.
+ * Recovers what it can and reports what it could not, in {@link RestoreWarning}s,
+ * rather than refusing the file. A backup is a historical artifact: a table
+ * renamed, a column dropped, or a version bump since it was taken must cost the
+ * operator that one part, not the whole recovery. Only a payload that is not a
+ * Cartethyia backup at all is rejected outright.
+ *
+ * Every problem that survives to a warning is still *checked* — an unknown
+ * column never reaches the store, and a row that cannot be represented is
+ * dropped rather than coerced. What changes is the verdict, not the rigor.
  *
  * `tenantId` is the restoring tenant. A row that carries a `tenant_id` column
- * is checked against it here, before anything is written, so a payload lifted
- * from another deployment fails with a message naming the table instead of
- * silently writing rows that belong to a different tenant.
+ * is rewritten to it here, before anything is written, so a payload lifted from
+ * another deployment lands in the importing tenant instead of silently
+ * restoring rows that belong to a different one.
  */
 export function validateRestorePayload(payload: unknown, tenantId: string): RestoreValidation {
   if (!isPlainObject(payload)) return { ok: false, error: "backup must be a JSON object" };
@@ -134,11 +257,18 @@ export function validateRestorePayload(payload: unknown, tenantId: string): Rest
           : `backup is for "${foreign}", not "${BACKUP_APP}"`,
     };
   }
-  if (payload.version !== BACKUP_VERSION) {
-    return { ok: false, error: `unsupported backup version ${String(payload.version)}` };
-  }
   if (!isPlainObject(payload.sections)) {
     return { ok: false, error: "backup.sections must be an object" };
+  }
+
+  const warnings: RestoreWarning[] = [];
+  // A version we do not write is not a reason to refuse the file: the section
+  // and column checks below are what actually decide what can be restored, so a
+  // future export degrades to "whatever still resolves" instead of dead.
+  if (payload.version !== BACKUP_VERSION) {
+    warnings.push({
+      reason: `backup version ${String(payload.version)} is not ${BACKUP_VERSION}; only the parts that still match the schema were restored`,
+    });
   }
 
   const tables = new Map<Table, ValidatedTable>();
@@ -147,50 +277,148 @@ export function validateRestorePayload(payload: unknown, tenantId: string): Rest
 
   for (const [sectionName, sectionValue] of Object.entries(payload.sections)) {
     if (!BACKUP_SECTIONS.includes(sectionName as BackupSection)) {
-      return { ok: false, error: `unknown backup section "${sectionName}"` };
+      warnings.push({ reason: `unknown backup section "${sectionName}" was skipped` });
+      continue;
     }
     const section = sectionName as BackupSection;
     if (!isPlainObject(sectionValue)) {
-      return { ok: false, error: `backup.sections.${section} must be an object` };
+      warnings.push({ reason: `backup.sections.${section} is not an object and was skipped` });
+      continue;
     }
 
     for (const [name, value] of Object.entries(sectionValue)) {
       const table = findTable(section, name);
       if (table === undefined) {
-        return { ok: false, error: `unknown table "${name}" in section "${section}"` };
+        warnings.push({ table: name, reason: `unknown table in section "${section}"; skipped` });
+        continue;
       }
       if (!Array.isArray(value)) {
-        return { ok: false, error: `table "${name}" must be an array of rows` };
+        warnings.push({ table: name, reason: "not an array of rows; skipped" });
+        continue;
       }
       if (value.length > MAX_ROWS_PER_TABLE) {
-        return { ok: false, error: `table "${name}" exceeds the ${MAX_ROWS_PER_TABLE} row limit` };
+        warnings.push({
+          table: name,
+          reason: `exceeds the ${MAX_ROWS_PER_TABLE} row limit; only the first ${MAX_ROWS_PER_TABLE} rows were restored`,
+        });
       }
 
       const allowed = columnNames(table);
       const dropped = droppedColumns(table);
       const types = columnTypes(table);
+      const required = requiredColumns(table);
+      const sealed = sealedColumns(table);
       const rows: BackupRow[] = [];
-      for (let i = 0; i < value.length; i++) {
-        const row = value[i];
-        if (!isPlainObject(row)) return { ok: false, error: `${name}[${i}] must be a row object` };
+      // One warning per (table, column), not per row: a retired column is one
+      // fact about the file, and repeating it 4,000 times is noise.
+      const reported = new Set<string>();
+      // A payload names its secrets for what they are (`access_token`), not for
+      // the column that seals them (`credential_ciphertext`) — the ciphertext is
+      // the one thing a backup cannot carry between installations. Map them back
+      // before anything else looks at the row, or the credentials would be
+      // dropped as unknown columns and the configuration would come back with
+      // none of them.
+      const aliases = sealedAliases(table);
+      const capped = Math.min(value.length, MAX_ROWS_PER_TABLE);
+      const rowsIn: readonly unknown[] =
+        aliases.size === 0
+          ? value
+          : value.slice(0, capped).map((row) => {
+              if (!isPlainObject(row)) return row;
+              const mapped: Record<string, unknown> = {};
+              for (const [column, cell] of Object.entries(normalizeLegacyCiphertext(table, row))) {
+                mapped[aliases.get(column) ?? column] = cell;
+              }
+              return mapped;
+            });
+
+      for (let i = 0; i < capped; i++) {
+        const row = rowsIn[i];
+        if (!isPlainObject(row)) {
+          warnings.push({ table: name, reason: `row ${i} is not an object; skipped` });
+          continue;
+        }
         // Older v1 backups used separate allow/deny columns. Convert them to
         // the current single policy before dropping retired column names.
-        const sourceRow = table === apiKeys ? normalizeLegacyApiKeyPolicy(row) : row;
+        const sourceRow = normalizeLegacyRow(
+          table,
+          table === apiKeys ? normalizeLegacyApiKeyPolicy(row) : row,
+        );
         // A stale backup may still carry columns the schema has since dropped.
         // Those are accepted but removed here, so they never reach the store
         // (which would reject them as unknown) and the rest of the row restores.
         const sanitizedRow = dropped.size > 0 && Object.keys(sourceRow).some((column) => dropped.has(column))
           ? Object.fromEntries(Object.entries(sourceRow).filter(([column]) => !dropped.has(column)))
           : sourceRow;
-        for (const [column, cell] of Object.entries(sanitizedRow)) {
-          if (!allowed.has(column)) {
-            return { ok: false, error: `${name}.${column} is not a column of ${tableName(table)}` };
+        // A column the schema never had is dropped from the row rather than
+        // failing the table: the rest of the row still restores.
+        const unknownColumns = Object.keys(sanitizedRow).filter((column) => !allowed.has(column));
+        for (const column of unknownColumns) {
+          if (reported.has(column)) continue;
+          reported.add(column);
+          warnings.push({
+            table: name,
+            column,
+            reason: `not a column of ${tableName(table)}; the column was dropped from every row`,
+          });
+        }
+        // A sealed column may only be restored from plaintext, because plaintext
+        // is the only form the store can re-seal under *this* install's key (see
+        // `sealedColumns`). A `{ __bytes }` cell in one of those columns is
+        // therefore ciphertext written by another install — the shape every
+        // backup before the credential portability fix produced — and it is
+        // dropped with a reason rather than inserted as though it were readable
+        // here, which is the defect that left restored providers unopenable. The
+        // rest of the row still restores: an account without its token is
+        // recoverable, and the operator re-authorizes one credential rather than
+        // losing the configuration.
+        let sealedRow = sanitizedRow;
+        if (sealed.size > 0) {
+          for (const column of sealed) {
+            if (!(column in sealedRow)) continue;
+            const cell = sealedRow[column];
+            if (cell === null || cell === undefined || typeof cell === "string") continue;
+            if (!reported.has(column)) {
+              reported.add(column);
+              warnings.push({
+                table: name,
+                column,
+                reason:
+                  "held ciphertext sealed under another install's key; the credential was not restored, so re-authorize it",
+              });
+            }
+            sealedRow = Object.fromEntries(Object.entries(sealedRow).filter(([key]) => key !== column));
           }
+        }
+        const knownRow: Record<string, unknown> =
+          unknownColumns.length === 0
+            ? sealedRow
+            : Object.fromEntries(Object.entries(sealedRow).filter(([column]) => allowed.has(column)));
+
+        // A row missing a column the database cannot fill in would abort the
+        // whole transaction. Drop that row and report it, so one stale row
+        // costs one row instead of the entire restore.
+        const missing = [...required].filter(
+          (column) => knownRow[column] === undefined || knownRow[column] === null,
+        );
+        if (missing.length > 0) {
+          const key = `missing:${missing.join(",")}`;
+          if (!reported.has(key)) {
+            reported.add(key);
+            warnings.push({
+              table: name,
+              reason: `${missing.length === 1 ? "row is missing required column" : "rows are missing required columns"} ${missing.join(", ")}; those rows were skipped`,
+            });
+          }
+          continue;
+        }
+        let rowUsable = true;
+        for (const [column, cell] of Object.entries(knownRow)) {
           // A `json`/`jsonb` column legitimately holds any nested shape, so it
           // is passed through untouched. Every other column must be a scalar or
           // one of the two carrier objects the store encodes dates and byte
           // strings into; anything else (a nested array, an arbitrary object) is
-          // rejected rather than coerced into something the driver would guess.
+          // dropped rather than coerced into something the driver would guess.
           if (types.get(column) === "json") continue;
           if (isPlainObject(cell)) {
             const carrier = Object.keys(cell);
@@ -198,20 +426,29 @@ export function validateRestorePayload(payload: unknown, tenantId: string): Rest
               (carrier.length === 1 && carrier[0] === "__date" && typeof cell["__date"] === "string") ||
               (carrier.length === 1 && carrier[0] === "__bytes" && typeof cell["__bytes"] === "string");
             if (!isCarrier) {
-              return { ok: false, error: `${name}[${i}].${column} is not a scalar or a carrier object` };
+              if (!reported.has(column)) {
+                reported.add(column);
+                warnings.push({ table: name, column, reason: "held an unsupported value; dropped" });
+              }
+              rowUsable = false;
             }
           } else if (typeof cell === "object" && cell !== null) {
-            return { ok: false, error: `${name}[${i}].${column} must be a scalar, null, or a carrier` };
+            if (!reported.has(column)) {
+              reported.add(column);
+              warnings.push({ table: name, column, reason: "held an unsupported value; dropped" });
+            }
+            rowUsable = false;
           }
         }
+        if (!rowUsable) continue;
         // A backup is portable across deployments: tenant-scoped rows keep
         // their shape but are assigned to the authenticated importing tenant.
         // The tenant row itself is handled separately below and never gets
         // remapped here.
         const tenantScopedRow =
           table === TENANT_TABLE || !types.has("tenant_id")
-            ? (sanitizedRow as BackupRow)
-            : { ...(sanitizedRow as BackupRow), tenant_id: tenantId };
+            ? (knownRow as BackupRow)
+            : { ...(knownRow as BackupRow), tenant_id: tenantId };
         // Version-1 backups can carry the retired monitor/setup link kinds.
         // Import them as inactive enrollment links so their old tokens never
         // regain a usable public endpoint.
@@ -237,7 +474,7 @@ export function validateRestorePayload(payload: unknown, tenantId: string): Rest
     }
   }
 
-  const value: ValidatedRestore = { tables, tenantRows, counts };
+  const value: ValidatedRestore = { tables, tenantRows, counts, warnings };
   return { ok: true, value };
 }
 

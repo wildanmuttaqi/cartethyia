@@ -1,7 +1,8 @@
 import type { ConsoleAccessResolver } from "../auth/access";
-import type { AuditRecorder } from "../auth/service";
+import type { AuditRecorder } from "../auth/audit-recorder";
 import { markClineApiKeyCredential } from "../../providers/integrations/cline/cline-quota";
 import { type QuotaRefreshDeps } from "./refresh";
+import type { AccountTestEgressDeps } from "./account-test-egress";
 
 /**
  * Dependencies shared by the tenant-scoped and global-admin account/quota route
@@ -9,6 +10,8 @@ import { type QuotaRefreshDeps } from "./refresh";
  * `createAccountQuotaRoutes`.
  */
 export interface AccountQuotaRoutesDeps extends QuotaRefreshDeps {
+  readonly poolSelector?: AccountTestEgressDeps["poolSelector"];
+  readonly networkBindingFactory?: AccountTestEgressDeps["networkBindingFactory"];
   readonly accessResolver: ConsoleAccessResolver;
   readonly snapshotInvalidator?: { invalidate(): Promise<number> };
   /** Records privileged account mutations (e.g. hard deletion) to `admin_audit_log`. */

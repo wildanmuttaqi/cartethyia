@@ -10,9 +10,9 @@ import {
   type RelayDeployRequest,
 } from "./relay-deploy";
 import { SPEED_TEST_MAX_BYTES, SPEED_TEST_MIN_BYTES } from "./speed-test-sizes";
-import { normalizeBridgeEndpoint } from "../../../network/pool/agent";
 import {
   MAX_BATCH_PROBE_TARGETS,
+  PROVIDER_PROBE_BATCH_CONCURRENCY,
   POOL_BATCH_PROBE_CONCURRENCY,
   POOL_ROUTING_STRATEGIES,
   normalizePoolConfig,
@@ -22,6 +22,8 @@ import {
   validateTransportConfig,
   type CreateNetworkPoolRequest,
   type HealthCheckResult,
+  type PoolBatchProviderProbeResult,
+  type PoolProviderProbeResult,
   type NetworkPoolConfig,
   type NetworkPoolRecord,
   type NetworkPoolResponse,
@@ -29,6 +31,14 @@ import {
   type PoolSpeedTestResult,
   type PoolStrategySetting,
 } from "./contracts";
+
+/**
+ * Whether a provider entry is a retired egress rather than a refilling
+ * allowance. Read from the stored flag, never from the duration.
+ */
+function isBlockedEntry(entry: { readonly blocked?: boolean }): boolean {
+  return entry.blocked === true;
+}
 
 export function createNetworkPoolOperations(config: NetworkPoolConfig) {
   const operations = {
@@ -53,6 +63,7 @@ export function createNetworkPoolOperations(config: NetworkPoolConfig) {
                       providerId: c.providerId,
                       until: new Date(c.until).toISOString(),
                       reason: c.reason,
+                      blocked: isBlockedEntry(c),
                     })),
                   }
                 : {}),
@@ -83,6 +94,7 @@ export function createNetworkPoolOperations(config: NetworkPoolConfig) {
                   providerId: c.providerId,
                   until: new Date(c.until).toISOString(),
                   reason: c.reason,
+                  blocked: isBlockedEntry(c),
                 })),
               }
             : {}),
@@ -146,11 +158,7 @@ export function createNetworkPoolOperations(config: NetworkPoolConfig) {
       ): Promise<NetworkPoolResponse> {
         const a = requireTenantScope(access, "dashboard:write");
         const normalizedConfig = normalizePoolConfig(request.config);
-        // The `bridge://` marker is an input convention, not a transport: fold
-        // it to the http(s) URL the pool dials once, here, so what is stored and
-        // validated is exactly what the loader hands the agent factory.
-        const endpoint =
-          request.kind === "bridge" ? normalizeBridgeEndpoint(request.endpoint) : request.endpoint;
+        const endpoint = request.endpoint;
         validateEndpoint(request.kind, endpoint, config.ssrfPolicy);
         validateTransportConfig(request.kind, normalizedConfig);
         validatePoolLimits(request.maxInflight, request.weight);
@@ -172,6 +180,7 @@ export function createNetworkPoolOperations(config: NetworkPoolConfig) {
           // Absent or `null` both mean unmetered; a positive number is the
           // allowance. The body schema already rejects zero and negatives.
           ...(typeof request.quotaBytes === "number" ? { quotaBytes: request.quotaBytes } : {}),
+          ...(request.family === undefined ? {} : { family: request.family }),
         };
         await config.store.create(record);
         await config.auditSink?.record({
@@ -198,9 +207,7 @@ export function createNetworkPoolOperations(config: NetworkPoolConfig) {
           const existing = await config.store.get(a.tenantId, poolId);
           if (!existing) throw new ConsoleDomainError("pool_not_found", 404, `Pool ${poolId} not found`);
           const effectiveKind = request.kind ?? existing.kind;
-          const rawEndpoint = request.endpoint ?? existing.endpoint;
-          const effectiveEndpoint =
-            effectiveKind === "bridge" ? normalizeBridgeEndpoint(rawEndpoint) : rawEndpoint;
+          const effectiveEndpoint = request.endpoint ?? existing.endpoint;
           const mergedConfig = { ...(existing.config ?? {}), ...(request.config ?? {}) };
           const normalizedConfig = normalizePoolConfig(mergedConfig);
           validateEndpoint(effectiveKind, effectiveEndpoint, config.ssrfPolicy);
@@ -307,6 +314,94 @@ export function createNetworkPoolOperations(config: NetworkPoolConfig) {
         );
       }
       return config.store.speedTest(a.tenantId, poolId, bytes);
+    },
+    /**
+     * Asks one provider whether it will serve traffic from this pool.
+     *
+     * Read-only by default: an operator testing a proxy wants to know its
+     * state, not to change it. `block` is the explicit opt-in that also
+     * retires the pool for that provider.
+     */
+    async providerProbe(
+      access: AccessDecision | undefined,
+      poolId: string,
+      providerId: string,
+    ): Promise<PoolProviderProbeResult> {
+      const a = requireTenantScope(access, "dashboard:read");
+      if (!config.store.providerProbe) {
+        throw new ConsoleDomainError("not_supported", 400, "Provider probing is unavailable");
+      }
+      const result = await config.store.providerProbe(a.tenantId, poolId, providerId);
+      if (!config.poolSelector) return result;
+      // The verdict *is* the enforcement. Storing it and leaving the pool in
+      // rotation is what produced "I tested every pool, some are red, and it
+      // still picked a red one": the red was a colour, not a decision.
+      //
+      // `blocked` retires the egress for this provider, so the next dispatch
+      // skips it. Anything else clears a previous block, because the address is
+      // serving again — an operator who replaced a proxy must not have to find
+      // a separate button to un-retire it.
+      if (result.status === "blocked") {
+        await config.poolSelector.flagProviderBlocked(
+          poolId,
+          providerId,
+          "Upstream refused this egress address",
+        );
+        return { ...result, blockedPool: true };
+      }
+      await config.poolSelector.clearProviderCooldown(poolId, providerId);
+      return { ...result, blockedPool: false };
+    },
+    /**
+     * Probes many unsaved pool definitions against one provider.
+     *
+     * Same shape and bounds as `probeAdHocPoolBatch`: the add form tests a
+     * pasted list before saving it, and a per-endpoint verdict is what it
+     * prints. A single failing probe becomes that endpoint's result rather
+     * than failing the batch.
+     */
+    async probeAdHocProviderBatch(
+      access: AccessDecision | undefined,
+      requests: readonly CreateNetworkPoolRequest[],
+      providerId: string,
+    ): Promise<readonly PoolBatchProviderProbeResult[]> {
+      const a = requireTenantScope(access, "dashboard:read");
+      if (requests.length === 0) return [];
+      if (requests.length > MAX_BATCH_PROBE_TARGETS) {
+        throw new ConsoleDomainError(
+          "batch_too_large",
+          422,
+          `At most ${MAX_BATCH_PROBE_TARGETS} targets per batch`,
+        );
+      }
+      if (!config.store.probeAdHocProvider) {
+        throw new ConsoleDomainError("not_supported", 400, "Provider probing is unavailable");
+      }
+      const probe = config.store.probeAdHocProvider.bind(config.store);
+      const results: PoolBatchProviderProbeResult[] = new Array(requests.length);
+      let cursor = 0;
+      const worker = async () => {
+        while (cursor < requests.length) {
+          const index = cursor++;
+          const request = requests[index]!;
+          let result: PoolProviderProbeResult;
+          try {
+            result = await probe(a.tenantId, request, providerId);
+          } catch (error) {
+            result = {
+              poolId: request.endpoint,
+              providerId,
+              status: "unreachable",
+              reason: error instanceof Error ? error.message : "Probe failed",
+            };
+          }
+          results[index] = { endpoint: request.endpoint, result };
+        }
+      };
+      await Promise.all(
+        Array.from({ length: Math.min(PROVIDER_PROBE_BATCH_CONCURRENCY, requests.length) }, () => worker()),
+      );
+      return results;
     },
     async probeAdHocPool(
       access: AccessDecision | undefined,

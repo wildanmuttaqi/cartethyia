@@ -10,6 +10,9 @@
 
 const inFlight = new Map<string, Promise<unknown>>();
 
+/** Cardinality bound; oldest entries evicted first under burst fan-out. */
+const MAX_INFLIGHT_DEDUP_KEYS = 1000;
+
 /**
  * Runs `fn` for `key`, sharing one in-flight promise across concurrent callers.
  * The entry is removed when the promise settles, so this de-duplicates bursts
@@ -23,16 +26,12 @@ export function dedupeRequest<T>(key: string, fn: () => Promise<T>): Promise<T> 
     // Only clear the entry this call created; a later call may have replaced it.
     if (inFlight.get(key) === task) inFlight.delete(key);
   });
+  // Evict oldest first: refusing to track past the cap would silently run the
+  // work twice, which is worse than dropping an older dedup entry.
+  if (inFlight.size >= MAX_INFLIGHT_DEDUP_KEYS) {
+    const oldest = inFlight.keys().next();
+    if (!oldest.done) inFlight.delete(oldest.value);
+  }
   inFlight.set(key, task);
   return task;
-}
-
-/** Number of keys currently in flight. Test/observability helper. */
-export function inFlightRequestCount(): number {
-  return inFlight.size;
-}
-
-/** Clears all in-flight keys. Test-only. */
-export function resetDeduplicationForTesting(): void {
-  inFlight.clear();
 }

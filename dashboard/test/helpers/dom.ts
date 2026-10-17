@@ -47,6 +47,7 @@ export function registerDom(): void {
     HTMLInputElement: window.HTMLInputElement,
     HTMLButtonElement: window.HTMLButtonElement,
     HTMLAnchorElement: window.HTMLAnchorElement,
+    HTMLTextAreaElement: window.HTMLTextAreaElement,
     Element: window.Element,
     Node: window.Node,
     Event: window.Event,

@@ -28,11 +28,11 @@ import type {
 import type { OAuthTokenRefreshResult } from "../../authentication/oauth-refresh-service";
 import { OAuthDeviceFlow } from "../../authentication/oauth-device-flow";
 import type { FetchLike } from "../../authentication/oauth-client";
-import { resolveGithubEnterpriseDomain } from "../../../config";
+import { resolveGithubEnterpriseDomain } from "../../../config/providers";
+
 
 /** Public GitHub OAuth app id the Copilot clients use; not a secret. */
 export const GITHUB_CLIENT_ID = "Iv1.b507a08c87ecfe98" as const;
-export const GITHUB_DEVICE_CODE_URL = "https://github.com/login/device/code" as const;
 export const GITHUB_ACCESS_TOKEN_URL = "https://github.com/login/oauth/access_token" as const;
 /** Default API host when a token carries no `proxy-ep` claim. */
 export const GITHUB_DEFAULT_API_HOST = "api.individual.githubcopilot.com" as const;
@@ -47,11 +47,11 @@ export const GITHUB_DEFAULT_API_HOST = "api.individual.githubcopilot.com" as con
  * which is what the upstream expects for this client id.
  */
 export const GITHUB_REQUEST_HEADERS: Readonly<Record<string, string>> = Object.freeze({
-  "user-agent": "GitHubCopilotChat/0.35.0",
-  "editor-version": "vscode/1.107.0",
-  "editor-plugin-version": "copilot-chat/0.35.0",
+  "user-agent": "GitHubCopilotChat/0.70.0",
+  "editor-version": "vscode/1.142.0",
+  "editor-plugin-version": "copilot-chat/0.70.0",
   "copilot-integration-id": "vscode-chat",
-  "x-github-api-version": "2026-06-01",
+  "x-github-api-version": "2026-08-01",
 });
 
 const DEVICE_INTERVAL_SECONDS = 5;
@@ -130,11 +130,6 @@ export function apiHostFromGithubToken(token: string): string {
   return apiHost.length > 0 ? apiHost : GITHUB_DEFAULT_API_HOST;
 }
 
-/** Absolute inference base URL for a Copilot token. */
-export function copilotBaseUrlFromToken(token: string): string {
-  return `https://${apiHostFromGithubToken(token)}`;
-}
-
 interface CopilotTokenResponse {
   token?: unknown;
   expires_at?: unknown;
@@ -184,7 +179,10 @@ async function fetchGitHubLogin(
       headers: {
         accept: "application/json",
         authorization: `Bearer ${githubAccessToken}`,
-        ...GITHUB_REQUEST_HEADERS,
+        // The Copilot client headers belong on the Copilot API. Sent here they
+        // draw a 400, the login is never read, and every account then shares
+        // the dialog's label — so the second one overwrites the first.
+        "user-agent": GITHUB_REQUEST_HEADERS["user-agent"]!,
       },
       signal,
     });
@@ -335,6 +333,7 @@ export class GithubOAuthClient extends OAuthDeviceFlow {
     };
     return { status: "complete", result };
   }
+
 
   override async refresh(refreshToken: string, signal?: AbortSignal): Promise<OAuthTokenRefreshResult> {
     const minted = await mintGithubToken(

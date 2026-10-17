@@ -26,14 +26,16 @@ import { ProviderIcon } from "../../components/ProviderIcon";
 import { ConfirmDialog } from "../../components/ConfirmDialog";
 import { HealthEventsModal } from "../../components/HealthEventsModal";
 import { Select } from "../../components/ui/select";
-import { Toolbar } from "../../components/ui/toolbar";
+
 import { Stack } from "../../components/ui/stack";
-import { toast } from "../../shared/toast";
+import { Card, CardBody, CardHeader } from "../../components/ui/card";
+import { toast } from "../../lib/toast";
 import {
   useQuotaOverview,
   useRefreshAccountQuota,
   useRefreshAllQuotas,
   useTriggerGrowthPass,
+  useTriggerProviderDailyGrowth,
   useTriggerAccountReset,
   useAccountResets,
   useUpdateAccountActive,
@@ -51,8 +53,8 @@ import {
   quotaBarTone,
   paginateQuotaWindows,
   accountIdentity,
-} from "../../shared/quota-formatters";
-import { getErrorMessage } from "../../shared/helpers";
+} from "../../lib/format/quota";
+import { getErrorMessage } from "../../data/api";
 
 
 function isEmpty(account: QuotaEntry): boolean {
@@ -106,32 +108,14 @@ function QuotaAccountResetModal({
       size="lg"
       title={`Saved Rate-Limit Resets — ${account.name}`}
     >
-      <div style={{ display: "flex", flexDirection: "column", gap: "14px" }}>
-        <div
-          style={{
-            display: "flex",
-            alignItems: "center",
-            justifyContent: "space-between",
-            gap: "12px",
-            padding: "12px 16px",
-            borderRadius: "10px",
-            background: "var(--surface-2)",
-            border: "1px solid var(--inner-border)",
-          }}
-        >
-          <div style={{ minWidth: 0 }}>
-            <div style={{ display: "flex", alignItems: "center", gap: "8px" }}>
-              <Zap size={14} style={{ color: "var(--status-success)" }} />
-              <span style={{ fontSize: "13px", fontWeight: 600 }}>Available resets</span>
+      <div className="flex flex-col gap-7">
+        <div className="flex items-center justify-between gap-6 rounded-control border border-inner-border bg-surface-2 px-8 py-6">
+          <div className="min-w-0">
+            <div className="flex items-center gap-4">
+              <Zap size={14} className="text-status-success" />
+              <span className="text-body font-semibold">Available resets</span>
             </div>
-            <p
-              style={{
-                fontSize: "11.5px",
-                color: "var(--text-tertiary)",
-                marginTop: "4px",
-                lineHeight: 1.5,
-              }}
-            >
+            <p className="mt-2 text-text-tertiary text-badge leading-normal">
               Each credit lifts a spent rate-limit window before its natural reset.
             </p>
           </div>
@@ -152,21 +136,14 @@ function QuotaAccountResetModal({
             icon={<Zap size={20} />}
           />
         ) : (
-          <div
-            style={{
-              maxHeight: "340px",
-              overflowY: "auto",
-              border: "1px solid var(--inner-border)",
-              borderRadius: "10px",
-            }}
-          >
+          <div className="max-h-170 overflow-y-auto rounded-control border border-inner-border">
             <DataTable headers={["Status", "Title", "Granted", "Expires", ""]}>
               {credits.map((credit) => {
                 const available = (credit.status ?? "available") === "available";
                 const remaining = remainingLabel(credit.expiresAt);
                 return (
                   <tr key={credit.id}>
-                    <td style={{ whiteSpace: "nowrap", verticalAlign: "middle" }}>
+                    <td className="whitespace-nowrap align-middle">
                       <Badge
                         tone={available ? "ok" : credit.status === "expired" ? "disabled" : "warn"}
                       >
@@ -174,44 +151,26 @@ function QuotaAccountResetModal({
                       </Badge>
                     </td>
                     <td
-                      style={{
-                        fontSize: "12px",
-                        color: "var(--text-primary)",
-                        fontWeight: 500,
-                        whiteSpace: "nowrap",
-                        verticalAlign: "middle",
-                      }}
+                      className="text-caption font-medium whitespace-nowrap align-middle text-text-primary"
                     >
                       {credit.title ?? "Rate-limit reset"}
                     </td>
                     <td
-                      style={{
-                        fontSize: "11px",
-                        color: "var(--text-secondary)",
-                        whiteSpace: "nowrap",
-                        fontVariantNumeric: "tabular-nums",
-                        verticalAlign: "middle",
-                      }}
+                      className="text-badge whitespace-nowrap tabular-nums align-middle text-text-secondary"
                     >
                       {grantedLabel(credit.grantedAt)}
                     </td>
                     <td
-                      style={{
-                        fontSize: "11px",
-                        color: "var(--text-secondary)",
-                        whiteSpace: "nowrap",
-                        fontVariantNumeric: "tabular-nums",
-                        verticalAlign: "middle",
-                      }}
+                      className="text-badge whitespace-nowrap tabular-nums align-middle text-text-secondary"
                     >
                       {expiryLabel(credit.expiresAt)}
                       {remaining && (
-                        <span style={{ color: "var(--text-tertiary)", marginLeft: "6px" }}>
+                        <span className="ml-3 text-text-tertiary">
                           ({remaining})
                         </span>
                       )}
                     </td>
-                    <td style={{ whiteSpace: "nowrap", textAlign: "right", verticalAlign: "middle" }}>
+                    <td className="whitespace-nowrap text-right align-middle">
                       <Button
                         size="sm"
                         variant={available ? "primary" : "secondary"}
@@ -253,6 +212,96 @@ function QuotaAccountResetModal({
         </Inline>
       </div>
     </Dialog>
+  );
+}
+
+/**
+ * Manual daily-growth pass for one buddy provider, at page level.
+ *
+ * The sweep already runs this, but an operator sometimes wants to trigger it
+ * now — and wants the whole provider's accounts done in one click rather than
+ * opening each card. One button runs the same order the worker uses: the
+ * activity report first, then the check-in claim, batched over every account of
+ * the selected provider with egress rotated per account.
+ *
+ * Only buddy providers are offered; the rest have no daily check-in and would
+ * be refused.
+ */
+function DailyGrowthActions({
+  accounts,
+}: {
+  readonly accounts: readonly QuotaEntry[];
+}): ReactNode {
+  const providers = useMemo(() => {
+    const seen = new Map<string, { id: string; label: string; count: number }>();
+    for (const account of accounts) {
+      if (!supportsAccountCheckin(account.provider)) continue;
+      const existing = seen.get(account.provider);
+      if (existing) existing.count += 1;
+      else
+        seen.set(account.provider, {
+          id: account.provider,
+          label: account.providerName || account.provider,
+          count: 1,
+        });
+    }
+    return [...seen.values()];
+  }, [accounts]);
+
+  const [providerId, setProviderId] = useState("");
+  const selected = providers.find((entry) => entry.id === providerId) ?? providers[0];
+  const activeId = selected?.id ?? "";
+  const batch = useTriggerProviderDailyGrowth(activeId);
+  const disabled = activeId.length === 0 || batch.isPending || providers.length === 0;
+
+  return (
+    <div
+      className="flex min-w-0 flex-wrap items-center gap-2.5"
+      aria-label="Daily growth actions"
+    >
+      <div className="min-w-0 w-67.5">
+        <Select
+          aria-label="Provider for the daily growth pass"
+          value={activeId}
+          onValueChange={setProviderId}
+          className="w-full h-16"
+          options={
+            providers.length > 0
+              ? providers.map((entry) => ({
+                  value: entry.id,
+                  label: `${entry.label} · ${entry.count}`,
+                }))
+              : [{ value: "", label: "No buddy providers" }]
+          }
+        />
+      </div>
+      <Button
+        variant="secondary"
+        size="sm"
+        title="Send the activity report, then claim the daily check-in, for every account of this provider"
+        aria-label="Run the daily growth pass for this provider"
+        disabled={disabled}
+        className="shrink-0"
+        icon={
+          batch.isPending ? <Loader2 size={13} className="animate-spin" /> : <CalendarCheck size={13} />
+        }
+        onClick={() =>
+          batch.mutate(undefined, {
+            onSuccess: (result) => {
+              const failed = result.data.filter((entry) => !entry.report.ok).length;
+              if (failed === 0) toast.success(result.message);
+              else
+                toast.error(
+                  `${result.message} — ${failed} report${failed === 1 ? "" : "s"} failed`,
+                );
+            },
+            onError: (err) => toast.error(getErrorMessage(err, "Unable to run the daily growth pass")),
+          })
+        }
+      >
+        Daily growth
+      </Button>
+    </div>
   );
 }
 
@@ -298,12 +347,12 @@ function QuotaCard({
     ? lastCheckin.state === "claimed"
       ? `Checked in${lastCheckin.credit !== null ? ` +${lastCheckin.credit}` : ""}${lastCheckin.streakDays !== null ? ` · ${lastCheckin.streakDays}d streak` : ""}`
       : lastCheckin.state === "already_claimed"
-        ? "Already checked in"
+        ? "Check-in attempted · already claimed"
         : lastCheckin.state === "not_eligible"
-          ? "Not eligible"
+          ? "Check-in attempted · not eligible"
           : lastCheckin.state === "event_ended"
-            ? "Event ended"
-            : "Check-in unavailable"
+            ? "Check-in attempted · event ended"
+            : "Check-in attempted · unavailable"
     : attemptedToday
       ? "Check-in attempted today"
       : "Check-in due";
@@ -323,6 +372,7 @@ function QuotaCard({
   }, 0);
   const rawError =
     (refresh.error ? getErrorMessage(refresh.error, "Unable to refresh this account") : null) ??
+    quota?.refreshError ??
     quota?.error ??
     account.health?.sanitizedMessage;
   const friendly = friendlyQuotaError(rawError);
@@ -332,106 +382,37 @@ function QuotaCard({
   const healthStatus = account.health?.status ?? "unknown";
 
   return (
-    <div
-      className="overflow-hidden rounded-xl border border-[var(--inner-border)] bg-[var(--glass-bg)] shadow-[0_8px_30px_rgba(0,0,0,.12)] backdrop-blur-xl"
-      style={{
-        background: "var(--glass-bg)",
-        borderColor: "var(--inner-border)",
-        borderRadius: "14px",
-      }}
-      aria-busy={busy}
-    >
+    <Card className="flex h-full flex-col overflow-hidden" aria-busy={busy}>
       {/* Header: icon + provider name + plan + account hint + actions */}
-      <div
-        className="flex flex-wrap items-center gap-2.5 px-3.5 py-2"
-        style={{
-          display: "flex",
-          alignItems: "center",
-          gap: "10px",
-          padding: "8px 14px",
-          flexWrap: "wrap",
-        }}
-      >
+      <div className="flex flex-wrap items-center gap-5 px-7 py-4">
         <ProviderIcon icon={account.providerIcon} name={account.providerName} size={32} />
-        <div className="min-w-0 flex-1" style={{ minWidth: "160px", flex: "1 1 160px" }}>
-          <div
-            className="flex min-w-0 items-center gap-2"
-            style={{ display: "flex", alignItems: "center", gap: "8px" }}
-          >
-            <div
-              className="truncate text-sm font-bold"
-              style={{
-                fontSize: "13.5px",
-                fontWeight: 700,
-                color: "var(--text-primary)",
-              }}
-            >
+        <div className="flex-[1_1_160px]">
+          <div className="flex min-w-0 items-center gap-4">
+            <div className="truncate text-caption font-bold text-text-primary text-body">
               {account.providerName}
             </div>
             {quota?.plan && (
-              <span
-                className="shrink-0 rounded-full bg-[var(--accent-soft)] px-2 py-0.5 text-[10px] font-semibold text-[var(--accent)]"
-                style={{
-                  padding: "2px 8px",
-                  borderRadius: "9999px",
-                  fontSize: "10px",
-                  fontWeight: 600,
-                  background: "var(--accent-soft)",
-                  color: "var(--accent)",
-                }}
-              >
+              <span className="shrink-0 rounded-chip bg-accent-soft px-4 py-1 text-micro font-semibold text-accent">
                 {quota.plan}
               </span>
             )}
-            {healthStatus !== "active" ? (
-              <Badge
-                tone={
-                  healthStatus === "disabled"
-                    ? "disabled"
-                    : healthStatus === "unknown"
-                      ? "default"
-                      : "warn"
-                }
-                dot
-                title={account.health?.sanitizedMessage ?? undefined}
-              >
-                {healthStatus}
-                {account.health?.lastErrorCategory ? ` · ${account.health.lastErrorCategory}` : ""}
-              </Badge>
-            ) : null}
           </div>
-          <div
-            className="truncate text-[11px] text-[var(--text-secondary)]"
-            style={{ fontSize: "11px", color: "var(--text-secondary)" }}
-          >
+          <div className="truncate text-badge text-text-secondary">
             {identity.primary}
           </div>
           {identity.secondary !== null && (
-            <div
-              className="truncate text-[10px] text-[var(--text-tertiary)]"
-              style={{ fontSize: "10px", color: "var(--text-tertiary)" }}
-            >
+            <div className="truncate text-micro text-text-tertiary">
               {identity.secondary}
             </div>
           )}
           {quota && (
-            <div
-              className="truncate text-[10px] text-[var(--text-tertiary)]"
-              style={{ fontSize: "10px", color: "var(--text-tertiary)" }}
-            >
+            <div className="truncate text-micro text-text-tertiary">
               {formatQuotaRefresh(quota.lastSuccessAt ?? quota.fetchedAt)}
             </div>
           )}
           {canReset && (
             <div
-              className="truncate text-[10px]"
-              style={{
-                fontSize: "10px",
-                color: "var(--text-tertiary)",
-                display: "flex",
-                alignItems: "center",
-                gap: "4px",
-              }}
+              className="truncate text-micro flex items-center gap-2 text-text-tertiary"
               title="Saved rate-limit reset credits available on this account"
             >
               {resets.isPending ? (
@@ -440,7 +421,7 @@ function QuotaCard({
                 <>
                   <Zap
                     size={10}
-                    style={{ color: "var(--status-success)", flexShrink: 0 }}
+                    className="text-status-success shrink-0"
                     aria-hidden="true"
                   />
                   <span className="reset-credit-live">
@@ -455,38 +436,24 @@ function QuotaCard({
           )}
           {canCheckin && (
             <>
-              <div
-                className="truncate text-[10px] text-[var(--text-tertiary)]"
-                style={{ fontSize: "10px", color: "var(--text-tertiary)" }}
-                title="Daily growth state: manual pass result, else the sweep ledger for today"
-              >
+              <div title="Daily growth state: manual pass result, else the sweep ledger for today"
+               className="truncate text-micro text-text-tertiary">
                 {growth.isPending ? "Running growth pass…" : statusHint}
               </div>
               {quotaWindows.some((window) => typeof window.limit === "number" && Number.isFinite(window.limit)) && (
-                <div
-                  className="truncate text-[10px] text-[var(--text-tertiary)]"
-                  style={{ fontSize: "10px", color: "var(--text-tertiary)" }}
-                >
+                <div className="truncate text-micro text-text-tertiary">
                   Total credits: {totalCredits.toLocaleString(undefined, { maximumFractionDigits: 2 })}
                 </div>
               )}
             </>
           )}
         </div>
-        <div
-          className="flex items-center gap-1"
-          style={{
-            display: "flex",
-            alignItems: "center",
-            gap: "6px",
-            marginLeft: "auto",
-          }}
-        >
+        <div className="flex items-center gap-1.75 gap-3 ml-auto">
           {canReset && (
             <Button
               variant="ghost"
               size="icon"
-              className="size-8"
+              className="w-16 h-16 p-0"
               title={
                 resets.isPending
                   ? "Checking saved rate-limit resets…"
@@ -497,7 +464,6 @@ function QuotaCard({
               aria-label={`Open saved rate-limit resets for ${account.name}`}
               disabled={busy}
               onClick={() => onShowResets(account)}
-              style={{ width: "32px", height: "32px", padding: 0 }}
             >
               <Zap size={14} />
             </Button>
@@ -506,7 +472,7 @@ function QuotaCard({
             <Button
               variant="ghost"
               size="icon"
-              className="size-8"
+              className="w-16 h-16 p-0"
               title={`Daily growth pass (check-in + activity report) — ${statusHint}`}
               aria-label={`Run daily growth pass for ${account.name}`}
               disabled={busy}
@@ -533,7 +499,6 @@ function QuotaCard({
                   },
                 })
               }
-              style={{ width: "32px", height: "32px", padding: 0 }}
             >
               {growth.isPending ? <Loader2 size={14} className="animate-spin" /> : <CalendarCheck size={14} />}
             </Button>
@@ -541,8 +506,19 @@ function QuotaCard({
           <Button
             variant="ghost"
             size="sm"
-            title="Health & Error Log"
-            aria-label={`Health log for ${account.name}`}
+            // The card no longer carries a status pill, so this is where the
+            // status is read: the account's own state, then where to inspect it.
+            // A healthy account still just says "Health & Error Log".
+            title={
+              healthStatus === "active"
+                ? "Health & Error Log"
+                : `${healthStatus} — Inspect account health details`
+            }
+            aria-label={
+              healthStatus === "active"
+                ? `Health log for ${account.name}`
+                : `Account is ${healthStatus} — inspect health details for ${account.name}`
+            }
             disabled={busy}
             onClick={() => onShowHealth(account)}
             icon={<Activity size={12} />}
@@ -568,7 +544,7 @@ function QuotaCard({
             title="Delete account"
             aria-label={`Delete ${account.name}`}
             onClick={() => onDelete(account)}
-            style={{ color: "var(--red)" }}
+            className="text-red"
             icon={<Trash2 size={12} />}
           />
           <Switch
@@ -583,17 +559,7 @@ function QuotaCard({
 
       {cardError && (
         <div
-          className="flex items-center justify-center gap-2 border-t border-[var(--inner-border)] px-4 py-3 text-center text-[11px] text-[var(--red)]"
-          style={{
-            display: "flex",
-            alignItems: "center",
-            justifyContent: "center",
-            gap: "8px",
-            borderTop: "1px solid var(--inner-border)",
-            padding: "10px 16px",
-            fontSize: "11px",
-            color: "var(--red)",
-          }}
+          className="flex items-center justify-center gap-4 border-t border-inner-border px-8 py-5 text-center text-badge text-red"
           role="alert"
         >
           <TriangleAlert size={13} className="shrink-0" />
@@ -604,24 +570,9 @@ function QuotaCard({
       {/* Quota progress bars */}
       {quota?.windows.length ? (
         <div
-          className="quota-window-list"
-          style={{
-            display: "flex",
-            flexDirection: "column",
-            gap: "8px",
-            borderTop: "1px solid var(--inner-border)",
-            padding: "9px 14px",
-          }}
+          className="quota-window-list flex flex-1 flex-col gap-4 border-t border-inner-border px-7 py-4.5"
         >
-          <div
-            className="quota-window-section-label"
-            style={{
-              fontSize: "10px",
-              fontWeight: 700,
-              letterSpacing: "0.08em",
-              color: "var(--text-tertiary)",
-            }}
-          >
+          <div className="quota-window-section-label text-micro font-bold tracking-label text-text-tertiary">
             QUOTA WINDOWS
           </div>
           {pagination.items.map((window, index) => {
@@ -646,68 +597,42 @@ function QuotaCard({
             const label = formatQuotaWindowLabel(window.label);
             return (
               <div
-                className="quota-window-row"
+                className="quota-window-row grid grid-cols-quota-window min-w-0 items-center gap-x-6 gap-y-2 max-small:grid-cols-[minmax(0,1fr)_auto] max-small:gap-x-4 max-small:gap-y-2.5"
                 key={`${window.kind ?? window.label}:${window.resetsAt ?? "none"}:${index}`}
               >
-                <div className="quota-window-heading">
-                  <span
-                    className="text-[11px] font-semibold text-[var(--text-primary)]"
-                    style={{ fontSize: "11px", fontWeight: 600, color: "var(--text-primary)" }}
-                  >
+                <div className="quota-window-heading min-w-0 max-small:col-start-1">
+                  <span className="text-badge font-semibold text-text-primary">
                     {label}
                   </span>
                 </div>
                 <div
-                  className="quota-bar-track quota-window-bar"
+                  className="quota-bar-track quota-window-bar min-w-0 w-full h-5 rounded-tiny bg-inner-border overflow-hidden max-small:col-span-full max-small:row-start-2"
                   role="progressbar"
                   aria-label={`${label} remaining quota`}
                   aria-valuemin={0}
                   aria-valuemax={100}
                   aria-valuenow={remaining === null ? undefined : quotaFillPct}
                   aria-valuetext={remaining === null ? "Quota only" : `${formatPercent(remaining)}% remaining`}
-                  style={{
-                    height: "10px",
-                    borderRadius: "4px",
-                    background: "var(--inner-border)",
-                    overflow: "hidden",
-                  }}
                 >
                   <div
-                    className="quota-bar-fill"
-                    style={{
-                      width: `${quotaFillPct}%`,
-                      height: "100%",
-                      borderRadius: "3px",
-                      background: colors.bar,
-                      transition: "width var(--dur-macro) var(--ease-spring)",
-                    }}
+                    className="quota-bar-fill h-full rounded-tiny transition-[width] duration-(--dur-macro) ease-spring"
+                    style={{ width: `${quotaFillPct}%`, background: colors.bar }}
                   />
                 </div>
                 <span
-                  className="quota-window-remaining text-[11px] font-bold tabular-nums"
-                  style={{
-                    fontSize: "11px",
-                    fontWeight: 700,
-                    color: colors.text,
-                    fontVariantNumeric: "tabular-nums",
-                  }}
+                  className="quota-window-remaining whitespace-nowrap text-badge font-bold tabular-nums max-small:col-start-2 max-small:row-start-1"
+                  style={{ color: colors.text }}
                 >
                   {remaining === null ? "—" : `${formatPercent(remaining)}%`}
                 </span>
-                <div className="quota-window-details">
-                  <span
-                    className="quota-window-usage"
-                    style={{ fontVariantNumeric: "tabular-nums" }}
-                  >
+                <div className="quota-window-details col-span-full flex min-w-0 items-center justify-end gap-6 text-micro text-text-tertiary max-small:row-start-3 max-small:flex-wrap max-small:justify-between max-small:gap-4">
+                  <span className="quota-window-usage mr-auto tabular-nums max-small:min-w-0">
                     {usedCredits !== null && limit !== null
                       ? `${formatAmount(usedCredits)} / ${formatAmount(limit)} Credits`
                       : "Quota only"}
                   </span>
                   {window.resetsAt && (
-                    <span
-                      className="quota-window-reset"
-                      style={{ fontVariantNumeric: "tabular-nums", textAlign: "right" }}
-                    >
+                    <span className="quota-window-reset whitespace-nowrap tabular-nums text-right max-small:ml-auto">
                       {formatResetDistance(window.resetsAt, window.recurring)}
                     </span>
                   )}
@@ -718,23 +643,15 @@ function QuotaCard({
           {pagination.pageCount > 1 && (
             <nav
               aria-label={`Quota windows for ${account.name}`}
-              className="quota-window-pagination"
-              style={{
-                display: "flex",
-                alignItems: "center",
-                justifyContent: "space-between",
-                gap: "8px",
-                borderTop: "1px solid var(--inner-border)",
-                paddingTop: "8px",
-              }}
+              className="quota-window-pagination mt-auto flex items-center justify-between gap-4 border-t border-inner-border pt-4 max-small:flex-wrap"
             >
               <span
                 aria-live="polite"
-                style={{ fontSize: "10px", color: "var(--text-tertiary)" }}
+                className="text-micro text-text-tertiary"
               >
                 Showing {pagination.startIndex + 1}–{pagination.startIndex + pagination.items.length} of {quotaWindows.length}
               </span>
-              <div style={{ display: "flex", alignItems: "center", gap: "4px" }}>
+              <div className="flex items-center gap-2">
                 <Button
                   variant="ghost"
                   size="sm"
@@ -742,7 +659,7 @@ function QuotaCard({
                   disabled={pagination.page === 0}
                   icon={<ChevronLeft size={13} />}
                   onClick={() => setQuotaWindowPage(pagination.page - 1)}
-                  style={{ height: "28px", padding: "0 8px" }}
+                  className="h-14 px-4 py-0"
                 >
                   Previous
                 </Button>
@@ -753,7 +670,7 @@ function QuotaCard({
                   disabled={pagination.page >= pagination.pageCount - 1}
                   icon={<ChevronRight size={13} />}
                   onClick={() => setQuotaWindowPage(pagination.page + 1)}
-                  style={{ height: "28px", padding: "0 8px" }}
+                  className="h-14 px-4 py-0"
                 >
                   Next
                 </Button>
@@ -763,14 +680,7 @@ function QuotaCard({
         </div>
       ) : !cardError ? (
         <div
-          className="border-t border-[var(--inner-border)] py-4 text-center text-[11px] text-[var(--text-tertiary)]"
-          style={{
-            borderTop: "1px solid var(--inner-border)",
-            padding: "18px 14px",
-            textAlign: "center",
-            fontSize: "11px",
-            color: "var(--text-tertiary)",
-          }}
+          className="border-t border-inner-border px-7 py-9 text-center text-badge text-text-tertiary"
         >
           {/* A pending fill is a real state with a known end, so it gets its own
               copy instead of the misleading "No quota data" a settled empty
@@ -778,7 +688,7 @@ function QuotaCard({
           {busy || account.pending ? "Fetching quota…" : "No quota data"}
         </div>
       ) : null}
-    </div>
+    </Card>
   );
 }
 
@@ -872,111 +782,111 @@ export default function QuotaPage(): ReactNode {
   const emptyCount = accounts.filter(isEmpty).length;
 
   return (
-    <Stack gap="16px" className="dashboard-page" style={{ minHeight: 0, flex: 1 }}>
-      <Toolbar className="page-toolbar-sticky">
-        <SlidersHorizontal
-          size={14}
-          className="mx-1 text-[var(--text-tertiary)]"
-          style={{ color: "var(--text-tertiary)" }}
-          aria-hidden="true"
-        />
-        <Select
-          aria-label="Filter quota by provider"
-          value={providerFilter}
-          onValueChange={setProviderFilter}
-          style={{ width: "160px", height: "32px" }}
-          options={[
-            { value: "all", label: "All Providers" },
-            ...providers.map((provider) => ({ value: provider.id, label: provider.name })),
-          ]}
-        />
-        <Select
-          aria-label="Filter quota by account"
-          value={accountFilter}
-          onValueChange={setAccountFilter}
-          style={{ width: "135px", height: "32px" }}
-          options={[
-            { value: "all", label: "With quota" },
-            { value: "active", label: "Active" },
-            { value: "disabled", label: "Disabled" },
-            { value: "untracked", label: "No quota" },
-          ]}
-        />
-        <Button
-          variant={expiringFirst ? "secondary" : "ghost"}
-          size="sm"
-          onClick={() => setExpiringFirst((current) => !current)}
-          aria-pressed={expiringFirst}
-          icon={<Clock3 size={13} />}
-        >
-          Expiring first
-        </Button>
-        <Button
-          variant="ghost"
-          size="sm"
-          className="text-[var(--red)]"
-          style={{ color: "var(--red)" }}
-          disabled={emptyCount === 0 || isFetching}
-          onClick={() => void turnOffEmpty()}
-          icon={<EyeOff size={13} />}
-        >
-          Turn off Empty
-        </Button>
-        <Button
-          variant="ghost"
-          size="sm"
-          className="text-[var(--green)]"
-          style={{ color: "var(--green)" }}
-          disabled={isFetching}
-          onClick={() => void turnOnAvailable()}
-          icon={<Check size={13} />}
-        >
-          Turn on Available
-        </Button>
-        <span
-          className="ml-auto flex items-center gap-1 text-[10px] text-[var(--text-tertiary)]"
-          style={{
-            marginLeft: "auto",
-            display: "flex",
-            alignItems: "center",
-            gap: "6px",
-            fontSize: "10.5px",
-            color: "var(--text-tertiary)",
-          }}
-        >
+    <Stack gap="16px" className="dashboard-page min-h-0 flex-1">
+      <Card>
+        <CardHeader title="Quota" subtitle="Provider account limits and what is left of them" icon={<SlidersHorizontal size={16} />} />
+      </Card>
+      <Card>
+        <CardBody className="flex flex-col gap-5">
+      <div className="flex flex-wrap items-center justify-between gap-5">
+        <div className="flex min-w-0 flex-1 flex-wrap items-center gap-4">
+          <Select
+            aria-label="Filter quota by provider"
+            value={providerFilter}
+            onValueChange={setProviderFilter}
+            className="w-full h-16 max-small:w-80"
+            options={[
+              { value: "all", label: "All Providers" },
+              ...providers.map((provider) => ({ value: provider.id, label: provider.name })),
+            ]}
+          />
+          <Select
+            aria-label="Filter quota by account"
+            value={accountFilter}
+            onValueChange={setAccountFilter}
+            className="w-full h-16 max-small:w-67.5"
+            options={[
+              { value: "all", label: "With quota" },
+              { value: "active", label: "Active" },
+              { value: "disabled", label: "Disabled" },
+              { value: "untracked", label: "No quota" },
+            ]}
+          />
+        </div>
+        <div className="flex flex-wrap items-center gap-4">
+          <Button
+            variant={expiringFirst ? "secondary" : "ghost"}
+            size="sm"
+            onClick={() => setExpiringFirst((current) => !current)}
+            aria-pressed={expiringFirst}
+            icon={<Clock3 size={13} />}
+          >
+            Expiring first
+          </Button>
+          <Button
+            variant="ghost"
+            size="sm"
+            className="text-red"
+            disabled={emptyCount === 0 || isFetching}
+            onClick={() => void turnOffEmpty()}
+            icon={<EyeOff size={13} />}
+          >
+            Turn off Empty
+          </Button>
+          <Button
+            variant="ghost"
+            size="sm"
+            className="text-green"
+            disabled={isFetching}
+            onClick={() => void turnOnAvailable()}
+            icon={<Check size={13} />}
+          >
+            Turn on Available
+          </Button>
+        </div>
+      </div>
+      <div className="flex flex-wrap items-center justify-between gap-4 border-t border-inner-border pt-5">
+        <span className="text-badge text-text-tertiary">
+          {filteredAccounts.length} shown
+          {emptyCount > 0 ? ` · ${emptyCount} empty` : ""}
+        </span>
+        <span className="flex min-w-0 flex-wrap items-center gap-x-5 gap-y-3 text-badge text-text-tertiary">
           {refreshingCount > 0
             ? `Refreshing ${refreshingCount} account${refreshingCount === 1 ? "" : "s"}…`
-            : `Auto-refresh (60s) · updated ${lastUpdated}`}{" "}
-          · {filteredAccounts.length} shown
-        </span>
-        <Button
-          variant="ghost"
-          size="icon"
-          className="size-8"
-          title="Queue quota refresh"
-          aria-label="Queue quota refresh"
-          disabled={isFetching || refreshAll.isPending || accounts.length === 0}
-          onClick={() =>
-            refreshAll.mutate(
-              accounts.map((account) => account.id),
-              {
-                onSuccess: (result) => {
-                  toast.success(
-                    result.failed === 0
-                      ? `Refreshed ${result.succeeded} quota${result.succeeded === 1 ? "" : "s"}`
-                      : `Refreshed ${result.succeeded}, ${result.failed} failed`,
-                  );
+            : `Auto-refresh 60s · ${lastUpdated}`}
+          <DailyGrowthActions accounts={accounts} />
+          <Button
+            variant="secondary"
+            size="sm"
+            title="Queue quota refresh"
+            aria-label="Queue quota refresh"
+            disabled={isFetching || refreshAll.isPending || accounts.length === 0}
+            icon={<RefreshCw size={13} className={refreshAll.isPending ? "animate-spin" : undefined} />}
+            onClick={() =>
+              refreshAll.mutate(
+                accounts.map((account) => account.id),
+                {
+                  onSuccess: (result) => {
+                    toast.success(
+                      result.failed === 0
+                        ? `Refreshed ${result.succeeded} quota${result.succeeded === 1 ? "" : "s"}`
+                        : `Refreshed ${result.succeeded}, ${result.failed} failed`,
+                    );
+                  },
+                  onError: (err) =>
+                    toast.error(err instanceof Error ? err.message : "Unable to refresh quota"),
                 },
-                onError: (err) =>
-                  toast.error(err instanceof Error ? err.message : "Unable to refresh quota"),
-              },
-            )
-          }
-          style={{ width: "32px", height: "32px", padding: 0 }}
-        >
-          <RefreshCw size={14} className={refreshAll.isPending ? "animate-spin" : undefined} />
-        </Button>
-      </Toolbar>
+              )
+            }
+          >
+            Refresh
+          </Button>
+        </span>
+      </div>
+        </CardBody>
+      </Card>
+      <div className="flex min-h-0 flex-1 flex-col gap-6">
+
 
       {isLoading ? (
         <StatePanel
@@ -1000,20 +910,15 @@ export default function QuotaPage(): ReactNode {
           }
         />
       ) : filteredAccounts.length === 0 ? (
-        <StatePanel
-          className="min-h-0 flex flex-1 flex-col items-center justify-center"
-          kind="empty"
-          title="No account quota data"
-          description="No tracked provider quota is available yet."
-        />
+        <div className="flex-1 flex items-center justify-center p-12 border border-dashed border-transparent rounded-card bg-transparent text-center">
+          <EmptyState
+            title="No account quota data"
+            message="Nothing is reporting a quota window yet. Add a provider account and its limits will appear here."
+          />
+        </div>
       ) : (
         <div
-          className="grid grid-cols-1 gap-3 lg:grid-cols-2"
-          style={{
-            display: "grid",
-            gridTemplateColumns: "repeat(auto-fill, minmax(min(420px, 100%), 1fr))",
-            gap: "12px",
-          }}
+          className="quota-account-grid scroll-region min-h-0 flex-1 gap-6 [align-content:start]"
         >
           {filteredAccounts.map((account) => (
             <QuotaCard
@@ -1027,6 +932,7 @@ export default function QuotaPage(): ReactNode {
           ))}
         </div>
       )}
+      </div>
 
       {healthTarget && (
         <HealthEventsModal

@@ -1,6 +1,6 @@
 import type { FetchLike } from "../quota/quota-contracts";
-import type { ModelDefinition } from "../model-definition";
-import type { ServiceKind } from "../../transport/canonical-model";
+import type { ModelDefinition } from "../provider-model-definition";
+import type { ServiceKind } from "../../protocol/canonical-model";
 
 /**
  * Credential-scoped model-discovery input.
@@ -82,6 +82,16 @@ export interface ProbeModelResult {
   latencyMs: number;
   ttfbMs?: number;
   sample?: string;
+  /**
+   * The `model` the upstream reported in its own response, verbatim.
+   *
+   * Not the model the probe asked for, and deliberately no fallback to it: a
+   * probe that asked for `muse-spark-1.3` and was answered by
+   * `deepseek-v4.1-flash` has found something, and filling in the requested id
+   * when the response carried none would report the ask as if it were the
+   * answer. Absent means the response said nothing.
+   */
+  reportedModel?: string;
   statusCode?: number;
   error?: string;
   /** Normalized hits a `websearch` probe returned, so the console can show them. */
@@ -114,6 +124,12 @@ export interface ByokConnectionTestResult {
   /** Number of models the upstream advertised; absent when the body was not a list. */
   readonly modelCount?: number;
   readonly error?: string;
+  /**
+   * A non-blocking note about what was corrected or looks wrong in the submitted
+   * base URL. Absent when the input was already a root. The test still reports
+   * `ok` on its own terms; this is the operator-facing explanation.
+   */
+  readonly warning?: string;
 }
 
 /** One entry of a batched provider-wide probe (`probeAllModels`). */

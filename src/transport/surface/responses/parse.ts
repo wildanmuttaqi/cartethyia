@@ -1,5 +1,5 @@
-import type { CanonicalMessage, CanonicalRequest, ContentPart, GenerationControls, ToolDefinition } from "../../canonical-model";
-import { isRecord } from "../../../protocol/primitives";
+import type { CanonicalMessage, CanonicalRequest, ContentPart, GenerationControls, ToolDefinition } from "../../../protocol/canonical-model";
+import { isRecord } from "../../../protocol/codecs";
 import { textPart, normalizeInlineFile } from "../content-parts";
 import {
   isServiceTier,
@@ -8,7 +8,7 @@ import {
   parseToolChoice,
   parseToolDefinition,
 } from "../dialects";
-import { readBoolean, readNumber, readString } from "../../../protocol/primitives";
+import { readBoolean, readNumber, readString } from "../../../protocol/codecs";
 import { ResponsesReasoningError } from "./errors";
 import type { ResponsesComputerAction, ResponsesInputItem, ResponsesItemMetadata } from "./contracts";
 const OPENAI_RESPONSE_INCLUDES = {
@@ -345,6 +345,7 @@ function parseInputItem(item: ResponsesInputItem): {
       throw new Error("Responses function_call requires call_id and name");
     const args = item["arguments"];
     if (args === undefined) throw new Error("Responses function_call requires arguments");
+    const namespace = readString(item, "namespace");
     return {
       message: {
         role: "assistant",
@@ -355,6 +356,7 @@ function parseInputItem(item: ResponsesInputItem): {
             name,
             arguments: args,
             ...(id === undefined ? {} : { item_id: id }),
+            ...(namespace === undefined ? {} : { namespace }),
           },
         ],
       },

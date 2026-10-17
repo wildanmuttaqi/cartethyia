@@ -1,11 +1,12 @@
-import { GatewayError } from "../gateway-error";
-import type { CanonicalRequest, UsageRecord } from "../canonical-model";
+import { GatewayError } from "../../protocol/gateway-error";
+import type { CanonicalRequest, UsageRecord } from "../../protocol/canonical-model";
 import type { ClientIdentity } from "../../security/abuse";
 import type { ResolvedApiKey } from "../../security/api-key-auth";
 import type { PreparedProxyRequest } from "./preparer";
+import type { PayloadCaptureState, TelemetryPayloadCapture } from "../../observability/payload-capture";
 import { createInFlightRegistry, type InFlightSnapshot } from "./inflight";
 import { log } from "../../observability/logger";
-import { fastPathname } from "./pathname";
+import { fastPathname } from "../pathname";
 
 export interface ProxyRequestOutcome {
   readonly status: "completed" | "failed" | "cancelled" | "truncated";
@@ -29,6 +30,15 @@ export interface ProxyRequestOutcome {
    */
   readonly errorOrigin?: string;
   readonly usage?: UsageRecord;
+  /**
+   * The `model` the upstream put in its own response, verbatim.
+   *
+   * Distinct from the model the request asked for. A provider that answers a
+   * `muse-spark` request as `deepseek-v4.1-flash` is telling the operator
+   * something the request cannot; recording the ask as if it were the answer
+   * would hide exactly that. Absent when the response carried no `model`.
+   */
+  readonly reportedModel?: string;
   readonly ttfbMs?: number;
   readonly tokensPerSec?: number;
   /** First meaningful content delta timestamp (for TTFT calculation). */
@@ -47,6 +57,17 @@ export interface ProxyRequestState {
   readonly abortController: AbortController;
   /** Body decoded by the single ingress reader, when this is a proxy request. */
   ingressBody?: unknown;
+  /**
+   * Drops the parsed ingress body once it can no longer be needed.
+   *
+   * The parsed body is the largest per-request value and, for a canonical
+   * request, only payload capture reads it after the canonical request exists.
+   * Capture reads it at finalize — after the whole upstream stream — so the
+   * dispatch path calls this before dispatch when the tenant's capture mode
+   * does not keep request bodies. The object then becomes unreachable and is
+   * reclaimed, instead of being held for the request's lifetime.
+   */
+  releaseIngressBody(): void;
   /** Inbound method/path are retained for structured Console Log events. */
   ingressMethod?: string;
   ingressPath?: string;
@@ -57,6 +78,31 @@ export interface ProxyRequestState {
   canonicalRequest?: CanonicalRequest;
   preparedRequest?: PreparedProxyRequest;
   outcome?: ProxyRequestOutcome;
+  /**
+   * Payload capture for this request, stashed so a rejection that never
+   * reaches `completeAttempt` can still record what the client sent. Set on
+   * the same code path that builds the dispatch deps; optional because a
+   * route may decline to capture.
+   */
+  payloadCapture?: TelemetryPayloadCapture;
+  /**
+   * The error envelope the client was given, for a rejection raised before
+   * dispatch. `attempt-finalize` derives this for dispatched attempts; an
+   * early rejection has no attempt, so it is recorded here instead and both
+   * paths end up with the same four panels populated.
+   */
+  clientResponseText?: string;
+  /**
+   * Why this request's drawer payloads were not captured, or `captured` when
+   * they were. Written by the capture path and read by telemetry finalization.
+   *
+   * Remote-diagnosis field: the drawer reads empty for reasons invisible from
+   * the client — the tenant's capture mode, a missing tenant, a non-terminal
+   * attempt — and without the reason an operator cannot tell "not configured"
+   * from "broken". The four panels are the only surface that could previously
+   * hint at it, and they look identical in both cases.
+   */
+  payloadCaptureState?: PayloadCaptureState;
   /**
    * Set by the dispatch handler synchronously before returning a streaming
    * response. `afterResponse` lifecycle hooks read it to skip finalization
@@ -195,7 +241,7 @@ export class ProxyRequestStateStore {
     const abortReason =
       reason instanceof Error || reason instanceof DOMException
         ? reason
-        : new GatewayError("shutting_down", 503, "Service is shutting down");
+        : new GatewayError("shutting_down", 503, "The gateway is shutting down, so this request cannot be served. Retry against a live instance.");
     for (const controller of controllers) {
       try {
         if (!controller.signal.aborted) controller.abort(abortReason);
@@ -253,6 +299,9 @@ export class ProxyRequestStateStore {
         if (cleaned || providerFlightStarted) return;
         providerFlightStarted = true;
         this.inFlight.track(requestId, state.clientIdentity?.address ?? "unknown", state.deadlineMs);
+      },
+      releaseIngressBody: () => {
+        state.ingressBody = undefined;
       },
       ingressMethod: request.method,
       ingressPath: fastPathname(request.url),
@@ -314,7 +363,7 @@ export class ProxyRequestStateStore {
   require(request: Request): ProxyRequestState {
     const state = this.states.get(request);
     if (!state)
-      throw new GatewayError("admission_unavailable", 503, "proxy request context unavailable");
+      throw new GatewayError("admission_unavailable", 503, "The request was never registered, so it cannot be served. Resend the request.");
     return state;
   }
 

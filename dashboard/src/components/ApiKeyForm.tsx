@@ -1,12 +1,37 @@
-import { useState, type ReactNode } from "react";
+import {
+  Ban,
+  Boxes,
+  ChevronDown,
+  Database,
+  Eye,
+  Fingerprint,
+  Gauge,
+  KeyRound,
+  LayoutDashboard,
+  LockKeyhole,
+  Repeat2,
+  Route,
+  Search,
+  Server,
+  Share2,
+  Shield,
+  ShieldCheck,
+  ShieldX,
+  StickyNote,
+  Pencil,
+  UserRound,
+  UsersRound,
+  type LucideIcon,
+} from "lucide-react";
+import { useEffect, useState, type ReactNode } from "react";
 import { Button } from "./ui/button";
-import { Input } from "./ui/input";
+import { FileInput, Input } from "./ui/input";
 import { Switch } from "./ui/switch";
 import { ModelPickerModal } from "./ModelPicker";
 import { useResetToolMappings, useSaveToolMappings, useToolMappings, useToolRegistry } from "../hooks/cli-tools";
 import { useUpdateApiKey } from "../hooks/api-keys";
-import { toast } from "../shared/toast";
-import { getErrorMessage } from "../shared/helpers";
+import { toast } from "../lib/toast";
+import { getErrorMessage } from "../data/api";
 import {
   CLIENT_ROUTERS,
   SHARE_POPUP_IMAGE_MAX_BYTES,
@@ -33,6 +58,17 @@ const SCOPE_DESCRIPTIONS: Record<TenantScope, string> = {
   "providers:write": "Add, modify, or delete provider rows and their credentials.",
   "models:read": "Read catalog model rows.",
   "models:write": "Add, modify, or delete catalog model rows.",
+};
+const SCOPE_ICONS: Record<TenantScope, LucideIcon> = {
+  "routing:invoke": Route,
+  "routing:cli_mapping": Route,
+  "search:invoke": Search,
+  "dashboard:read": Eye,
+  "dashboard:write": Pencil,
+  "providers:read": Server,
+  "providers:write": LockKeyhole,
+  "models:read": Boxes,
+  "models:write": Database,
 };
 
 type TokenBudgetMode = "recurring" | "one-time";
@@ -102,7 +138,7 @@ function TokenBudgetField({
         disabled={disabled}
       />
       <div
-        style={{ display: "flex", flexWrap: "wrap", gap: "6px", marginTop: "6px" }}
+        className="flex flex-wrap gap-3 mt-3"
         role="group"
         aria-label={`${label} presets`}
       >
@@ -114,11 +150,8 @@ function TokenBudgetField({
             aria-label={`${preset.label}, ${preset.description} tokens`}
             onClick={() => onChange(preset.label)}
             disabled={disabled}
+            className="py-1 px-4 rounded-chip text-micro font-semibold"
             style={{
-              padding: "2px 8px",
-              borderRadius: "6px",
-              fontSize: "10px",
-              fontWeight: 600,
               cursor: disabled ? "not-allowed" : "pointer",
               border: `1px solid ${selected === preset.label ? "var(--accent)" : "var(--inner-border)"}`,
               background: selected === preset.label ? "var(--accent-soft)" : "transparent",
@@ -178,29 +211,27 @@ function RemoteRoutingRow({
 
   return (
     <div
+      className="flex items-center justify-between gap-6 py-2 px-5 rounded-inset"
       style={{
-        display: "flex",
-        alignItems: "center",
-        justifyContent: "space-between",
-        gap: "12px",
         minHeight: "44px",
-        padding: "8px 10px",
         border: "1px solid var(--inner-border)",
-        borderRadius: "8px",
         background: enabled ? "var(--accent-soft)" : "var(--surface-1)",
       }}
     >
-      <div>
-        <div style={{ fontSize: "12px", fontWeight: 600, color: "var(--text-primary)" }}>
+      <div className="flex min-w-0 items-start gap-3">
+        <Route size={16} className="mt-1 shrink-0 text-accent" aria-hidden="true" />
+        <div className="min-w-0">
+        <div className="text-caption font-semibold text-text-primary">
           {tool.name}
         </div>
-        <p style={{ marginTop: "2px", fontSize: "11px", color: "var(--text-tertiary)" }}>
+        <p className="mt-1 text-badge text-text-tertiary">
           {enabled
             ? `Remote routing on — ${rowCount} route${rowCount === 1 ? "" : "s"} active, routing:cli_mapping granted.`
             : "Remote routing off — this key's requests go straight to the provider."}
         </p>
+        </div>
       </div>
-      <div style={{ display: "flex", alignItems: "center", gap: "8px" }}>
+      <div className="flex items-center gap-4">
         <Switch
           checked={enabled}
           disabled={busy || pending || mappings.isLoading}
@@ -248,16 +279,17 @@ function RemoteRoutingSection({
   const tools = (registry.data ?? []).filter((tool) => tool.mappingSupported);
   if (keyId.length === 0 || tools.length === 0) return null;
   return (
-    <section aria-labelledby="remote-routing-heading" style={{ display: "flex", flexDirection: "column", gap: "8px" }}>
+    <section aria-labelledby="remote-routing-heading" className="flex flex-col gap-4">
       <div>
-        <h4 id="remote-routing-heading" style={{ fontSize: "12px", fontWeight: 700, color: "var(--text-primary)" }}>
-          Remote routing
-        </h4>
-        <p style={{ marginTop: "2px", fontSize: "11px", color: "var(--text-tertiary)" }}>
+    <h4 id="remote-routing-heading" className="inline-flex items-center gap-2 text-caption font-bold text-text-primary">
+      <Route size={15} className="text-accent" aria-hidden="true" />
+      Remote routing
+    </h4>
+        <p className="mt-1 text-badge text-text-tertiary">
           Route this key's CLI model calls through persisted mappings and grant routing:cli_mapping. Applies immediately — no save needed.
         </p>
       </div>
-      <div style={{ display: "flex", flexDirection: "column", gap: "6px" }}>
+      <div className="flex flex-col gap-3">
         {tools.map((tool) => (
           <RemoteRoutingRow
             key={tool.id}
@@ -306,6 +338,8 @@ interface KeyFormProps {
   busy: boolean;
   onDone: (input: KeyFormInput) => void;
   onClose: () => void;
+  /** Receives the action row so the dialog can pin it below the scrolling body. */
+  actionsRef?: (actions: ReactNode) => void;
 }
 export function keyCredentialFields(
   keyMode: ApiKeyResponse["keyMode"],
@@ -322,7 +356,16 @@ export function keyCredentialFields(
 export function oneTimeSecretForMode(keyMode: ApiKeyResponse["keyMode"], secret: string | undefined): string | null {
   return keyMode === "personal" ? secret ?? null : null;
 }
-export function ApiKeyForm({ mode, record, busy, onDone, onClose }: KeyFormProps): ReactNode {
+export function initialApiKeyScopes(
+  record: { readonly isDefault?: boolean; readonly scopes?: readonly string[] } | null,
+): string[] {
+  if (record?.isDefault) return [...TENANT_KEY_SCOPES];
+  const savedScopes = record?.scopes;
+  return savedScopes && savedScopes.length > 0
+    ? [...savedScopes]
+    : ["routing:invoke", "search:invoke"];
+}
+export function ApiKeyForm({ mode, record, busy, onDone, onClose, actionsRef }: KeyFormProps): ReactNode {
   const [label, setLabel] = useState(record?.label ?? "");
   const [prefix, setPrefix] = useState(record?.keyPrefix ?? "");
   const [customKey, setCustomKey] = useState("");
@@ -348,10 +391,7 @@ export function ApiKeyForm({ mode, record, busy, onDone, onClose }: KeyFormProps
       : "recurring",
   );
   const [concurrent, setConcurrent] = useState(record?.maxConcurrentRequests?.toString() ?? "");
-  const [scopes, setScopes] = useState<string[]>(() => {
-    const s = (record as unknown as { scopes?: string[] })?.scopes;
-    return s && s.length ? [...s] : ["routing:invoke", "search:invoke"];
-  });
+  const [scopes, setScopes] = useState<string[]>(() => initialApiKeyScopes(record));
   const [modelAccessMode, setModelAccessMode] = useState<"whitelist" | "blacklist">(
     (record as unknown as { modelAccessMode?: "whitelist" | "blacklist" | null })?.modelAccessMode ??
       "whitelist",
@@ -433,43 +473,63 @@ export function ApiKeyForm({ mode, record, busy, onDone, onClose }: KeyFormProps
       sharePopupBody: sharePopupBody.trim(),
     });
   };
+  useEffect(() => {
+    actionsRef?.(
+      <>
+        <Button variant="secondary" size="sm" onClick={onClose} disabled={busy}>Cancel</Button>
+        <Button variant="primary" size="sm" disabled={busy || (mode === "create" && !label.trim())} onClick={submit}>
+          {busy ? "Saving…" : mode === "create" ? "Create API key" : "Save changes"}
+        </Button>
+      </>
+    );
+  });
   return (
-    <div className="api-key-form-layout">
-      <section className="api-key-form-section api-key-form-section-wide">
-        <h3 style={{ fontSize: "13px", fontWeight: 700, color: "var(--text-primary)" }}>Credential mode</h3>
-        <div role="group" aria-label="Credential mode" style={{ display: "flex", gap: "8px" }}>
+    <div className="flex flex-col gap-6 min-w-0 pb-2">
+      <section className="flex flex-col gap-4 min-w-0 p-6 border border-inner-border rounded-card bg-surface-2 col-span-full">
+        <h3 className="inline-flex items-center gap-2 text-body font-bold text-text-primary">
+          <KeyRound size={16} className="text-accent" aria-hidden="true" />
+          Credential mode
+        </h3>
+        <div role="group" aria-label="Credential mode" className="flex gap-4">
           {(["personal", "share"] as const).map((modeOption) => (
             <button key={modeOption} type="button" aria-pressed={keyMode === modeOption}
               disabled={busy || modeLocked} onClick={() => setKeyMode(modeOption)}
               title={modeLocked ? "Credential mode cannot change after creation" : undefined}
-              style={{ border: "1px solid var(--inner-border)", borderRadius: "8px", padding: "8px 12px",
+              className="rounded-inset py-2 px-6"
+              style={{ border: "1px solid var(--inner-border)",
                 color: keyMode === modeOption ? "var(--accent)" : "var(--text-secondary)",
                 background: keyMode === modeOption ? "var(--accent-soft)" : "var(--surface-2)",
                 cursor: modeLocked ? "not-allowed" : "pointer", opacity: modeLocked && keyMode !== modeOption ? 0.5 : 1 }}>
-              {modeOption === "personal" ? "Personal" : "Share template"}
+              <span className="inline-flex items-center gap-2">
+                {modeOption === "personal" ? <UserRound size={14} aria-hidden="true" /> : <UsersRound size={14} aria-hidden="true" />}
+                {modeOption === "personal" ? "Personal" : "Share template"}
+              </span>
             </button>
           ))}
         </div>
-        <p style={{ fontSize: "11px", color: "var(--text-tertiary)" }}>
+        <p className="mt-1 text-badge text-text-tertiary">
           {keyMode === "share"
             ? "A share template does not authenticate requests. Recipients generate their own child key from its public enrollment page."
             : "A personal key authenticates requests directly; its secret is shown once when created or rotated."}
         </p>
       </section>
-      <div className="api-key-form-columns">
+      <div className="columns-2 gap-6 min-w-0 max-medium:columns-1">
       {mode === "create" && (
-        <section className="api-key-form-section">
+        <section className="flex flex-col gap-4 min-w-0 p-6 border border-inner-border rounded-card bg-surface-2 break-inside-avoid mb-6">
           <div>
-            <h3 style={{ fontSize: "13px", fontWeight: 700, color: "var(--text-primary)" }}>Identity</h3>
-            <p style={{ marginTop: "2px", fontSize: "11px", color: "var(--text-tertiary)" }}>
+            <h3 className="inline-flex items-center gap-2 text-body font-bold text-text-primary">
+              <Fingerprint size={16} className="text-accent" aria-hidden="true" />
+              Identity
+            </h3>
+            <p className="mt-1 text-badge text-text-tertiary">
               Give this credential a recognizable name.
             </p>
           </div>
-          <div className="api-key-form-grid">
+          <div className="grid grid-cols-2 gap-4 items-start min-w-0 max-medium:grid-cols-1">
             <Input label="Name" value={label} onChange={(e) => setLabel(e.target.value)}
               placeholder="ci-key…" disabled={busy} autoFocus />
             <Input label="Key prefix" value={prefix} onChange={(e) => setPrefix(e.target.value)}
-              placeholder="rk_ (default)…" disabled={busy || customKey.trim().length > 0} />
+              placeholder="carte_ (default)…" disabled={busy || customKey.trim().length > 0} />
           </div>
           {keyMode === "personal" && (
             <Input label="Custom API key value (optional)" value={customKey}
@@ -478,37 +538,42 @@ export function ApiKeyForm({ mode, record, busy, onDone, onClose }: KeyFormProps
         </section>
       )}
       {mode === "edit" && (
-        <section className="api-key-form-section">
+        <section className="flex flex-col gap-4 min-w-0 p-6 border border-inner-border rounded-card bg-surface-2 break-inside-avoid mb-6">
           <div>
-            <h3 style={{ fontSize: "13px", fontWeight: 700, color: "var(--text-primary)" }}>
+            <h3 className="text-body font-bold text-text-primary">
+              <Fingerprint size={16} className="mr-2 inline text-accent" aria-hidden="true" />
               Identity
             </h3>
-            <p style={{ marginTop: "2px", fontSize: "11px", color: "var(--text-tertiary)" }}>
-              Update the label for this credential.
+            <p className="mt-1 text-badge text-text-tertiary">
+              {record?.isDefault
+                ? "The default key's name is fixed. Limits, access, and everything else can still change."
+                : "Update the label for this credential."}
             </p>
           </div>
-          <div className="api-key-form-grid">
+          <div className="grid grid-cols-2 gap-4 items-start min-w-0 max-medium:grid-cols-1">
             <Input
               label="Name"
               value={label}
               onChange={(e) => setLabel(e.target.value)}
               placeholder="ci-key…"
-              disabled={busy}
+              disabled={busy || record?.isDefault === true}
+              title={record?.isDefault ? "The default gateway key keeps its name" : undefined}
               autoFocus
             />
           </div>
         </section>
       )}
-      <section className="api-key-form-section">
+      <section className="flex flex-col gap-4 min-w-0 p-6 border border-inner-border rounded-card bg-surface-2 break-inside-avoid mb-6">
         <div>
-          <h3 style={{ fontSize: "13px", fontWeight: 700, color: "var(--text-primary)" }}>
+          <h3 className="text-body font-bold text-text-primary">
+            <StickyNote size={16} className="mr-2 inline text-accent" aria-hidden="true" />
             Share notes
           </h3>
-          <p style={{ marginTop: "2px", fontSize: "11px", color: "var(--text-tertiary)" }}>
+          <p className="mt-1 text-badge text-text-tertiary">
             Optional copy shown on the public share page.
           </p>
         </div>
-        <div className="api-key-form-grid">
+        <div className="grid grid-cols-2 gap-4 items-start min-w-0 max-medium:grid-cols-1">
         <Input
           label="Title"
           value={notesTitle}
@@ -532,16 +597,17 @@ export function ApiKeyForm({ mode, record, busy, onDone, onClose }: KeyFormProps
         />
         </div>
       </section>
-      <section className="api-key-form-section">
+      <section className="flex flex-col gap-4 min-w-0 p-6 border border-inner-border rounded-card bg-surface-2 break-inside-avoid mb-6">
         <div>
-          <h3 style={{ fontSize: "13px", fontWeight: 700, color: "var(--text-primary)" }}>
+          <h3 className="text-body font-bold text-text-primary">
+            <Gauge size={16} className="mr-2 inline text-accent" aria-hidden="true" />
             Limits
           </h3>
-          <p style={{ marginTop: "2px", fontSize: "11px", color: "var(--text-tertiary)" }}>
+          <p className="mt-1 text-badge text-text-tertiary">
             Keep this credential predictable under load.
           </p>
         </div>
-        <div className="api-key-form-grid">
+        <div className="grid grid-cols-2 gap-4 items-start min-w-0 max-medium:grid-cols-1">
           <Input
             label="Requests per minute"
             type="number"
@@ -562,70 +628,53 @@ export function ApiKeyForm({ mode, record, busy, onDone, onClose }: KeyFormProps
           />
         </div>
         <div
-          style={{
-            display: "flex",
-            alignItems: "center",
-            justifyContent: "space-between",
-            gap: "12px",
-            borderRadius: "12px",
-            border: "1px solid var(--inner-border)",
-            background: "var(--surface-2)",
-            padding: "10px 12px",
-          }}
+          className="flex items-center justify-between gap-6 rounded-panel border border-inner-border px-6 py-5 bg-surface-2"
         >
           <div>
-            <div style={{ fontSize: "12px", fontWeight: 700, color: "var(--text-primary)" }}>
+            <div className="text-caption font-bold text-text-primary">
+              <Gauge size={14} className="mr-2 inline text-accent" aria-hidden="true" />
               Token budget
             </div>
-            <p style={{ marginTop: "2px", fontSize: "10.5px", color: "var(--text-tertiary)" }}>
+            <p className="mt-1 text-text-tertiary text-micro">
               {isOneTime
                 ? "One-time cap; it does not reset."
                 : "Daily and monthly limits reset automatically."}
             </p>
           </div>
           <div
-            style={{
-              display: "flex",
-              gap: "4px",
-              padding: "2px",
-              borderRadius: "8px",
-              background: "var(--surface-1)",
-              border: "1px solid var(--inner-border)",
-            }}
+            className="flex gap-2 rounded-inset border border-inner-border bg-surface-1 p-1"
           >
             <button
               type="button"
               onClick={() => setBudgetMode("recurring")}
               disabled={busy}
+              className="py-2 px-5 rounded-chip font-semibold border-0 cursor-pointer"
               style={{
-                padding: "4px 10px",
-                borderRadius: "6px",
                 fontSize: "10.5px",
-                fontWeight: 600,
                 background: !isOneTime ? "var(--accent-soft)" : "transparent",
                 color: !isOneTime ? "var(--accent)" : "var(--text-tertiary)",
-                border: "none",
-                cursor: "pointer",
               }}
             >
+              <span className="inline-flex items-center gap-2">
+                <Repeat2 size={13} aria-hidden="true" />
               Recurring
+              </span>
             </button>
             <button
               type="button"
               onClick={() => setBudgetMode("one-time")}
               disabled={busy}
+              className="py-2 px-5 rounded-chip font-semibold border-0 cursor-pointer"
               style={{
-                padding: "4px 10px",
-                borderRadius: "6px",
                 fontSize: "10.5px",
-                fontWeight: 600,
                 background: isOneTime ? "var(--accent-soft)" : "transparent",
                 color: isOneTime ? "var(--accent)" : "var(--text-tertiary)",
-                border: "none",
-                cursor: "pointer",
               }}
             >
+              <span className="inline-flex items-center gap-2">
+                <LockKeyhole size={13} aria-hidden="true" />
               One-time
+              </span>
             </button>
           </div>
         </div>
@@ -637,7 +686,7 @@ export function ApiKeyForm({ mode, record, busy, onDone, onClose }: KeyFormProps
             disabled={busy}
           />
         ) : (
-          <div className="api-key-form-grid">
+          <div className="grid grid-cols-2 gap-4 items-start min-w-0 max-medium:grid-cols-1">
             <TokenBudgetField
               label="Daily token limit"
               value={daily}
@@ -654,13 +703,14 @@ export function ApiKeyForm({ mode, record, busy, onDone, onClose }: KeyFormProps
         )}
       </section>
       </div>
-      <section className="api-key-form-section api-key-form-section-wide" aria-labelledby="share-popup-heading">
-        <div className="api-key-popup-header">
+      <section className="flex flex-col gap-4 min-w-0 p-6 border border-inner-border rounded-card bg-surface-2 col-span-full" aria-labelledby="share-popup-heading">
+        <div className="flex items-start justify-between gap-6">
           <div>
-            <h3 id="share-popup-heading" style={{ fontSize: "13px", fontWeight: 700, color: "var(--text-primary)" }}>
+            <h3 id="share-popup-heading" className="text-body font-bold text-text-primary">
+              <Share2 size={16} className="mr-2 inline text-accent" aria-hidden="true" />
               Share page popup
             </h3>
-            <p style={{ marginTop: "2px", fontSize: "11px", color: "var(--text-tertiary)" }}>
+            <p className="mt-1 text-badge text-text-tertiary">
               Optional card visitors open from the Base URL card on your share page.
             </p>
           </div>
@@ -672,19 +722,17 @@ export function ApiKeyForm({ mode, record, busy, onDone, onClose }: KeyFormProps
           />
         </div>
         {sharePopupEnabled ? (
-          <div className="api-key-popup-body">
-            <div className="api-key-popup-image">
+          <div className="flex gap-7 items-start mt-2 min-w-0 max-medium:flex-col max-medium:items-stretch">
+            <div className="flex flex-col gap-4 min-w-0 w-100 shrink-0 max-medium:w-auto">
               {popupImagePreview ? (
-                <img className="api-key-popup-preview" src={popupImagePreview} alt="Popup image preview" />
+                <img className="block w-full h-66 object-cover border border-inner-border rounded-control bg-surface-1 max-medium:h-80" src={popupImagePreview} alt="Popup image preview" />
               ) : (
-                <div className="api-key-popup-preview api-key-popup-preview-empty" aria-hidden="true">
+                <div className="flex items-center justify-center w-full h-66 object-cover border border-dashed border-inner-border rounded-control bg-surface-1 text-text-tertiary text-badge max-medium:h-80" aria-hidden="true">
                   <span>No image</span>
                 </div>
               )}
-              <input
+              <FileInput
                 id="share-popup-image"
-                className="form-file-input"
-                type="file"
                 accept={SHARE_POPUP_IMAGE_MIMES.join(",")}
                 aria-label="Popup image"
                 disabled={busy}
@@ -713,7 +761,7 @@ export function ApiKeyForm({ mode, record, busy, onDone, onClose }: KeyFormProps
                   size="sm"
                   type="button"
                   disabled={busy}
-                  className="api-key-popup-remove"
+                  className="h-14 px-5 text-badge self-start"
                   onClick={() => {
                     setSharePopupImageDataUrl(null);
                     setSharePopupImageRemoved(true);
@@ -724,9 +772,9 @@ export function ApiKeyForm({ mode, record, busy, onDone, onClose }: KeyFormProps
                 </Button>
               ) : null}
               {sharePopupImageError ? <p className="form-error">{sharePopupImageError}</p> : null}
-              <p className="api-key-popup-footnote">PNG, JPEG, WebP, or GIF up to 2 MB.</p>
+              <p className="m-0 text-text-tertiary text-badge leading-normal">PNG, JPEG, WebP, or GIF up to 2 MB.</p>
             </div>
-            <div className="api-key-popup-fields">
+            <div className="flex flex-col gap-4 min-w-0 flex-1 [&_.form-group]:gap-2">
               <Input label="Popup title" value={sharePopupTitle} onChange={(event) => setSharePopupTitle(event.target.value)} maxLength={120} placeholder="Support this gateway" disabled={busy} />
               <div className="form-group">
                 <label className="form-label" htmlFor="share-popup-copy">Message</label>
@@ -736,32 +784,48 @@ export function ApiKeyForm({ mode, record, busy, onDone, onClose }: KeyFormProps
           </div>
         ) : null}
       </section>
-      <section className="api-key-form-section api-key-form-section-wide">
+      <details className="group min-w-0 col-span-full rounded-card border border-inner-border bg-surface-2">
+        <summary className="flex cursor-pointer list-none items-center justify-between gap-4 p-6 [&::-webkit-details-marker]:hidden">
+          <span className="flex min-w-0 items-start gap-3">
+            <span className="grid size-10 shrink-0 place-items-center rounded-inset bg-accent-soft text-accent">
+              <Shield size={18} aria-hidden="true" />
+            </span>
+            <span className="min-w-0">
+              <span className="block text-body font-bold text-text-primary">Access</span>
+              <span className="mt-1 block text-badge text-text-tertiary">
+                {record?.isDefault
+                  ? "Default gateway key · all tenant permissions, including gateway routing and remote debugging."
+                  : "Choose model, router, and dashboard permissions for this key."}
+              </span>
+            </span>
+          </span>
+          <span className="inline-flex shrink-0 items-center gap-2 rounded-control border border-inner-border bg-surface-1 px-3 py-2 text-micro font-semibold text-text-secondary">
+            {scopes.length}/{TENANT_KEY_SCOPES.length} grants
+            <ChevronDown size={14} className="transition-transform group-open:rotate-180" aria-hidden="true" />
+          </span>
+        </summary>
+        <div className="flex flex-col gap-5 border-t border-inner-border p-6">
+          {record?.isDefault ? (
+            <div className="flex items-start gap-3 rounded-control border border-accent/30 bg-accent-soft p-4 text-badge text-text-secondary">
+              <ShieldCheck size={16} className="mt-0.5 shrink-0 text-accent" aria-hidden="true" />
+              <p className="m-0">
+                This default API key is provisioned with every tenant permission, including <code>routing:invoke</code> and
+                {" "}<code>routing:cli_mapping</code>. Those grant gateway access and authorization to use remote CLI mappings;
+                each client's mapping toggle below still controls whether those routes are active. You can remove individual
+                grants here.
+              </p>
+            </div>
+          ) : null}
+        <div className="columns-2 gap-6 min-w-0 max-medium:columns-1">
         <div>
-          <h3 style={{ fontSize: "13px", fontWeight: 700, color: "var(--text-primary)" }}>
-            Access
-          </h3>
-          <p style={{ marginTop: "2px", fontSize: "11px", color: "var(--text-tertiary)" }}>
-            Choose which models this key can use and what it is allowed to access.
-          </p>
-        </div>
-        <div className="api-key-form-columns">
-        <div>
-          <label
-            style={{
-              fontSize: "11px",
-              fontWeight: 600,
-              color: "var(--text-secondary)",
-              display: "block",
-              marginBottom: "6px",
-            }}
-          >
+          <label className="inline-flex items-center gap-2 text-badge font-semibold text-text-secondary block mb-3">
+            <Boxes size={14} className="text-accent" aria-hidden="true" />
             Model access
           </label>
           <div
             role="group"
             aria-label="Model access mode"
-            style={{ display: "flex", gap: "6px", marginBottom: "8px" }}
+            className="flex gap-3 mb-4"
           >
             {(["whitelist", "blacklist"] as const).map((option) => (
               <button
@@ -775,11 +839,8 @@ export function ApiKeyForm({ mode, record, busy, onDone, onClose }: KeyFormProps
                     ? "Only the listed models may be used. An empty list allows every model."
                     : "The listed models are refused. Everything else is allowed."
                 }
+                className="flex-1 py-2.5 px-4 text-badge font-semibold"
                 style={{
-                  flex: 1,
-                  padding: "5px 8px",
-                  fontSize: "11px",
-                  fontWeight: 600,
                   borderRadius: "7px",
                   border: `1px solid ${modelAccessMode === option ? "var(--accent)" : "var(--inner-border)"}`,
                   background: modelAccessMode === option ? "var(--accent-soft)" : "var(--surface-2)",
@@ -789,55 +850,33 @@ export function ApiKeyForm({ mode, record, busy, onDone, onClose }: KeyFormProps
                 }}
               >
                 {option === "whitelist" ? "Whitelist" : "Blacklist"}
+                {option === "whitelist"
+                  ? <ShieldCheck size={13} className="ml-2 inline" aria-hidden="true" />
+                  : <ShieldX size={13} className="ml-2 inline" aria-hidden="true" />}
               </button>
             ))}
           </div>
           <label
-            style={{
-              fontSize: "11px",
-              fontWeight: 600,
-              color: "var(--text-secondary)",
-              display: "block",
-              marginBottom: "6px",
-            }}
+            className="text-badge font-semibold text-text-secondary block mb-3"
           >
             {modelAccessMode === "whitelist" ? "Allowed models" : "Blocked models"}
           </label>
-          <div style={{ display: "flex", gap: "6px", flexWrap: "wrap", marginBottom: "8px" }}>
+          <div className="flex gap-3 flex-wrap mb-4">
             {models.length === 0 ? (
-              <span style={{ fontSize: "11px", color: "var(--text-tertiary)" }}>
+              <span className="mt-1 text-badge text-text-tertiary">
                 {modelAccessMode === "whitelist" ? "All models allowed" : "No models blocked"}
               </span>
             ) : (
               models.map((m) => (
-                <span
-                  key={m}
-                  style={{
-                    display: "inline-flex",
-                    alignItems: "center",
-                    gap: "4px",
-                    fontFamily: "var(--font-mono)",
-                    fontSize: "11px",
-                    background: "var(--accent-soft)",
-                    color: "var(--accent)",
-                    padding: "2px 8px",
-                    borderRadius: "6px",
-                    border: "1px solid var(--accent)",
-                  }}
-                >
+                <span key={m}
+                 className="font-mono tabular-nums inline-flex items-center gap-2 text-badge bg-accent-soft text-accent py-1 px-4 rounded-chip border border-accent">
                   {m}
                   <button
                     type="button"
                     aria-label={`Remove ${m} from the model list`}
                     onClick={() => setModels((prev) => prev.filter((x) => x !== m))}
                     disabled={busy}
-                    style={{
-                      background: "transparent",
-                      border: "none",
-                      cursor: "pointer",
-                      padding: 0,
-                      display: "flex",
-                    }}
+                    className="bg-transparent border-0 cursor-pointer p-0 flex"
                   >
                     ×
                   </button>
@@ -865,38 +904,37 @@ export function ApiKeyForm({ mode, record, busy, onDone, onClose }: KeyFormProps
             multi
           />
         </div>
-        <section aria-labelledby="blocked-routers-heading" style={{ display: "flex", flexDirection: "column", gap: "8px" }}>
+        <section aria-labelledby="blocked-routers-heading" className="flex flex-col gap-4">
           <div>
-            <h4 id="blocked-routers-heading" style={{ fontSize: "12px", fontWeight: 700, color: "var(--text-primary)" }}>
+            <h4 id="blocked-routers-heading" className="inline-flex items-center gap-2 text-caption font-bold text-text-primary">
+              <Ban size={15} className="text-accent" aria-hidden="true" />
               Blocked client routers
             </h4>
-            <p style={{ marginTop: "2px", fontSize: "11px", color: "var(--text-tertiary)" }}>
+            <p className="mt-1 text-badge text-text-tertiary">
               Matching fingerprints are rejected with 403 before routing. Detection is best-effort; clients without a fingerprint are not matched. This may also block bazaar probe links that share the same fingerprint.
             </p>
           </div>
-          <div style={{ display: "flex", flexDirection: "column", gap: "6px" }}>
+          <div className="flex flex-col gap-3">
             {CLIENT_ROUTERS.map((router) => (
               <div
                 key={router.id}
+                className="flex items-center justify-between gap-6 py-2 px-5 rounded-inset"
                 style={{
-                  display: "flex",
-                  alignItems: "center",
-                  justifyContent: "space-between",
-                  gap: "12px",
                   minHeight: "44px",
-                  padding: "8px 10px",
                   border: "1px solid var(--inner-border)",
-                  borderRadius: "8px",
                   background: blockedRouters.includes(router.id) ? "var(--accent-soft)" : "var(--surface-1)",
                 }}
               >
-                <div>
-                  <div style={{ fontSize: "12px", color: "var(--text-primary)" }}>
+                <div className="flex min-w-0 items-start gap-3">
+                  <Ban size={15} className="mt-1 shrink-0 text-orange" aria-hidden="true" />
+                  <div className="min-w-0">
+                  <div className="text-caption text-text-primary">
                     Block {router.label} Client
                   </div>
-                  <p style={{ marginTop: "2px", fontSize: "11px", color: "var(--text-tertiary)" }}>
+                  <p className="mt-1 text-badge text-text-tertiary">
                     Reject requests fingerprinted as {router.label}.
                   </p>
+                  </div>
                 </div>
                 <Switch
                   checked={blockedRouters.includes(router.id)}
@@ -914,11 +952,12 @@ export function ApiKeyForm({ mode, record, busy, onDone, onClose }: KeyFormProps
             ))}
           </div>
         </section>
-        <section aria-labelledby="routing-scopes-heading" style={{ display: "flex", flexDirection: "column", gap: "8px" }}>
-          <h4 id="routing-scopes-heading" style={{ fontSize: "12px", fontWeight: 700, color: "var(--text-primary)" }}>
+        <section aria-labelledby="routing-scopes-heading" className="flex flex-col gap-4">
+          <h4 id="routing-scopes-heading" className="inline-flex items-center gap-2 text-caption font-bold text-text-primary">
+            <Route size={15} className="text-accent" aria-hidden="true" />
             Routing
           </h4>
-          <div style={{ display: "flex", flexDirection: "column", gap: "6px" }}>
+          <div className="flex flex-col gap-3">
             {/* routing:cli_mapping is intentionally absent here: it is the scope
                 half of the Remote routing switch below, which grants it and
                 enables the routes together. Listing it separately let the two
@@ -926,21 +965,19 @@ export function ApiKeyForm({ mode, record, busy, onDone, onClose }: KeyFormProps
             {TENANT_KEY_SCOPES.filter((scope) => scope === "routing:invoke").map((scope) => (
               <div
                 key={scope}
+                className="flex items-center justify-between gap-6 py-2 px-5 rounded-inset"
                 style={{
-                  display: "flex",
-                  alignItems: "center",
-                  justifyContent: "space-between",
-                  gap: "12px",
                   minHeight: "44px",
-                  padding: "8px 10px",
                   border: "1px solid var(--inner-border)",
-                  borderRadius: "8px",
                   background: scopes.includes(scope) ? "var(--accent-soft)" : "var(--surface-1)",
                 }}
               >
-                <div>
-                  <div style={{ fontSize: "12px", fontWeight: 600, color: "var(--text-primary)" }}>{scope}</div>
-                  <p style={{ marginTop: "2px", fontSize: "11px", color: "var(--text-tertiary)" }}>{SCOPE_DESCRIPTIONS[scope]}</p>
+                <div className="flex items-start gap-3">
+                  <Route size={16} className="mt-1 shrink-0 text-accent" aria-hidden="true" />
+                  <div className="min-w-0">
+                  <div className="text-caption font-semibold text-text-primary">{scope}</div>
+                  <p className="mt-1 text-badge text-text-tertiary">{SCOPE_DESCRIPTIONS[scope]}</p>
+                  </div>
                 </div>
                 <Switch checked={scopes.includes(scope)} onChange={() => toggleScope(scope)} disabled={busy} aria-label={`Grant ${scope}`} />
               </div>
@@ -973,29 +1010,31 @@ export function ApiKeyForm({ mode, record, busy, onDone, onClose }: KeyFormProps
             );
           }}
         />
-        <section aria-labelledby="dashboard-scopes-heading" style={{ display: "flex", flexDirection: "column", gap: "8px" }}>
-          <h4 id="dashboard-scopes-heading" style={{ fontSize: "12px", fontWeight: 700, color: "var(--text-primary)" }}>
+        <section aria-labelledby="dashboard-scopes-heading" className="flex flex-col gap-4">
+          <h4 id="dashboard-scopes-heading" className="inline-flex items-center gap-2 text-caption font-bold text-text-primary">
+            <LayoutDashboard size={15} className="text-accent" aria-hidden="true" />
             Dashboard / Resources
           </h4>
-          <div style={{ display: "flex", flexDirection: "column", gap: "6px" }}>
+          <div className="flex flex-col gap-3">
             {TENANT_KEY_SCOPES.filter((scope) => !scope.startsWith("routing:")).map((scope) => (
               <div
                 key={scope}
+                className="flex items-center justify-between gap-6 py-2 px-5 rounded-inset"
                 style={{
-                  display: "flex",
-                  alignItems: "center",
-                  justifyContent: "space-between",
-                  gap: "12px",
                   minHeight: "44px",
-                  padding: "8px 10px",
                   border: "1px solid var(--inner-border)",
-                  borderRadius: "8px",
                   background: scopes.includes(scope) ? "var(--accent-soft)" : "var(--surface-1)",
                 }}
               >
-                <div>
-                  <div style={{ fontSize: "12px", fontWeight: 600, color: "var(--text-primary)" }}>{scope}</div>
-                  <p style={{ marginTop: "2px", fontSize: "11px", color: "var(--text-tertiary)" }}>{SCOPE_DESCRIPTIONS[scope]}</p>
+                <div className="flex items-start gap-3">
+                  {(() => {
+                    const ScopeIcon = SCOPE_ICONS[scope];
+                    return <ScopeIcon size={16} className="mt-1 shrink-0 text-accent" aria-hidden="true" />;
+                  })()}
+                  <div className="min-w-0">
+                  <div className="text-caption font-semibold text-text-primary">{scope}</div>
+                  <p className="mt-1 text-badge text-text-tertiary">{SCOPE_DESCRIPTIONS[scope]}</p>
+                  </div>
                 </div>
                 <Switch checked={scopes.includes(scope)} onChange={() => toggleScope(scope)} disabled={busy} aria-label={`Grant ${scope}`} />
               </div>
@@ -1003,24 +1042,8 @@ export function ApiKeyForm({ mode, record, busy, onDone, onClose }: KeyFormProps
           </div>
         </section>
         </div>
-      </section>
-      <div
-        className="modal-form-actions"
-        style={{
-          display: "flex",
-          justifyContent: "flex-end",
-          gap: "8px",
-          borderTop: "1px solid var(--inner-border)",
-          paddingTop: "12px",
-        }}
-      >
-        <Button variant="secondary" size="sm" onClick={onClose} disabled={busy}>
-          Cancel
-        </Button>
-        <Button variant="primary" size="sm" disabled={busy || (mode === "create" && !label.trim())} onClick={submit}>
-          {busy ? "Saving…" : mode === "create" ? "Create API key" : "Save changes"}
-        </Button>
-      </div>
+        </div>
+      </details>
     </div>
   );
 }

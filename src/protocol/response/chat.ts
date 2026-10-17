@@ -1,14 +1,17 @@
 /**
  * [OpenAI]-compatible /chat/completions response decoder: wire JSON/SSE → canonical events.
  */
-import { canonicalTerminal } from "../../protocol/primitives";
-import { GatewayError } from "../../transport/gateway-error";
-import { type CanonicalEvent, type CanonicalRequest } from "../../transport/canonical-model";
-import { decodeSseEvents } from "../../transport/streaming";
+import { canonicalTerminal } from "../codecs";
+import { GatewayError } from "../gateway-error";
+import { type CanonicalEvent, type CanonicalRequest } from "../canonical-model";
+import { decodeSseEvents } from "../sse-decoder";
 import { gatewayErrorFromStreamError } from "../stream-error-frames";
 import { mergeResponsesUsage } from "./responses";
-import { usageFromProvider, readReasoningText } from "../../providers/usage";
-import { createToolEmitLedger } from "../../transport/tool-identity";
+import { usageFromProvider, readReasoningText } from "../../providers/provider-usage";
+import { createToolEmitLedger } from "../tool-identity";
+import { MimoThinkSplitter, stripThinkingTags } from "../../providers/integrations/xiaomi-mimo/think-stream";
+import { parseDsmlToolCalls } from "./dsml";
+
 
 export function mapChatStopReason(
   reason: unknown,
@@ -41,7 +44,13 @@ export function parseChatResponseToEvents(
   const first = choices[0] as Record<string, unknown> | undefined;
   const message = first?.["message"] as Record<string, unknown> | undefined;
   if (message) {
-    const reasoning = readReasoningText(message);
+    const reasoningRaw = readReasoningText(message);
+    // hy4-preview-f (and other buddy reasoning models) sometimes wraps its own
+    // reasoning in `<think>…</think>` inside `reasoning_content`, which then
+    // reaches the client as literal tag bytes. The field itself is the stream
+    // for reasoning here, so the tags cannot carry structure — strip them.
+    const reasoning =
+      typeof reasoningRaw === "string" ? stripThinkingTags(reasoningRaw) : reasoningRaw;
     if (typeof reasoning === "string" && reasoning.length > 0) {
       events.push({
         type: "content_delta",
@@ -53,12 +62,36 @@ export function parseChatResponseToEvents(
       });
     }
     const content = message["content"] as string | null;
-    if (content) {
+    const recovered = typeof content === "string" ? parseDsmlToolCalls(content) : undefined;
+    const visible = recovered === undefined ? content : recovered.text;
+    if (typeof visible === "string" && visible.includes("<think")) {
+      const think = new MimoThinkSplitter();
+      const split = think.push(visible);
+      const rest = think.flush();
+      const reasoning = `${split.reasoning}${rest.reasoning}`;
+      const text = `${split.text}${rest.text}`;
+      if (reasoning.length > 0) {
+        events.push({
+          type: "content_delta",
+          sequence_number: events.length + 1,
+          response_id: id,
+          content: { kind: "reasoning", payload: null, summary: reasoning },
+        });
+      }
+      if (text.length > 0) {
+        events.push({
+          type: "content_delta",
+          sequence_number: events.length + 1,
+          response_id: id,
+          content: { kind: "text", text },
+        });
+      }
+    } else if (visible) {
       events.push({
         type: "content_delta",
         sequence_number: events.length + 1,
         response_id: id,
-        content: { kind: "text", text: content },
+        content: { kind: "text", text: visible },
       });
     }
     const refusal = message["refusal"];
@@ -70,32 +103,37 @@ export function parseChatResponseToEvents(
         content: { kind: "refusal", text: refusal },
       });
     }
-    const toolCalls = message["tool_calls"];
-    if (Array.isArray(toolCalls)) {
-      for (const tc of toolCalls) {
-        if (typeof tc !== "object" || tc === null) continue;
-        const record = tc as Record<string, unknown>;
-        const fn = typeof record["function"] === "object" && record["function"] !== null
-          ? (record["function"] as Record<string, unknown>)
-          : undefined;
-        // Malformed tool calls (missing id/name) are dropped, not poisoned
-        // into the ledger: an undefined id/name downstream breaks pairing and
-        // surfaces as a confusing unknown-tool error instead of a clean skip.
-        const callId = typeof record["id"] === "string" && record["id"].length > 0 ? record["id"] : undefined;
-        const name = typeof fn?.["name"] === "string" && fn["name"].length > 0 ? fn["name"] : undefined;
-        const args = typeof fn?.["arguments"] === "string" ? fn["arguments"] : "{}";
-        if (callId === undefined || name === undefined) continue;
-        const itemId = callId;
-        events.push({
-          type: "tool_call_delta",
-          sequence_number: events.length + 1,
-          response_id: id,
-          item_id: itemId,
-          call_id: callId,
-          name,
-          arguments_delta: args,
-        });
-      }
+    const structuredCalls = message["tool_calls"];
+    const toolCalls = Array.isArray(structuredCalls) && structuredCalls.length > 0
+      ? structuredCalls
+      : recovered?.calls ?? [];
+    for (const tc of toolCalls) {
+      if (typeof tc !== "object" || tc === null) continue;
+      const record = tc as Record<string, unknown>;
+      const fn = typeof record["function"] === "object" && record["function"] !== null
+        ? (record["function"] as Record<string, unknown>)
+        : undefined;
+      // Malformed tool calls (missing id/name) are dropped, not poisoned
+      // into the ledger: an undefined id/name downstream breaks pairing and
+      // surfaces as a confusing unknown-tool error instead of a clean skip.
+      const callId = typeof record["id"] === "string" && record["id"].length > 0 ? record["id"] : undefined;
+      const name = typeof fn?.["name"] === "string" && fn["name"].length > 0
+        ? fn["name"]
+        : typeof record["name"] === "string" ? record["name"] : undefined;
+      const args = typeof fn?.["arguments"] === "string"
+        ? fn["arguments"]
+        : typeof record["arguments"] === "string" ? record["arguments"] : "{}";
+      if (callId === undefined || name === undefined) continue;
+      const itemId = callId;
+      events.push({
+        type: "tool_call_delta",
+        sequence_number: events.length + 1,
+        response_id: id,
+        item_id: itemId,
+        call_id: callId,
+        name,
+        arguments_delta: args,
+      });
     }
     // Audio output (`modalities: ["audio"]`) rides on `message.audio`; carry it
     // as an extension part so the Chat encoder can re-emit the same object.
@@ -158,6 +196,7 @@ export async function* decodeChatSseStream(
   let lastSeenToolName: string | undefined;
   // Single emission ledger: one entry per logical call.
   const ledger = createToolEmitLedger();
+  const think = new MimoThinkSplitter();
   yield {
     type: "response_start",
     sequence_number: seq++,
@@ -201,33 +240,42 @@ export async function* decodeChatSseStream(
         // text/thinking blocks.
         if (typeof delta?.["content"] === "string" && delta["content"].length > 0) {
           const raw = delta["content"] as string;
-          // Generic thinking models (mimo/minimax/kiro) embed <think> in content
-          if (raw.includes("<think")) {
-            const stripped = raw.replace(/<think(?:ing)?>[\s\S]*?<\/think(?:ing)?>/g, "");
-            const thinkMatch = raw.match(/<think(?:ing)?>([\s\S]*?)<\/think(?:ing)?>/);
-            if (thinkMatch?.[1]) {
-              yield {
-                type: "content_delta",
-                sequence_number: seq++,
-                content: { kind: "reasoning", payload: null, summary: thinkMatch[1] },
-              } as CanonicalEvent;
-            }
-            if (stripped.length > 0) {
-              yield {
-                type: "content_delta",
-                sequence_number: seq++,
-                content: { kind: "text", text: stripped },
-              } as CanonicalEvent;
-            }
-          } else {
+          const recovered = parseDsmlToolCalls(raw);
+          const visible = recovered?.text ?? raw;
+          const split = think.push(visible);
+          if (split.reasoning.length > 0) {
             yield {
               type: "content_delta",
               sequence_number: seq++,
-              content: { kind: "text", text: raw },
+              content: { kind: "reasoning", payload: null, summary: split.reasoning },
             } as CanonicalEvent;
           }
+          if (split.text.length > 0) {
+            yield {
+              type: "content_delta",
+              sequence_number: seq++,
+              content: { kind: "text", text: split.text },
+            } as CanonicalEvent;
+          }
+          if (recovered !== undefined) {
+            for (const call of recovered.calls) {
+              yield {
+                type: "tool_call_delta",
+                sequence_number: seq++,
+                call_id: call.id,
+                name: call.name,
+                arguments_delta: call.arguments,
+              } as CanonicalEvent;
+            }
+          }
         }
-        const reasoningText = delta ? readReasoningText(delta) : undefined;
+        const reasoningRaw = delta ? readReasoningText(delta) : undefined;
+        // Strip stray `<think>` tags the upstream double-wrapped inside its own
+        // reasoning stream (buddy's hy4-preview-f leaks them per-delta). Done
+        // per delta rather than once at the end because an open-ended tag that
+        // spans multiple deltas is a splitter job, not this one.
+        const reasoningText =
+          typeof reasoningRaw === "string" ? stripThinkingTags(reasoningRaw) : reasoningRaw;
         if (typeof reasoningText === "string" && reasoningText.length > 0) {
           yield {
             type: "content_delta",
@@ -268,6 +316,7 @@ export async function* decodeChatSseStream(
           // first call's slot in the index-keyed materializer.
           let emitIndex: number | undefined;
           let establishedNew = false;
+
           if (realId !== undefined) {
             id = realId;
             emitIndex = index;
@@ -282,6 +331,7 @@ export async function* decodeChatSseStream(
             id = ledger.nextOrphanId(index === undefined ? "call" : `call-${index}-frag`);
             establishedNew = true;
           }
+
           lastSeenToolId = id;
           if (fragName !== undefined) lastSeenToolName = fragName;
           if (index !== undefined) {
@@ -340,6 +390,21 @@ export async function* decodeChatSseStream(
       );
     }
   }
+  const rest = think.flush();
+  if (rest.reasoning.length > 0) {
+    yield {
+      type: "content_delta",
+      sequence_number: seq++,
+      content: { kind: "reasoning", payload: null, summary: rest.reasoning },
+    } as CanonicalEvent;
+  }
+  if (rest.text.length > 0) {
+    yield {
+      type: "content_delta",
+      sequence_number: seq++,
+      content: { kind: "text", text: rest.text },
+    } as CanonicalEvent;
+  }
   const chatStopReason = mapChatStopReason(finishReason);
   const chatProviderStopReason =
     typeof finishReason === "string" ? finishReason : undefined;
@@ -354,7 +419,11 @@ export async function* decodeChatSseStream(
       : finishReason === "error" || finishReason === "failed" || truncated
         ? "failed"
         : "complete",
-    stopReason: chatStopReason,
+    // An upstream that ends without a verdict must not render as a clean
+    // `stop`. `chatFinishReason(undefined)` falls back to `stop`, so the client
+    // saw a completed turn while telemetry recorded a 502 upstream transport
+    // failure — the failure this terminal already carries was invisible to it.
+    stopReason: truncated && signal?.aborted !== true ? "error" : chatStopReason,
     providerStopReason: chatProviderStopReason,
     usage: usageFromProvider(rawUsage),
   });

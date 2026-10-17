@@ -1,15 +1,15 @@
 /**
  * Canonical → Claude Messages request builder.
  */
-import type { CanonicalRequest, ContentPart } from "../../transport/canonical-model";
-import { buildAnthropicThinkingPayload } from "../../providers/reasoning";
+import { allParts, type CanonicalRequest, type ContentPart } from "../canonical-model";
+import { buildAnthropicThinkingPayload } from "../../providers/provider-reasoning";
 import { anthropicCacheControl } from "../../transport/translation/cache-controls";
 import {
   THINKING_STRIPPED_SAMPLING_CONTROLS,
   ensureMaxTokensForThinking,
   isThinkingEnabled,
-  normalizeWireMaxTokens,
 } from "../../transport/translation/capabilities";
+import { normalizeWireMaxTokens } from "../../transport/translation/normalize";
 import { resolveWireMaxTokens, WIRE_TOKEN_BOUNDS } from "../../transport/translation/quirks";
 import {
   isClaudeBillingHeaderText,
@@ -24,11 +24,12 @@ import {
   isRecord,
   resolveImageSource,
   splitDataUrl,
-} from "../primitives";
+  finiteNumber,
+} from "../codecs";
 import { log } from "../../observability/logger";
+import { base64DecodedByteLength, clampImage } from "../image-clamp";
 import { clampReasoningEffort, claudeUsesAdaptiveThinking, LEVEL_TO_BUDGET, resolveSupportedReasoningEfforts } from "../../transport/translation/thinking";
-
-export const OAUTH_MESSAGES_MAX_OUTPUT_TOKENS = WIRE_TOKEN_BOUNDS["messages"]?.oauthCeiling ?? 64_000;
+import { claudeResponseToEvents, parseClaudeSseStream } from "../response/messages";
 
 /**
  * Gateway default when the caller sent no max_tokens (Anthropic requires
@@ -74,6 +75,77 @@ function normalizeAnthropicImageMediaType(mediaType: string): string {
     return mediaType;
   }
   return normalized;
+}
+
+/**
+ * Placeholder substituted for an image block the clamp refuses to send.
+ *
+ * A `reject` decision means the block would be accepted and then poison every
+ * retry and every later turn that replays the history. Dropping it silently
+ * would leave the model answering a question whose attachment is gone, so the
+ * block is replaced by visible text — the same degrade-to-placeholder shape the
+ * `audio` case below uses for a part this wire cannot encode.
+ */
+function clampedImagePlaceholder(): ClaudeWireObject {
+  return { type: "text", text: "[image omitted: over the provider size limit]" };
+}
+
+/**
+ * Reads a declared pixel dimension (`width`/`height`) off an image payload.
+ *
+ * No wire this gateway speaks carries one — an Anthropic `source` has only
+ * `type`/`media_type`/`data` and an OpenAI `image_url` only `url`/`detail` — so
+ * this is a courtesy read for a client that declares it anyway. Both plausible
+ * declaration sites are checked: the payload itself and its nested `source`.
+ */
+function declaredDimension(payload: unknown, key: "width" | "height"): number | undefined {
+  if (!isRecord(payload)) return undefined;
+  const direct = payload[key];
+  if (typeof direct === "number" && Number.isFinite(direct)) return direct;
+  const source = payload["source"];
+  if (isRecord(source)) {
+    const nested = source[key];
+    if (typeof nested === "number" && Number.isFinite(nested)) return nested;
+  }
+  return undefined;
+}
+
+/**
+ * Applies the shared pre-send image clamp to an already-projected block.
+ *
+ * Only inline bytes are measurable here: a `url` or `file` source carries no
+ * payload in this request, so it is forwarded untouched rather than refused for
+ * being unmeasurable. Dimensions are honoured when the origin declared them.
+ */
+function applyImageClamp(
+  block: ClaudeWireObject,
+  imageCount: number,
+  payload: unknown,
+): ClaudeWireObject {
+  const source = block["source"];
+  const data = isRecord(source) ? source["data"] : undefined;
+  const width = declaredDimension(payload, "width");
+  const height = declaredDimension(payload, "height");
+  const decision = clampImage({
+    ...(typeof data === "string" ? { bytes: base64DecodedByteLength(data) } : {}),
+    ...(width === undefined ? {} : { width }),
+    ...(height === undefined ? {} : { height }),
+    imageCount,
+  });
+  if (decision.action === "pass") return block;
+  log.warn(
+    decision.action === "reject"
+      ? "claude: image block over the send limit, omitted"
+      : "claude: image block over the dimension limit, omitted (no re-encode in the router)",
+    {
+      action: decision.action,
+      reason: decision.reason,
+      max_dimension_px: decision.maxDimensionPx,
+      max_bytes: decision.maxBytes,
+      image_count: imageCount,
+    },
+  );
+  return clampedImagePlaceholder();
 }
 
 /**
@@ -204,13 +276,22 @@ function anthropicDocumentSource(
 
 function partToClaudeBlock(
   part: ContentPart,
-  ctx?: { seen: Map<string, number>; idMap: Map<string, string>; isOAuth: boolean },
+  ctx?: {
+    seen: Map<string, number>;
+    idMap: Map<string, string>;
+    isOAuth: boolean;
+    imageCount: number;
+  },
 ): ClaudeWireObject | undefined {
   switch (part.kind) {
     case "text":
       return { type: "text", text: toWellFormedString(part.text) };
     case "image":
-      return normalizeImageBlock(part.payload);
+      return applyImageClamp(
+        normalizeImageBlock(part.payload),
+        ctx?.imageCount ?? 1,
+        part.payload,
+      );
     case "file":
       return {
         type: "document",
@@ -252,6 +333,7 @@ function partToClaudeBlock(
         id: normalized,
         name: prefixClaudeToolName(part.name, ctx?.isOAuth ?? false),
         input: toWellFormedDeep(parseArguments(part.arguments)),
+        ...(part.namespace === undefined ? {} : { namespace: part.namespace }),
       };
     }
     case "toolResult": {
@@ -314,6 +396,7 @@ function partToClaudeBlock(
       if (
         part.name === "server_tool_use" ||
         part.name === "search_result" ||
+        part.name === "web_search_tool_result" ||
         part.name === "document" ||
         (part.name.startsWith("messages:") && part.name !== "messages:unknown")
       )
@@ -359,13 +442,125 @@ function stablePartitionToolUse(blocks: ClaudeWireObject[]): void {
   blocks.push(...nonToolUse, ...toolUse);
 }
 
+/**
+ * Maximum entries in a Claude server-side `fallbacks` chain.
+ *
+ * Donor-captured limit (research `## Claude Code` → "Multi-model"): the chain
+ * carries at most 3 models. A longer declared chain is trimmed with a warning
+ * rather than rejected, matching how an over-long `stop_sequences` degrades
+ * below — the request still goes out, it just carries fewer fallbacks.
+ */
+export const CLAUDE_FALLBACKS_CHAIN_LIMIT = 3;
+
+/**
+ * `provider_options` key that declares a server-side `fallbacks` chain.
+ *
+ * The chain is opt-in per request because it is not a canonical field and no
+ * local state can decide whether a route honors it; see the UNCONFIRMED note on
+ * `claudeFallbacksChain`. Default (no declaration) is no `fallbacks` key at all.
+ */
+export const CLAUDE_FALLBACKS_OPTION = "claude_fallbacks";
+
+/**
+ * Per-attempt override keys forwarded inside one `fallbacks[]` entry.
+ *
+ * UNCONFIRMED — the donor research names the *concept* ("per-attempt
+ * max_tokens/thinking/output_config/speed",
+ * the provider comparison research → "Multi-model",
+ * citing `anthropic-wire.ts:297-308` and `anthropic.ts:1868-1901`) but no
+ * request capture in this repository shows the field names or their value
+ * grammar inside a chain entry. Only the chain key (`fallbacks`) and the
+ * ≤3-model cap are named at that level. These keys are therefore whitelisted
+ * rather than passed through blindly: a key we cannot name is dropped with a
+ * warning instead of being invented onto the wire.
+ */
+const FALLBACK_ATTEMPT_NUMBER_KEYS: readonly string[] = ["max_tokens"];
+const FALLBACK_ATTEMPT_RECORD_KEYS: readonly string[] = ["thinking", "output_config"];
+/** The only `speed` value the research captures (`anthropic.ts:5578-5580`). */
+const FALLBACK_SPEED_VALUE = "fast";
+
+/**
+ * Validates one declared chain entry into a `fallbacks[]` object.
+ *
+ * A bare string is accepted as a model id. Anything that cannot yield a
+ * non-empty model id is dropped: a chain entry without a model names nothing
+ * to fall back to, so forwarding it would only invite an upstream 400.
+ */
+function claudeFallbackAttempt(entry: unknown): ClaudeWireObject | undefined {
+  if (typeof entry === "string") {
+    const model = entry.trim();
+    return model.length > 0 ? { model } : undefined;
+  }
+  if (!isRecord(entry)) return undefined;
+  const model = typeof entry["model"] === "string" ? entry["model"].trim() : "";
+  if (model.length === 0) return undefined;
+  const attempt: ClaudeWireObject = { model };
+  for (const key of FALLBACK_ATTEMPT_NUMBER_KEYS) {
+    const value = entry[key];
+    if (value === undefined) continue;
+    if (finiteNumber(value) && value > 0) attempt[key] = value;
+    else
+      log.warn(`claude: fallbacks entry ${key} dropped, expected a positive number`, {
+        received: value,
+      });
+  }
+  for (const key of FALLBACK_ATTEMPT_RECORD_KEYS) {
+    const value = entry[key];
+    if (value === undefined) continue;
+    if (isRecord(value)) attempt[key] = toWellFormedDeep(value);
+    else
+      log.warn(`claude: fallbacks entry ${key} dropped, expected an object`, {
+        received: value,
+      });
+  }
+  const speed = entry["speed"];
+  if (speed === undefined) return attempt;
+  if (speed === FALLBACK_SPEED_VALUE) attempt["speed"] = speed;
+  else
+    log.warn(`claude: fallbacks entry speed dropped, only "${FALLBACK_SPEED_VALUE}" is captured`, {
+      received: speed,
+    });
+  return attempt;
+}
+
+/**
+ * Builds the Claude server-side `fallbacks` chain from `provider_options`, or
+ * `undefined` when the caller declared none — in which case no `fallbacks` key
+ * is emitted, so a route that does not know the field is unaffected.
+ *
+ * Declared as `provider_options.claude_fallbacks`: an array of model-id strings
+ * or of objects carrying `model` plus optional per-attempt overrides. Entries
+ * beyond `CLAUDE_FALLBACKS_CHAIN_LIMIT` are dropped.
+ */
+export function claudeFallbacksChain(
+  provider_options: Readonly<Record<string, unknown>> | undefined,
+): readonly ClaudeWireObject[] | undefined {
+  const declared = provider_options?.[CLAUDE_FALLBACKS_OPTION];
+  if (!Array.isArray(declared) || declared.length === 0) return undefined;
+  if (declared.length > CLAUDE_FALLBACKS_CHAIN_LIMIT) {
+    log.warn(
+      `claude: fallbacks chain exceeds ${CLAUDE_FALLBACKS_CHAIN_LIMIT}; extra entries dropped`,
+      { received: declared.length, kept: CLAUDE_FALLBACKS_CHAIN_LIMIT },
+    );
+  }
+  const attempts: ClaudeWireObject[] = [];
+  for (const entry of declared.slice(0, CLAUDE_FALLBACKS_CHAIN_LIMIT)) {
+    const attempt = claudeFallbackAttempt(entry);
+    if (attempt !== undefined) attempts.push(attempt);
+  }
+  return attempts.length > 0 ? attempts : undefined;
+}
+
 export function canonicalToClaudeMessagesPayload(
   request: CanonicalRequest,
   options: { isOAuth?: boolean } = {},
 ): ClaudeWireObject {
   const seen = new Map<string, number>();
   const idMap = new Map<string, string>();
-  const ctx = { seen, idMap, isOAuth: options.isOAuth ?? false };
+  // The clamp's per-image ceiling depends on how many images the whole request
+  // carries, so it is counted once over every part rather than per message.
+  const imageCount = allParts(request).filter((part) => part.kind === "image").length;
+  const ctx = { seen, idMap, isOAuth: options.isOAuth ?? false, imageCount };
   const messages: ClaudeWireObject[] = [];
   // Anthropic accepts system content only at the top level. Chat `developer`
   // turns and Responses `instructions` have no `developer` role upstream, and
@@ -665,6 +860,11 @@ export function canonicalToClaudeMessagesPayload(
   if (stringValue(userProfileId)) payload.user_profile_id = userProfileId;
   const workspaceId = controls["extension:workspace_id"];
   if (stringValue(workspaceId)) payload.workspace_id = workspaceId;
+  // Server-side `fallbacks` chain: opt-in per request via
+  // `provider_options.claude_fallbacks`. Absent by default — see the
+  // UNCONFIRMED note on `claudeFallbacksChain`.
+  const fallbacks = claudeFallbacksChain(request.provider_options);
+  if (fallbacks !== undefined) payload.fallbacks = fallbacks;
   const metadataUserId = controls["extension:metadata_user_id"];
   if (stringValue(metadataUserId)) {
     const existingMetadata = isRecord(payload.metadata) ? { ...payload.metadata } : {};
@@ -683,3 +883,10 @@ export function canonicalToClaudeMessagesPayload(
   return payload;
 }
 
+
+export const messagesCodecModule = {
+  family: "messages" as const,
+  encodeWireRequest: canonicalToClaudeMessagesPayload,
+  decodeWireResponse: claudeResponseToEvents,
+  decodeWireStream: parseClaudeSseStream,
+} as const;

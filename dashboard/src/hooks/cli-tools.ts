@@ -2,7 +2,7 @@ import { consoleRequest } from "../data/api";
 import type { ApiErrorShape } from "../data/api";
 import type { ApplyConfigResult, ApplyInput, CliMappingInput, CliMappingSettings, DownloadResult, ToolRegistryEntry, ToolStatus } from "../data/contracts";
 import { queryKeys } from "../data/query-keys";
-import { querySignal } from "./common";
+import { querySignal } from "../data/assert";
 import { DASHBOARD_QUERY_OPTIONS } from "../data/query-policy";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 
@@ -85,7 +85,8 @@ export function useDownloadTool() {
         method: "POST",
         // The wire schema names this `models`; the shared interface calls it
         // `modelIds`. Sending only the interface name is rejected as
-        // `invalid_request: must have required properties models`.
+        // `invalid_request` ("must have required properties models") — the code
+        // arrives in `error.code` and no longer prefixes the message.
         body: JSON.stringify({ ...input, models: input.modelIds, keyId }),
       }),
     onSuccess: async (_result, { toolId, keyId }) => {

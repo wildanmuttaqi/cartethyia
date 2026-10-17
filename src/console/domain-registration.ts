@@ -2,8 +2,8 @@ import { Elysia } from "elysia";
 import { ConsoleDomainError } from "./shared/errors";
 import { createCliToolsRoutes } from "./cli-tools/routes";
 import { createAccountQuotaRoutes } from "./quota/account-quota";
-import { createApiKeyRoutes } from "./domains/api-keys/routes";
-import { familyBucketSpend } from "./domains/api-keys/bucket-spend";
+import { createApiKeyRoutes } from "./api-keys/routes";
+import { familyBucketSpend } from "./api-keys/bucket-spend";
 import { createProviderCatalogRoutes } from "./providers/catalog/routes";
 import {
   createProviderDetailRoutes,
@@ -22,21 +22,20 @@ import { createModelRoutingRoutes } from "./routing/model/routes";
 import { createNetworkPoolRoutes } from "./routing/pools/routes";
 import { DrizzleModelRoutingStore } from "./routing/model/store";
 import { DrizzleNetworkPoolStore } from "./routing/pools/store";
-import { createRuntimeSettingsRoutes } from "./settings/contracts";
+import { createRuntimeSettingsRoutes } from "./settings/routes";
 import { DrizzleRuntimeSettingsStore } from "./settings/store";
-import { createObservabilityRoutes } from "./observability/contracts";
+import { createObservabilityRoutes } from "./observability/routes";
 import { DrizzleObservabilityStore } from "./observability/store";
 import { createLiveRoutes } from "./observability/live";
 import { createLogRoutes } from "./observability/logs";
-import { createAuditRoutes } from "./domains/audit/contracts";
-import { createModelAbuseRoutes } from "./domains/model-abuse/contracts";
-import { DrizzleAuditReadStore } from "./domains/audit/store";
-import { createStudioRoutes } from "./domains/studio/routes";
-import { DrizzleStudioSessionStore } from "./domains/studio/store";
+import { createAuditRoutes } from "./audit/routes";
+import { createModelAbuseRoutes } from "./admin/model-abuse/routes";
+import { DrizzleAuditReadStore } from "./audit/store";
 import { createPerformanceRoutes } from "./observability/performance";
+import { createUpdateRoutes } from "./updates/routes";
 import { createBackupRoutes } from "./backup/routes";
 import { BackupService } from "./backup/service";
-import type { ConsoleCredentialService } from "./auth/service";
+import type { ConsoleCredentialService } from "./auth/credentials";
 
 import { InMemoryOAuthFlowStore, OAuthFlowStore } from "../providers/authentication/oauth-flow-store";
 import { OAuthCallbackListener } from "./providers/oauth/callback-listener";
@@ -45,16 +44,15 @@ import {
   createAccountSecretResolver,
 } from "../providers/operations/provider-credential-service";
 import { syncByokProvider } from "../providers/operations/provider-catalog-service";
-import { DrizzleApiKeyStore } from "../persistence/api-key-store";
-import { DrizzleShareLinkStore } from "../persistence/share-store";
+import { DrizzleApiKeyStore } from "../persistence/stores/api-key-store";
+import { DrizzleShareLinkStore } from "../persistence/stores/share-store";
 import { createShareUsagePort } from "./share/share-usage";
-import { resolveSsrfPolicy } from "../config";
+import { resolveSsrfPolicy } from "../config/network";
 import { createValidatedFetch } from "../network/outbound-fetch";
-import type { AuditRecorder } from "./auth/service";
+import type { AuditRecorder } from "./auth/audit-recorder";
 import type { CliToolService } from "./cli-tools/service";
 import type { NetworkPoolSelector } from "../network/pool/selector";
-import type { ProxyRequestStateStore } from "../transport/request/state";
-import type { RouteSnapshotService } from "../transport/routing/route-model";
+import type { LiveInFlightSource } from "./observability/live";
 import type { ApiKeyAdmissionService } from "../security/admission/service";
 import type { ModelStrikeService } from "../security/model-abuse";
 import type { TelemetryBatchBuffer } from "../observability/telemetry-buffer";
@@ -64,7 +62,7 @@ import type { RedisClient } from "../persistence/redis";
 import type { ProviderRegistry } from "../providers/provider-registry";
 import type { BundledProviderCatalog } from "../providers/operations/provider-catalog-service";
 import type { ValidatedNetworkBindingFactory } from "../network/pool/resolver";
-import type { CartethyiaDatabase } from "../persistence/postgres";
+import type { CartethyiaDatabase } from "../persistence/db-handle";
 import type { ConsoleAccessResolver } from "./auth/access";
 
 export interface ConsoleDomainContext {
@@ -77,14 +75,16 @@ export interface ConsoleDomainContext {
   readonly auditRecorder: AuditRecorder;
   readonly cliToolService: CliToolService;
   readonly redis: RedisClient | undefined;
-  readonly routeSnapshotService: RouteSnapshotService;
+  /** Drops the cached route snapshot after a catalog write. Structurally
+   * satisfied by `RouteSnapshotService`. */
+  readonly routeSnapshotService: { invalidate(): Promise<number> };
   readonly poolSelector: NetworkPoolSelector;
   readonly telemetryBuffer: TelemetryBatchBuffer;
   /** Owns the live in-flight gauge the console surfaces. */
-  readonly stateStore?: ProxyRequestStateStore;
+  readonly stateStore?: LiveInFlightSource;
   readonly admissionService: Pick<ApiKeyAdmissionService, "purgeKey">;
   /** Graduated model-abuse strikes: list and lift bans from the console. */
-  readonly modelStrikes?: Pick<ModelStrikeService, "listBans" | "unban">;
+  readonly modelStrikes?: Pick<ModelStrikeService, "listBans" | "unban" | "ban">;
   readonly readRoutingAccountInflight?:
     | ((
         providerId: string,
@@ -102,7 +102,7 @@ export interface ConsoleDomainContext {
 import { and, eq, isNull, or } from "drizzle-orm";
 import { networkPools, providerRoutingSettings } from "../persistence/schema";
 import { resolveTenantOverride } from "../persistence/tenant-scope";
-import { DEFAULT_PROXY_BYPASS_PROVIDER_IDS } from "../providers/provider-registry";
+import { DEFAULT_PROXY_SKIP_PROVIDER_IDS } from "../providers/provider-metadata";
 import type { ProbeOutboundBinding } from "../providers/discovery/probing-service";
 
 
@@ -133,7 +133,7 @@ export function registerConsoleDomains(
         const rows = await ctx.db
           .select({
             tenantId: providerRoutingSettings.tenantId,
-            bypassProxy: providerRoutingSettings.bypassProxy,
+            skipProxy: providerRoutingSettings.skipProxy,
           })
           .from(providerRoutingSettings)
           .where(
@@ -145,12 +145,12 @@ export function registerConsoleDomains(
               ),
             ),
           );
-        const tenantSetting = rows.find((row) => row.tenantId === tenantId)?.bypassProxy;
-        const globalSetting = rows.find((row) => row.tenantId === null)?.bypassProxy;
+        const tenantSetting = rows.find((row) => row.tenantId === tenantId)?.skipProxy;
+        const globalSetting = rows.find((row) => row.tenantId === null)?.skipProxy;
         bypass = resolveTenantOverride(
           tenantSetting,
           globalSetting,
-          DEFAULT_PROXY_BYPASS_PROVIDER_IDS.has(providerId),
+          DEFAULT_PROXY_SKIP_PROVIDER_IDS.has(providerId),
         );
       }
 
@@ -207,7 +207,7 @@ export function registerConsoleDomains(
   const modelRoutingStore = new DrizzleModelRoutingStore(ctx.db);
   const apiKeyStore = new DrizzleApiKeyStore(ctx.db);
   const shareStore = new DrizzleShareLinkStore(ctx.db);
-  const shareActivity = createShareUsagePort(ctx.db);
+  const shareActivity = createShareUsagePort({ db: ctx.db, redis: ctx.redis });
 
 
   console.use(createObservabilityRoutes({ store: observabilityStore, accessResolver: ctx.accessResolver }));
@@ -217,15 +217,9 @@ export function registerConsoleDomains(
     db: ctx.db,
     ...(ctx.stateStore ? { stateStore: ctx.stateStore } : {}),
   }));
-  console.use(createStudioRoutes({
-    sessionStore: new DrizzleStudioSessionStore(ctx.db),
-    keyStore: apiKeyStore,
-    accessResolver: ctx.accessResolver,
-    webFetch: (tenantId) => ctx.networkBindingFactory.fetch(undefined, tenantId),
-    auditSink: ctx.auditRecorder,
-  }));
   console.use(createLogRoutes({ accessResolver: ctx.accessResolver, auditSink: ctx.auditRecorder }));
   console.use(createPerformanceRoutes({ accessResolver: ctx.accessResolver }));
+  console.use(createUpdateRoutes());
   console.use(createAuditRoutes({ store: auditReadStore, accessResolver: ctx.accessResolver }));
   if (ctx.modelStrikes) {
     console.use(createModelAbuseRoutes({
@@ -299,6 +293,8 @@ export function registerConsoleDomains(
     snapshotInvalidator: ctx.routeSnapshotService,
     providerRegistry: ctx.providerRegistry,
     resolveCredential,
+    poolSelector: ctx.poolSelector,
+    networkBindingFactory: ctx.networkBindingFactory,
   }));
   // The listener binds the loopback port a browser redirect names, so the
   // callback delivers itself instead of waiting for a manual paste. One

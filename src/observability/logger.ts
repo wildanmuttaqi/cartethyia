@@ -109,7 +109,19 @@ function ring(level: ConsoleLogLevel, msg: string, safeArgs: readonly unknown[])
   }
 }
 
-function logArgs(level: ConsoleLogLevel, write: (args: unknown[]) => void, msg: string, args: readonly unknown[]): void {
+function logArgs(
+  level: ConsoleLogLevel,
+  write: (args: unknown[]) => void,
+  msg: string,
+  args: readonly unknown[],
+): void {
+  // The level is consulted first. Building the safe copy used to happen
+  // unconditionally, so a `debug` call at the production `info` default still
+  // paid a depth-capped deep copy plus a JSON.stringify of every argument, on
+  // every request that reached it — the surface-detection debug line fires on
+  // almost every chat request. Pino's own level check happens inside `write`,
+  // which is already too late to skip the work.
+  if (!logger.isLevelEnabled(level)) return;
   const safeArgs = safeLogArgs(args);
   ring(level, msg, safeArgs);
   write(safeArgs);

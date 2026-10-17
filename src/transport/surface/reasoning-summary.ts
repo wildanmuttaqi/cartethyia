@@ -1,4 +1,4 @@
-import type { CanonicalEvent } from "../canonical-model";
+import type { CanonicalEvent } from "../../protocol/canonical-model";
 
 export interface ReasoningSummaryIdentity {
   readonly itemId?: string;
@@ -39,13 +39,25 @@ export function reasoningSummaryHasBoundary(
     (previous.outputIndex !== undefined &&
       current.outputIndex !== undefined &&
       previous.outputIndex !== current.outputIndex) ||
-    (previous.summaryIndex !== undefined &&
-      current.summaryIndex !== undefined &&
-      previous.summaryIndex !== current.summaryIndex)
+    previous.summaryIndex !== current.summaryIndex
   );
 }
 
-/** Separates distinct summary parts without splitting token fragments. */
+/**
+ * Separates distinct summary parts without splitting a word.
+ *
+ * A boundary between two source items is not a boundary between two
+ * sentences. Copilot streams one thought as many items, and the token that
+ * ends one item is the first half of a word the next item finishes. Inserting
+ * a break there painted `Gil` in the thinking pane and `iran` in the answer.
+ *
+ * The part that decides is the one that *opens*: a part starting with a
+ * capital, or with the markdown marker a summary block begins with, is a new
+ * thought; a part starting mid-word is a continuation. Requiring the previous
+ * part to end a sentence as well dropped the break between two headers that
+ * carry no terminal punctuation (`**Crafting a brief reply**`), which glued
+ * separate thoughts into one line.
+ */
 export function reasoningSummarySeparator(
   previous: ReasoningSummaryIdentity | undefined,
   current: ReasoningSummaryIdentity | undefined,
@@ -54,5 +66,13 @@ export function reasoningSummarySeparator(
 ): string {
   if (!reasoningSummaryHasBoundary(previous, current)) return "";
   if (/\s$/.test(previousText ?? "") || /^\s/.test(currentText)) return "";
-  return "\n\n";
+  // The part that opens decides: a capital, or the markdown marker a summary
+  // block starts with, begins a thought, so the break is a paragraph.
+  if (/^[A-ZÀ-ÖØ-Þ*#\-]/.test(currentText)) return "\n\n";
+  // A part opening mid-word is a continuation, not a new thought — that is the
+  // `Gil` + `iran` case, and it gets nothing. But when the previous part closed
+  // a sentence, the next one is a different artifact (the raw reasoning after a
+  // summary), and gluing them produced `file.raw private reasoning`.
+  if (/[.!?][)"'\]]*$/.test(previousText ?? "")) return " ";
+  return "";
 }

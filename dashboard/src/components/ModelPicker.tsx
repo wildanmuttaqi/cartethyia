@@ -3,14 +3,14 @@ import { useMemo, useState, type ReactNode } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { Badge } from "./ui/badge";
 import { Button } from "./ui/button";
-import { Dialog } from "./ui/dialog";
+import { Dialog, type DialogSize } from "./ui/dialog";
 import { ProviderIcon } from "./ProviderIcon";
 import { consoleRequest } from "../data/api";
 import type { ApiErrorShape } from "../data/api";
 import type { FlatModelCatalogEntry } from "../data/contracts";
-import { UNKNOWN_LIMITS_TOOLTIP } from "../shared/model-limits";
+import { UNKNOWN_LIMITS_TOOLTIP } from "../lib/format/tokens";
 import { queryKeys } from "../data/query-keys";
-import { querySignal } from "../hooks/common";
+import { querySignal } from "../data/assert";
 
 export type FlatModelEntry = FlatModelCatalogEntry;
 
@@ -75,6 +75,7 @@ export function ModelPickerModal({
   selected,
   onToggle,
   onSelectOne,
+  size = "lg",
   title = "Select model",
   multi = true,
   filter,
@@ -84,6 +85,7 @@ export function ModelPickerModal({
   selected: string[];
   onToggle: (value: string) => void;
   onSelectOne?: (value: string) => void;
+  size?: DialogSize;
   title?: string;
   multi?: boolean;
   /** Optional capability predicate (e.g. image-generation models only). */
@@ -143,93 +145,36 @@ export function ModelPickerModal({
   };
 
   return (
-    <Dialog open={open} onClose={onClose} title={title}>
-      <div
-        style={{
-          display: "flex",
-          flexDirection: "column",
-          gap: "12px",
-          width: "min(720px, 90vw)",
-          maxHeight: "70vh",
-          maxWidth: "100%",
-        }}
-      >
-        <div style={{ position: "relative" }}>
+    <Dialog open={open} onClose={onClose} title={title} size={size} footer={<Button variant="secondary" onClick={onClose}>Done</Button>}>
+      <div className="flex max-w-full flex-col gap-6">
+        <div className="relative">
           <Search
             size={14}
-            style={{
-              position: "absolute",
-              left: "10px",
-              top: "50%",
-              transform: "translateY(-50%)",
-              color: "var(--text-tertiary)",
-            }}
+            className="absolute left-5 top-1/2 -translate-y-1/2 text-text-tertiary"
           />
           <input
             value={search}
             onChange={(e) => setSearch(e.target.value)}
             placeholder="Search models or providers (e.g. gpt-5.4, codex)"
-            style={{
-              width: "100%",
-              maxWidth: "100%",
-              boxSizing: "border-box",
-              padding: "8px 10px 8px 32px",
-              borderRadius: "8px",
-              border: "1px solid var(--inner-border)",
-              background: "var(--surface-2)",
-              color: "var(--text-primary)",
-              fontSize: "12px",
-            }}
+            className="w-full max-w-full rounded-inset border border-inner-border bg-surface-2 py-4 pr-5 pl-16 text-caption text-text-primary"
           />
         </div>
 
         {multi && selected.length > 0 && (
           <div
-            style={{
-              display: "flex",
-              gap: "6px",
-              flexWrap: "wrap",
-              padding: "8px",
-              borderRadius: "8px",
-              background: "var(--surface-2)",
-              border: "1px solid var(--inner-border)",
-            }}
+            className="flex flex-wrap gap-3 rounded-inset border border-inner-border bg-surface-2 p-4"
           >
             {selected.map((s) => (
-              <span
-                key={s}
-                style={{
-                  display: "inline-flex",
-                  alignItems: "center",
-                  gap: "4px",
-                  fontFamily: "var(--font-mono)",
-                  fontSize: "11px",
-                  background: "var(--accent-soft)",
-                  color: "var(--accent)",
-                  padding: "2px 6px",
-                  borderRadius: "6px",
-                  border: "1px solid var(--accent)",
-                  maxWidth: "100%",
-                  overflow: "hidden",
-                  wordBreak: "break-all",
-                }}
-              >
+              <span key={s} className="font-mono tabular-nums inline-flex items-center gap-2 text-badge bg-accent-soft text-accent py-1 px-3 rounded-chip border border-accent max-w-full overflow-hidden break-all">
                 <span
-                  style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}
+                  className="overflow-hidden truncate whitespace-nowrap"
                 >
                   {s}
                 </span>
                 <button
                   type="button"
                   onClick={() => onToggle(s)}
-                  style={{
-                    background: "transparent",
-                    border: "none",
-                    cursor: "pointer",
-                    padding: 0,
-                    display: "flex",
-                    flexShrink: 0,
-                  }}
+                  className="bg-transparent border-none cursor-pointer p-0 flex shrink-0"
                 >
                   <X size={12} />
                 </button>
@@ -239,47 +184,24 @@ export function ModelPickerModal({
         )}
 
         <div
-          style={{
-            flex: 1,
-            overflowY: "auto",
-            overflowX: "hidden",
-            border: "1px solid var(--inner-border)",
-            borderRadius: "10px",
-            background: "var(--surface-1)",
-            minHeight: "320px",
-            maxHeight: "420px",
-            padding: "12px",
-            display: "flex",
-            flexDirection: "column",
-            gap: "16px",
-          }}
+          className="flex min-h-160 max-h-210 flex-1 flex-col gap-8 overflow-x-hidden overflow-y-auto rounded-control border border-inner-border bg-surface-1 p-6"
         >
           {isLoading ? (
             <div
-              style={{
-                padding: "32px",
-                textAlign: "center",
-                fontSize: "12px",
-                color: "var(--text-tertiary)",
-              }}
+              className="p-16 text-center text-caption text-text-tertiary"
             >
               Loading catalog…
             </div>
           ) : isError ? (
-            <div style={{ padding: "32px", textAlign: "center", fontSize: "12px" }}>
-              <p style={{ color: "var(--text-tertiary)" }}>Failed to load catalog.</p>
-              <button type="button" onClick={refetch} style={{ marginTop: "8px" }}>
+            <div className="p-16 text-center text-caption">
+              <p className="text-text-tertiary">Failed to load catalog.</p>
+              <button type="button" onClick={refetch} className="mt-4">
                 Retry
               </button>
             </div>
           ) : grouped.length === 0 ? (
             <div
-              style={{
-                padding: "32px",
-                textAlign: "center",
-                fontSize: "12px",
-                color: "var(--text-tertiary)",
-              }}
+              className="p-16 text-center text-caption text-text-tertiary"
             >
               No models found.
             </div>
@@ -289,19 +211,10 @@ export function ModelPickerModal({
               return (
               <div
                 key={groupKey}
-                style={{ display: "flex", flexDirection: "column", gap: "8px", minWidth: 0 }}
+                className="flex flex-col gap-4 min-w-0"
               >
                 <div
-                  style={{
-                    display: "flex",
-                    alignItems: "center",
-                    gap: "6px",
-                    fontSize: "11px",
-                    fontWeight: 700,
-                    color: "var(--text-secondary)",
-                    textTransform: "uppercase",
-                    letterSpacing: "0.05em",
-                  }}
+                  className="flex items-center gap-3 text-badge font-bold tracking-[0.05em] text-text-secondary uppercase"
                 >
                   {isProviderGroup ? (
                     <ProviderIcon name={groupKey} icon={groupKey} size={16} />
@@ -311,14 +224,9 @@ export function ModelPickerModal({
                   {groupKey}
                   <Badge tone="default">{entries.length}</Badge>
                 </div>
-                <div
-                  style={{
-                    display: "grid",
-                    gridTemplateColumns: "repeat(auto-fill, minmax(min(180px, 100%), 1fr))",
-                    gap: "8px",
-                    minWidth: 0,
-                  }}
-                >
+                {/* Auto-fill so a group of two models does not stretch across the
+                    whole panel; the 180px track is what a chip's model id needs. */}
+                <div className="grid min-w-0 grid-cols-2 gap-4 max-small:gap-2">
                   {entries.map((e) => {
                     const sel = isSelected(e.qualified);
                     return (
@@ -326,45 +234,17 @@ export function ModelPickerModal({
                         key={e.qualified}
                         type="button"
                         onClick={() => handlePick(e.qualified)}
-                        style={{
-                          display: "flex",
-                          flexDirection: "column",
-                          gap: "4px",
-                          padding: "10px 12px",
-                          borderRadius: "10px",
-                          border: sel ? "1px solid var(--accent)" : "1px solid var(--inner-border)",
-                          background: sel ? "var(--accent-soft)" : "var(--surface-2)",
-                          cursor: "pointer",
-                          textAlign: "left",
-                          position: "relative",
-                          minWidth: 0,
-                          overflow: "hidden",
-                        }}
+                        className={`relative flex w-full min-w-0 cursor-pointer flex-col gap-2 overflow-hidden rounded-control px-6 py-5 text-left max-small:px-3 max-small:py-4 ${sel ? "border border-accent bg-accent-soft" : "border border-inner-border bg-surface-2"}`}
                       >
                         {sel && (
                           <Check
                             size={12}
-                            style={{
-                              position: "absolute",
-                              top: "8px",
-                              right: "8px",
-                              color: "var(--accent)",
-                            }}
+                            className="absolute top-4 right-4 text-accent"
                           />
                         )}
                         <span
                           title={e.qualified}
-                          style={{
-                            fontFamily: "var(--font-mono)",
-                            fontSize: "11px",
-                            fontWeight: 600,
-                            color: sel ? "var(--accent)" : "var(--text-primary)",
-                            overflow: "hidden",
-                            textOverflow: "ellipsis",
-                            whiteSpace: "nowrap",
-                            paddingRight: sel ? "16px" : 0,
-                            width: "100%",
-                          }}
+                          className={`font-mono tabular-nums w-full whitespace-normal break-all text-badge font-semibold ${sel ? "pr-8 text-accent" : "text-text-primary"}`}
                         >
                           {e.modelId}
                           {/* A non-chat service (System One) is not served on
@@ -374,18 +254,7 @@ export function ModelPickerModal({
                           {e.kind === "model" && e.entry.serviceKind !== "llm" && (
                             <span
                               title={NATIVE_SERVICE_TOOLTIP(e.entry.serviceKind)}
-                              style={{
-                                marginLeft: "6px",
-                                padding: "0 5px",
-                                borderRadius: "4px",
-                                fontSize: "9px",
-                                fontWeight: 700,
-                                textTransform: "uppercase",
-                                letterSpacing: "0.04em",
-                                color: "var(--orange)",
-                                border: "1px solid var(--orange)",
-                                cursor: "help",
-                              }}
+                              className="ml-3 inline-block cursor-help rounded-tiny border border-orange px-2.5 align-middle font-bold tracking-[0.04em] text-micro text-orange uppercase"
                             >
                               {e.entry.serviceKind}
                             </span>
@@ -393,15 +262,7 @@ export function ModelPickerModal({
                         </span>
                         <span
                           title={e.qualified}
-                          style={{
-                            fontFamily: "var(--font-mono)",
-                            fontSize: "10px",
-                            color: "var(--text-tertiary)",
-                            overflow: "hidden",
-                            textOverflow: "ellipsis",
-                            whiteSpace: "nowrap",
-                            width: "100%",
-                          }}
+                          className="font-mono tabular-nums w-full truncate text-micro text-text-tertiary"
                         >
                           {/* An alias/combo is a named routing target, so its
                               target is the useful second line — not token
@@ -413,7 +274,7 @@ export function ModelPickerModal({
                               {e.entry.contextLimit ? (
                                 `${formatShortTokens(e.entry.contextLimit)} ctx`
                               ) : (
-                                <span title={UNKNOWN_LIMITS_TOOLTIP} style={{ cursor: "help" }}>
+                                <span title={UNKNOWN_LIMITS_TOOLTIP} className="cursor-help">
                                   n/a ctx
                                 </span>
                               )}
@@ -421,7 +282,7 @@ export function ModelPickerModal({
                               {e.entry.outputLimit ? (
                                 `${formatShortTokens(e.entry.outputLimit)} out`
                               ) : (
-                                <span title={UNKNOWN_LIMITS_TOOLTIP} style={{ cursor: "help" }}>
+                                <span title={UNKNOWN_LIMITS_TOOLTIP} className="cursor-help">
                                   n/a out
                                 </span>
                               )}
@@ -442,11 +303,6 @@ export function ModelPickerModal({
           )}
         </div>
 
-        <div style={{ display: "flex", justifyContent: "flex-end", gap: "8px" }}>
-          <Button variant="secondary" onClick={onClose}>
-            Done
-          </Button>
-        </div>
       </div>
     </Dialog>
   );
