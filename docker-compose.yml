@@ -3,7 +3,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-    image: cartethyia:local
+    image: wildanmuttaqi/cartethyia:20261018
     container_name: cartethyia
     expose:
       - "12800"
