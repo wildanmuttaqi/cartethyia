@@ -1,9 +1,6 @@
 services:
   app:
-    build:
-      context: .
-      dockerfile: Dockerfile
-    image: cartethyia:local
+    image: wildanmuttaqi/cartethyia:lite
     ports:
       - "${PORT:-12800}:12800"
     # .env supplies the app's own secrets, but Redis location is set below so it
