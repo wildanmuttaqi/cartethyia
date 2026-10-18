@@ -30,6 +30,14 @@ services:
     networks:
       - cartethyia
 
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    container_name: cartethyia-cloudflared
+    command: tunnel --no-autoupdate run --token ${CLOUDFLARE_TUNNEL_TOKEN:-}
+    restart: unless-stopped
+    networks:
+      - cartethyia
+
   # Redis is bundled for Docker's default full capabilities. Set
   # CARTETHYIA_REDIS_URL empty for the in-memory backend. PostgreSQL is never
   # bundled; full mode reaches it through DATABASE_URL in .env.
