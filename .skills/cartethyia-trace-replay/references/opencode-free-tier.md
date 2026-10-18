@@ -23,21 +23,30 @@ Corollary for deployments: a datacenter IP (Railway and similar) is blocked.
 
 - Base: `https://opencode.ai/inference/v1`; endpoint
   `/chat/completions` for free ids.
-- `stream: true` is required.
-- The body must carry the OpenCode **agent-tool fingerprint set**:
-  `edit, glob, grep, read, shell, skill, subagent, webfetch, websearch, write,
-  execute` — `FREE_AGENT_TOOL_NAMES` in
-  `src/providers/integrations/opencode/provider.ts`.
-- `Authorization: Bearer public` — required, and case-sensitive (`PUBLIC`
-  answers 401). Do not remove it.
-- Identity headers: `x-opencode-client: cli`, the four session headers set to
-  one `ses_` id, `x-opencode-project` as 40 lowercase hex, and
-  `user-agent: opencode/latest/<version>/cli`. Do **not** send
-  `x-opencode-request` on this lane.
-- The legacy lane `https://opencode.ai/zen/v1/chat/completions` also answers
-  200 with the pre-2.x shape (`user-agent: opencode/1.18.31 (...)`,
-  `x-opencode-request` present, `x-opencode-project: prj_<24hex>`, and only a
-  single `read` tool). It is a fallback, not the primary.
+- `stream: true` is required — `false` answers 403.
+- **At least 3 tools.** The gate is a membership test, not an exact-match test:
+  0/1/2 answer 403, 3 through 13 all answer 200. We send the full
+  `FREE_AGENT_TOOL_NAMES` set from
+  `src/providers/integrations/opencode/provider.ts` because the client does,
+  not because the floor demands it.
+- **`user-agent` must have a version segment**: `opencode/<channel>/<version>/cli`
+  with the version ≥ **1.18.0**. Two segments (`opencode/latest/cli`) answers
+  403; below the floor answers `426 UpgradeRequired`.
+- **One affinity header carrying a well-formed `ses_` id** is required:
+  `x-opencode-session`, `x-session-affinity`, or `x-session-id`. The id is
+  `ses_` + 12 hex (counter **1–63**) + 14 base62. Counter 64 answers 403.
+- `Authorization: Bearer public` is what the client sends, but it is **not
+  required** — an absent header answers 200, while a *wrong* one answers 401.
+  We keep sending it.
+- Everything else is optional: `x-opencode-client` (`cli` or `desktop`),
+  `x-opencode-project` (40 hex, `global`, `prj_*`, or absent), `accept`,
+  `content-type`, `traceparent`/`b3`, `x-opencode-request`.
+- The legacy lane `https://opencode.ai/zen/v1/chat/completions` answered **429
+  `FreeUsageLimitError`** on 2026-10-18 — rate-limited, not refused. Treat it as
+  a fallback whose quota is unknown, not as a dead lane.
+
+Full measured contract with the correction history:
+`documentation/archive/opencode-free-tier.md`.
 
 Absent the fingerprint, a free-model request is refused:
 
@@ -109,7 +118,8 @@ like an unreachable host.
   Limits and status: `https://models.opencode.ai/api.json` — a `status:
   "deprecated"` row is on its way out; do not guess either.
 - Known-good real-client capture:
-  `documentation/archive/opencode-freetier-exact-request-2.0.26.json`.
+  `documentation/archive/opencode-freetier-capture.log`. Its `user-agent` is
+  stale — add the version segment before replaying it.
 
 ## What does NOT matter
 
@@ -117,9 +127,12 @@ Verified by replay, so do not spend time here:
 
 | Suspect | Verdict |
 |---|---|
-| Client version in the `user-agent` (1.18.0 … 2.0.32) | Not validated. |
+| Exact version in the `user-agent`, above 1.18.0 (… 99.99.99) | Indifferent. But the **segment must exist** and the floor is 1.18.0. |
 | `x-opencode-client: cli` vs `desktop` | Both accepted. |
-| Session id value, when the shape is right | Any `ses_` id with a plausible inverted timestamp. |
-| Extra tool definitions beyond the 11 | Allowed; the gate is membership, not equality. |
+| Session id value, when the shape is right | Any `ses_` id with counter 1–63. |
+| Extra tool definitions beyond the fingerprint | Allowed; the gate is membership, not equality. |
 | Tool order | Irrelevant. |
+| `authorization` | Absent passes; *wrong* answers 401. |
+| `x-opencode-request` | Answers 200 on `/inference`. |
+| Prompt size, turn count, `system` turns, `temperature`, `top_p`, missing token cap | All 200. |
 | The egress IP | **Decisive.** Check this first. |

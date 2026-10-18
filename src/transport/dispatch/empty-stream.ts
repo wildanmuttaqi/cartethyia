@@ -12,7 +12,10 @@
  * callback and supplies materialized headers + serialized body so replays
  * are byte-identical.
  *
- * Design: documentation/research/empty-stream-replay-design.md
+ * Design: the replay count, backoff, and the ordered endpoint list are the
+ * caller's contract; this helper owns fetch, watchdog, and rotation so a
+ * provider that answers 200 with no events is retried on the next endpoint
+ * rather than surfacing an empty body to the client.
  */
 import { GatewayError } from "../../protocol/gateway-error";
 

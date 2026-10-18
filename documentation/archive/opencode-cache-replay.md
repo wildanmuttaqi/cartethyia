@@ -9,9 +9,10 @@
 > `src/providers/integrations/opencode/fingerprint.ts` and
 > `documentation/reference/providers.md`.
 
-**Status:** completed, live replay. **Date:** 2026-10-13. **Source:** `preview-main` at `50b57c04`.
+**Status:** completed, live replay. **Date:** 2026-10-13. **Source:** commit `50b57c04`.
 
-> **See also:** [opencode-freetier-replay-2.0.29.md](./opencode-freetier-replay-2.0.29.md)
+> **Current contract:** [`opencode-free-tier.md`](./opencode-free-tier.md).
+> **See also:** [opencode-freetier-replay.md](./opencode-freetier-replay.md)
 > — the 2.0.29 DMG/RPM reverse-engineering and replay attempt that followed,
 > including how to extract UDIF/RPM without `7z` or `hdiutil`.
 

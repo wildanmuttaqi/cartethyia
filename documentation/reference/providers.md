@@ -65,7 +65,7 @@ storage enum is narrower — `api_key`, `oauth`, `none` (`schema.ts`,
 | API key | `provider_accounts.credential_ciphertext` (encrypted) | — |
 | OAuth | same column, access token | `provider_oauth_states` (`schema.ts`): refresh ciphertext, optional client-secret ciphertext, `expires_at`, refresh lease |
 | Device code | mints one of the two above | — |
-| No credential | nothing; `requires_account = false` and `credential_forwarding: "never"` | — |
+| No credential | nothing; `requires_account = false` (and, where the endpoint must not see any bearer, `credential_forwarding: "never"`) | — |
 
 `provider_accounts.auth_state` (`schema.ts`) holds non-secret per-account
 upstream configuration — region, profile ARN, OAuth client id, token endpoint —
@@ -115,10 +115,9 @@ while leaving operator-owned `enabled` alone.
 
 **Live discovery.** `loadModelDiscovery` is a `ProviderModelDiscovery`
 (`discovery/discovery-types.ts`); most OpenAI-compatible providers reuse
-`fetchOpenAICompatibleModels`. Per-account catalogs declare
-`modelDiscoveryRequiresCredential: true` — Kiro's list answers with what the
-credential's plan reaches, so static rows are only an offline seed. Persisted
-rows get `source: 'discovered'` or `'auto_free'`
+`fetchOpenAICompatibleModels`. Per-account catalogs are scoped by the
+credential's plan (`integrations/kiro/kiro-discovery.ts`); static rows are only
+an offline seed. Persisted rows get `source: 'discovered'` or `'auto_free'`
 (`discovery/probing-service.ts`).
 
 Whether the dashboard offers "Fetch models" is `supportsModelDiscovery`, which
@@ -131,7 +130,7 @@ static floor and never resets `enabled`. Catalog presence is not availability �
 ## Quota and health
 
 `QuotaFetcher` (`quota/quota-support.ts`) is a per-provider callback returning
-`ProviderQuotaResult` (`quota-contracts.ts:17`): a plan label and windows with
+`ProviderQuotaResult` (`quota-contracts.ts:22`): a plan label and windows with
 percentages and reset times, resolved lazily through the registry. Each window
 is explicitly `pooled` credit or, by default, an independent quota. Pooled
 balances sum per account before applying a credit/percent floor; independent

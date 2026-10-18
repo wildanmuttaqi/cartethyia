@@ -118,7 +118,7 @@ and keep `REDIS_URL` shared.
 
 ## Docker — bundling PostgreSQL
 
-[Getting started](getting-started.md#docker) covers the default Compose stack,
+[Getting started](getting-started.md#7-docker) covers the default Compose stack,
 which is Full mode with bundled Redis and an external PostgreSQL reached
 through `DATABASE_URL`. To bundle PostgreSQL in Compose instead of pointing at
 an external one, add a `docker-compose.override.yml` with a `postgres:16-alpine`

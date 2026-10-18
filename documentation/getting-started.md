@@ -33,7 +33,8 @@ Same features either way. Only the database changes.
 | Needs | Nothing | A reachable PostgreSQL |
 | Ceiling | Single process, single writer | Multiple instances |
 
-Lite is the default and stores its database at
+Lite is the default written by `bun setup` and shipped in `.env.example`, and it
+stores its database at
 `<CARTETHYIA_DATA_DIR>/cartethyia.sqlite`. When that is unset: `%APPDATA%\Cartethyia`
 on Windows, `~/Library/Application Support/Cartethyia` on macOS,
 `$XDG_DATA_HOME/Cartethyia` (or `~/.local/share/Cartethyia`) on Linux.
@@ -49,7 +50,7 @@ Redis is optional in both. Set `REDIS_URL` only when coordination is shared
 across processes. Lite is not a cut-down edition: move to Full later by
 exporting a JSON backup and importing it. The config does not need rebuilding.
 
-## npm global package
+## 3. npm global package
 
 ```bash
 npm install --global cartethyia
@@ -57,22 +58,32 @@ cartethyia setup
 carte
 ```
 
+`--global` is required. A local `npm install cartethyia` installs the package
+but leaves `cartethyia` and `carte` in `./node_modules/.bin/`, which is not on
+`PATH`, so neither command resolves. For a local install run `npx cartethyia`
+instead. On Linux and macOS a global install may need `sudo`; if it does, see
+<https://docs.npmjs.com/resolving-eacces-permissions-errors-when-installing-packages-globally>.
+
 Setup creates the encryption key, asks Lite or Full, checks the database, and
 stores `.env` in the OS config directory (`%APPDATA%\Cartethyia` on Windows,
 `~/Library/Application Support/Cartethyia` on macOS, `$XDG_CONFIG_HOME/Cartethyia`
 on Linux). Override it with `CARTETHYIA_CONFIG_DIR`. Generated config and SQLite
 data stay outside the npm package. Setup does not install PostgreSQL.
 
-`carte` starts the gateway in the tray and returns the terminal. `cartethyia
-start` stays in the foreground. The tray shows versions, **Open Console**,
-**Reset password**, **Backup & Restore**, and **Exit**, and can install an
-update. Exit drains the gateway through its authenticated loopback endpoint
-before stopping. This does not install a login/startup service.
+`carte` starts the gateway and opens an arrow-key menu: **Open Console**,
+**Settings**, **Hide to background**, **Check for updates**, and **Exit**. It
+needs no desktop environment, so it works over SSH and on a headless box.
+`carte --tray` starts a system-tray icon instead — versions, **Open Console**,
+**Reset password**, **Backup**, and **Exit** — and needs a graphical
+session; the launcher then releases the terminal once the gateway is ready.
+`cartethyia start` stays in the foreground. Exit drains the gateway through its
+authenticated loopback endpoint before stopping. This does not install a
+login/startup service.
 
 `cartethyia setup --non-interactive` never prompts and reads the persisted
 config. Full mode must already have `CARTETHYIA_DB_MODE=full` and a reachable
 `DATABASE_URL` there; values supplied only in the shell are not copied to disk.
-## 3. Install dependencies
+## 4. Install dependencies
 
 From the repository root, install both Bun workspaces (backend and dashboard):
 
@@ -85,7 +96,7 @@ root and `dashboard/`; one command installs both workspaces. Do not run a
 separate install from `dashboard/`. Installation does not create the database,
 generate `.env`, or start Cartethyia.
 
-## 4. Configure and validate the installation
+## 5. Configure and validate the installation
 
 Run the unified setup command:
 
@@ -108,7 +119,7 @@ pick which one an install's data is read against.
 bun setup --non-interactive   # never prompts; fails when Full config is missing
 bun doctor                    # checks .env, the database, optional Redis, readiness
 ```
-## 5. Configure encryption
+## 6. Configure encryption
 
 `CARTETHYIA_ENCRYPTION_KEY` is a required 256-bit secret. It encrypts stored
 provider credentials and API keys. Treat it like a password and keep it outside
@@ -123,7 +134,7 @@ bun -e "import { randomBytes } from 'node:crypto'; console.log(randomBytes(32).t
 
 A 64-character hex value or Base64 of 32 bytes are both accepted.
 
-## 6. Start Cartethyia
+## 7. Start Cartethyia
 
 Production builds first, then runs the compiled binary:
 
@@ -149,7 +160,7 @@ proxies to it and never needs to be opened on a VPS. When `PORT` changes,
 | `/console` | Dashboard |
 | `/share/:token` | Public child-key enrollment |
 
-## 7. Docker
+## 8. Docker
 
 Docker Compose defaults to Full mode and bundled Redis coordination:
 
@@ -180,7 +191,7 @@ The Compose app stores gateway state and telemetry payloads in the persistent
 `/app/data` volume. Redis starts as a helper container in either mode, but the
 application uses the in-memory backend when `CARTETHYIA_REDIS_URL` is empty.
 
-## 8. Migrations and backups
+## 9. Migrations and backups
 
 Numbered migrations under `migrations/full-postgres/` (Full) and
 `migrations/lite-sqlite3/` (Lite) run automatically at boot and are
@@ -197,7 +208,7 @@ To move an installation from Lite to Full:
 Backups may contain provider credentials and API-key data. Treat them like
 passwords and store them securely.
 
-## 9. Test database
+## 10. Test database
 
 Database-backed tests use the disposable URL in `CARTETHYIA_TEST_DATABASE_URL`,
 not the runtime `DATABASE_URL`. Keep optional test service settings in the
@@ -232,7 +243,7 @@ bun run test-db:down
 
 Never use production data for tests.
 
-## 10. Verification commands
+## 11. Verification commands
 
 Run the gates relevant to the change:
 

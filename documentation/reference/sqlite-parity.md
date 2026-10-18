@@ -13,8 +13,8 @@ retired migration history are recreated and restored from backup, not upgraded
 in place. What follows is what that arrangement actually does, measured against
 a real SQLite database on 2026-10-07, not inferred from the types.
 
-The column counts are from `schema.ts`: 18 `boolean`, 15 `jsonb`, 24
-`timestamp`, 13 `bigint` (all `mode: "number"`), 3 `numeric`, 12 `pgEnum`.
+The column counts are from `schema.ts`: 18 `boolean`, 14 `jsonb`, 29
+`timestamp`, 13 `bigint` (all `mode: "number"`), 4 `numeric`, 10 `pgEnum`.
 
 ## What round-trips correctly
 
@@ -54,14 +54,15 @@ spelling: `mergeJson`, `pruneExpiredCooldowns`, `caseInsensitiveLike`,
 lock. `db-sqlite.ts` rewrites `gen_random_uuid()` and `now()` per statement,
 converts `Date` bindings to ISO strings, maps boolean and timestamp
 columns back to the types the schema declares (`installSqliteColumnMapping`),
-skips an `ADD COLUMN` whose column already exists, and exposes `execute` (with
-rows) on both the handle and the transaction. The generator rewrites the DDL types listed above and drops
-`CREATE EXTENSION`, `CREATE TYPE`, `USING btree`, and `DESC`.
+skips no `ADD COLUMN` (SQLite has no `ADD COLUMN IF NOT EXISTS`; idempotency
+comes from the migration ledger), and exposes `execute` (with rows) on both the
+handle and the transaction. The generator rewrites the DDL types listed above
+and drops `CREATE EXTENSION`, `CREATE TYPE`, `USING btree`, and `DESC`.
 
 A caller that interpolates its own `::jsonb`, `::uuid`, or `octet_length`
-bypasses `dialect.ts` and fails on SQLite. `usage-flush.ts` is the one caller
-that spells those casts, and it branches: PostgreSQL gets
-`UPDATE ... FROM (VALUES ...)` with `::uuid` and `::bigint`, SQLite gets a
+bypasses `dialect.ts` and fails on SQLite. `usage-flush.ts` is the one *store*
+that spells `::uuid` and `::bigint`, and it branches: PostgreSQL gets
+`UPDATE ... FROM (VALUES ...)` with the casts, SQLite gets a
 `SELECT ... UNION ALL` with neither, because SQLite rejects `UPDATE ... FROM`.
 That branch is exercised by `test/persistence/usage-flush.test.ts`, which
 flushes 25 keys in one statement on a migrated SQLite file and reads the

@@ -4,11 +4,12 @@ One page per user-facing feature: what it is, the data that carries it, the
 code that owns it, and where to change it.
 
 These pages hold the *narrative*. The reference pages still hold the indexes —
-route tables, console domain inventory, dashboard page map, snapshot mechanics —
-and each of them points here for the detail behind a row. When a feature grows
-enough to need a page, give it one here and shrink the prose in
-`architecture.md`, `backend.md`, `console-api.md`, and `dashboard.md` to a
-summary plus a link. Do not grow those four into feature manuals.
+route tables, snapshot mechanics, one summary per layer — and each of them points
+here for the detail behind a row. When a feature grows enough to need a page,
+give it one here and shrink the prose in `architecture.md` and the four
+`.skills/.../references/*.md` layers (backend, protocol-and-translation,
+console-api, dashboard-map) to a summary plus a link. Do not grow those into
+feature manuals.
 
 | Feature | What it does |
 | --- | --- |

@@ -8,7 +8,235 @@ current baseline; an existing one applies the numbered files that followed it.
 
 The format follows [Keep a Changelog](https://keepachangelog.com/).
 
-## Unreleased
+## [2.4.5] — 2026-10-18
+
+### Fixed
+
+- **Update prints the command instead of failing with EBUSY.** An in-process
+  `npm install --global` can never succeed: the process running the install is
+  itself executing out of the package directory npm has to rename, and on
+  Windows that rename fails with `EBUSY` and npm exits `14`. Stopping the
+  gateway was not enough, because the CLI and the tray still run from that
+  directory.
+
+  Update now stops everything and prints the command to run, which is what
+  9router does:
+
+  ```text
+  Update available: 2.4.4 → 2.4.5
+
+  Run this now that Cartethyia has stopped:
+
+     npm install --global cartethyia@latest --prefer-online
+  ```
+
+  `cartethyia update` behaves the same way. `npmUpdate()` is deleted: it could
+  only ever fail, and reporting its exit code as "update finished" is what made
+  a failed install look successful.
+
+## [2.4.4] — 2026-10-18
+
+### Fixed
+
+- **An update now actually takes effect.** `npm install --global` cannot replace
+  the package directory while a process is running out of it: on Windows the
+  rename fails with `EBUSY` and npm exits `14`. The update ran with the gateway
+  and the menu still alive, so the install failed and the failure was reported
+  as success — "Update to 2.4.3 installs now", with the install left on 2.4.2.
+  Both the menu and the tray now stop the gateway before the install and start
+  it again afterwards, and a non-zero npm exit is reported with its code and
+  the current version is restored rather than leaving nothing running.
+
+## [2.4.3] — 2026-10-18
+
+### Fixed
+
+- **The tray no longer leaves an empty console window.** On Windows the tray
+  was a Node process holding a `systray2` helper, and Windows Terminal kept a
+  tab open for it for the tray's whole lifetime. That window belongs to the
+  terminal, not to the process — `MainWindowHandle` reads 0, so it cannot be
+  found and hidden from inside, and neither `windowsHide` nor
+  `detached: true` removes it.
+
+  The tray is now platform-specific (`scripts/cli/tray.ts`): on Windows it is a
+  PowerShell `NotifyIcon` (`scripts/cli/tray.ps1`) driven over JSON lines on
+  stdin/stdout, started with `-WindowStyle Hidden` so it owns no console at
+  all. macOS and Linux keep `systray2`, which attaches no console there. This
+  is the arrangement 9router uses.
+
+### Changed
+
+- `scripts/cli/cli.ts` drops the `systray2` dependency from its tray path, and
+  the tray helpers that existed only to launch and stop a Node tray process
+  (`waitForTrayStartupSignal`, `launchUpdatedTray`, `waitForTray`, `stopTray`)
+  are gone.
+
+## [2.4.2] — 2026-10-18
+
+### Fixed
+
+- **"Hide to tray" now actually runs the gateway in the background.** The handoff
+  was handing a live gateway to a tray that adopted it, which meant the tray
+  owned nothing and the port was empty after choosing it. It now follows the
+  same shape as 9router: spawn a detached `tray` process that starts and owns
+  the gateway from scratch, then drain this one so the new process can claim the
+  port. The tray is a normal first-class run rather than an adopted orphan, so
+  Exit, update, and `cartethyia stop` all behave the same whether the gateway
+  was started from the menu or from `carte --tray`. The adoption path is gone.
+
+## [2.4.1] — 2026-10-18
+
+### Fixed
+
+- **`carte` on a fresh install runs setup instead of crashing.** With no config
+  file, the menu booted the gateway immediately and the operator got a stack
+  trace about `CARTETHYIA_DB_MODE` being required — naming an environment
+  variable, not "you have not set this up". It now detects a missing config (or
+  a config with no database mode) and runs setup first, then starts.
+  `cartethyia start` still requires setup to have run, because it is the
+  foreground server command, not the entry point.
+
+## [2.4.0] — 2026-10-18
+
+### Added
+
+- **`cartethyia stop` stops a gateway this shell did not start.** The drain
+  token was regenerated on every start and `runtime.json` was deleted on
+  shutdown, so the token `stop` read could never match the gateway actually
+  running — it reported "no gateway found" or a 401 against a live process.
+  The token is now created once per install and kept, so the menu, the tray,
+  and `start` all authenticate with the same secret. `stop` also waits for the
+  port to stop answering before reporting success; a 202 is not a stop.
+- **Backup writes a file, not a settings page.** `POST /admin/export-backup`
+  writes a gzipped config backup to the download directory. The dashboard
+  export requires the console password, which is exactly what a locked-out
+  operator does not have; this route is gated by loopback plus the install
+  token instead. It exports the `config` section only — `telemetry_events`,
+  `telemetry_usage_totals`, and `telemetry_payloads` are per-request history,
+  are the bulk of the file, and are not what an operator is recovering.
+  Restore stays a console action.
+- **`POST /admin/reset-console-account`** deletes every console user, which puts
+  `requiresSetup()` back to true so `/console` asks for a new account. A
+  forgotten password previously had no recovery: `/change-password` needs the
+  current password and first-boot setup only runs when no user exists. Gated
+  by loopback, a constant-time token, and the literal body
+  `{"confirm":"RESET"}`. Providers, API keys, and routing are untouched.
+- **`carte` opens an arrow-key menu.** It lists Open Console, Reset console
+  password, Backup, Visit repository, the update row, Hide to tray, and Exit.
+  Built on `enquirer`, so it works over SSH and headless with no desktop
+  environment.
+
+### Changed
+
+- The gateway runs detached with its output in `gateway.log`, so the menu owns
+  the terminal instead of competing with startup logging.
+- The tray's three version rows collapse into one that carries the running
+  version and either "up to date" or "update to X".
+- `scripts/cli/cli.ts` splits by responsibility into `menu.ts` (key capture and
+  confirmations), `runtime-state.ts` (the install token), `version.ts`, and
+  `wordmark.ts` (the ANSI banner). `scripts/media.ts` moves to
+  `scripts/operations/media.ts`. `bun run test --scope scripts` covers the CLI.
+
+### Fixed
+
+- **The gateway dies with the menu.** Ctrl-C used to leave it running, so the
+  next `carte` reported "already running on port 12800". The gateway was
+  spawned detached and unref'd, and `kill()` from an exit handler does not stop
+  a detached child on Windows — measured: the call ran and the gateway kept
+  serving. It is now a child in this process group, so Ctrl-C reaches it
+  directly and `process.on("exit")` covers a closed terminal or a crash.
+  "Hide to tray" still hands it over untouched.
+- **An adopted tray's Exit stops the gateway.** "Hide to tray" hands the
+  running gateway to a tray that adopts it, so the tray holds no child process
+  and Exit only closed the icon, leaving the gateway listening. It now drains
+  through the loopback endpoint.
+- Starting while a gateway is already running reported "stopped before
+  becoming ready (exit code 1)", naming neither the port nor the cause. It now
+  says the gateway is already running on that port and how to resolve it.
+- The wordmark repeated down the terminal because the header was printed
+  inside the menu loop while `enquirer` redraws its frame per keypress.
+- A start failure printed "Cartethyia failed to start:" with an empty message.
+  It now names the exit code and the usual cause.
+
+## [2.3.4] — 2026-10-18
+
+### Fixed
+
+- The **menu now receives Enter.** `carte` rendered its menu but never got a
+  second keypress: the gateway was spawned with `stdin: "inherit"`, so it held
+  the descriptor and swallowed everything after the first key. The gateway
+  does not read stdin and the menu is the only consumer, so it now spawns
+  with `stdin: "ignore"`. Arrow keys move the selection and Enter chooses.
+
+### Changed
+
+- `scripts/cli/cli.ts` (794 lines) is split by responsibility: `menu.ts`
+  owns key capture, `runtime-state.ts` owns the `runtime.json` drain token,
+  and `version.ts` owns the installed/published version and `npm update`.
+  No command or flag changes.
+- `scripts/media.ts` moves to `scripts/operations/media.ts`, beside the other
+  provider-facing operations. Run it as `bun run scripts/operations/media.ts`.
+- `scripts/how-to-gen-media.md` is deleted; nothing referenced it.
+- `bun run test --scope scripts` is a new scope covering `test/scripts/`. It
+  pins the three CLI behaviours that regressed in 2.3.x: the non-interactive
+  menu guard, the drain-token round-trip, and a corrupt state file reading as
+  "no background gateway".
+
+## [2.3.3] — 2026-10-18
+
+### Added
+
+- `cartethyia stop` stops a gateway left running by the menu's **Hide to
+  background**. That process is not a child of the stopping shell, so it
+  cannot be signalled directly: the drain token is written to `runtime.json`
+  in the config directory (mode `0600`, outside `.env` because it authorises a
+  shutdown) when the menu detaches, and `stop` posts it to the loopback
+  `/admin/drain` endpoint. The file is removed once the drain is accepted, so
+  a stale token never outlives its gateway. Without it `stop` reports that no
+  background gateway was found instead of guessing at a process.
+
+### Fixed
+
+- "Hide to background" no longer prints a command that did not exist. It
+  previously told the operator to run `cartethyia stop`, which was never
+  implemented — the only way to stop a hidden gateway was to find the process
+  by hand.
+
+## [2.3.2] — 2026-10-18
+
+### Added
+
+- `carte` now opens an arrow-key menu instead of going straight to a
+  system-tray icon: Open Console, Settings, Hide to background, Check for
+  updates, and Exit. It is built on stdin raw mode, so it adds no menu
+  dependency and works over SSH, on a headless box, and on Windows where the
+  tray icon lands in the hidden-icons overflow and is never seen.
+  `carte --tray` still starts the icon for anyone who prefers it.
+
+### Fixed
+
+- `carte --tray` releases the launching terminal. The Node launcher used to
+  stay alive after the gateway was ready, which kept the shell open; it now
+  exits once the console URL has been shown. On Windows the child is spawned
+  through `cmd /c start "" /b` so it gets its own console group and closing
+  the terminal no longer signals the gateway.
+
+## [2.3.1] — 2026-10-18
+
+### Fixed
+
+- `ws` is bumped to `8.22.0`. The pinned `8.18.3` carried two advisories —
+  uninitialized memory disclosure and memory exhaustion from tiny fragments —
+  and npm reported no fix because the dependency was exact-pinned. Only
+  `src/network/pool/resolver.ts` imports it, for the proxy-pool egress probe.
+- Installing the package locally no longer reads as a broken install. The
+  commands live in `./node_modules/.bin/`, which is not on `PATH`, so
+  `cartethyia` and `carte` did not resolve after `npm install cartethyia`.
+  The install instructions now say `--global` is required, name `npx
+  cartethyia` as the local-install path, and point Linux and macOS users at
+  npm's EACCES guidance for a global install that needs `sudo`.
+
+## [2.3.0] — 2026-10-18
 
 ### Added
 
@@ -83,6 +311,61 @@ The format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ### Fixed
 
+- The OpenCode archive is reorganised around one canonical document,
+  `documentation/archive/opencode-free-tier.md`: the measured contract, the two
+  failures that look identical (shape vs egress), a runnable replay recipe, a
+  dated timeline, a corrections ledger of every claim this investigation got
+  wrong, and what is still open. The other documents are now marked as history
+  or method and link to it, and their stale values are corrected in place.
+- The OpenCode dispatch identity now sends `x-opencode-client: cli`, matching the
+  captured 2.x dispatch, the local 2.0.26 CLI captures and the reference
+  gateway. It previously sent `desktop` on the strength of a code comment that
+  no source in the archive supports. The gate accepts both, so this was never a
+  refusal — it was the adapter claiming a client identity it does not have.
+- The OpenCode gate's minimum header set is measured: **`user-agent` plus one
+  of `x-opencode-session`, `x-session-affinity`, or `x-session-id`**. Every other
+  header — including `authorization` — is individually droppable without a
+  refusal, but `x-opencode-session-id` alone does not satisfy the check, and the
+  session value must be a well-formed `ses_` id (`not-a-session` and empty both
+  answer 403). We keep sending the client's full set; the finding is about which
+  header a change must not drop.
+- More of the OpenCode gate is measured, mostly as things it does **not**
+  check: prompt size, 20-turn history, a system turn, `temperature`, `top_p`, a
+  missing token cap, absent or malformed trace headers, and `x-opencode-request`
+  all answer 200. `/zen/v1` answers `429 FreeUsageLimitError` rather than the 403
+  the capture records — the lane is alive and rate-limited. Volume is not the
+  trigger either: 12 sequential and 8 concurrent dispatches through fresh
+  proxies all answered 200.
+- The OpenCode free-tier tool threshold is measured at **3**, not the 10–11 the
+  archived capture recorded: 0/1/2 tools answer `403`, and 3 through 13 all
+  answer `200`. Streaming remains mandatory (`stream: false` → 403). We still
+  send the client's full 13 — the lower floor is a fact about the gate, not a
+  reason to send less.
+- OpenCode's free-tier User-Agent rule is measured: the gate requires
+  `opencode/<channel>/<version>/cli` with a **version segment** and a floor of
+  **1.18.0**. `opencode/latest/cli` — the value the archived capture records —
+  now answers `403 FreeTierError`, and anything below the floor answers
+  `426 UpgradeRequired` with the upstream's own explanation. Above the floor the
+  exact number is indifferent (1.18.0 through 99.99.99 all pass). Our adapter
+  already sends the three-segment form; the capture document now carries a
+  warning so nobody follows it into a 403.
+- The OpenCode free-tier refusal was measured against five fresh egresses: the
+  session counter window is **1–63** (64 and above answer `403 FreeTierError`),
+  the 64-hex internal session literal is refused, and `x-opencode-client`,
+  the session-id/affinity split, and three project-header shapes all pass. The
+  refusal therefore follows the egress address, not the request. Recorded in
+  `documentation/archive/opencode-session-identity.md`.
+- `x-opencode-project` is sent as 40 hex, hashed from the project identity, in
+  the shape the 2.x client emits. The literal `global` was a value that passed
+  one probe, not the client's own shape, and the gate fingerprints this header
+  beside the session id.
+- OpenCode session ids are capped at the counter window the free-tier gate
+  accepts. The client's own generator lets the counter grow without bound, so a
+  burst of more than 63 dispatches inside one millisecond produced ids outside
+  the accepted window — and a pool produces exactly that burst. On overflow the
+  timestamp advances one millisecond instead. The bundle trace, the generator,
+  and what is still unverified are recorded in
+  `documentation/archive/opencode-session-identity.md`.
 - The model probe now sends the same request shape a real dispatch does:
   `stream_options.include_usage` is attached, the sampling temperature is no
   longer pinned, and the output allowance is sentence-sized instead of 1024.
@@ -378,7 +661,7 @@ Released 2026-10-12.
   retains its chat-carried image path. Model Lab exposes image/video generation
   controls, including size and count selection where supported, and keeps media
   placeholders visible while generation is in progress.
-- `scripts/media.ts` provides reusable CodeBuddy image/video commands, including
+- `scripts/operations/media.ts` provides reusable CodeBuddy image/video commands, including
   automatic video task polling by default and `--no-wait` for returning a task
   ID.
 - Buddy image generation has been verified; Buddy-family video generation has
@@ -646,8 +929,6 @@ Released 2026-10-12.
   chat, completion, Responses, and Messages.
 - A plain-HTTP `CARTETHYIA_PUBLIC_ORIGIN` keeps the console session cookie
   non-Secure even when the production binary has `NODE_ENV` baked in.
-- Direct egress resolves through the OS resolver, so a pool on a VPN is not
-  recorded as a hang.
 - A regional model rejection now cools the account; a proxy VPN hang is recorded as
   such.
 - The buddy family keeps its variant's fixed leading system prompt — replacing it

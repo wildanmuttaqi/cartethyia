@@ -39,6 +39,9 @@ import { createTokenCountHandler } from "../transport/dispatch/token-count";
 
 import { createTransportPipeline } from "../transport/guards/pipeline";
 import { createDrainHandler, isLoopbackPeer, tokenMatches } from "../transport/drain-endpoint";
+import { createConsoleAccountResetHandler } from "../console/auth/account-reset";
+import { createBackupExportHandler } from "../console/backup/export-endpoint";
+import { consoleUsers, tenants } from "../persistence/schema";
 import { PublicModelCatalogStore, type AllowedModelEntry } from "../console/providers/catalog/public-model-store";
 import type { IpAbuseProtectionService } from "../security/abuse";
 import type { ReadinessCheckResult } from "../persistence/readiness";
@@ -547,6 +550,42 @@ export function createGatewayApp(deps: GatewayAppDeps) {
         resolvePeerAddress: (request) => peerAddresses.get(request) ?? null,
       });
       app.post("/admin/drain", drainHandler);
+    }
+
+    // Operator backup export. Same double gate as drain and reset, and no
+    // console password: the CLI already runs as the OS user who owns the
+    // database, and a forgotten password must not block the backup that is
+    // meant to rescue the install.
+    if (deps.drainToken) {
+      app.post(
+        "/admin/export-backup",
+        createBackupExportHandler({
+          db: deps.db,
+          token: deps.drainToken,
+          resolvePeerAddress: (request) => peerAddresses.get(request) ?? null,
+          resolveTenantId: async () => {
+            const [row] = await deps.db.select({ id: tenants.id }).from(tenants).limit(1);
+            return row?.id ?? null;
+          },
+        }),
+      );
+    }
+
+    // Console account reset. Same double gate as drain — loopback plus the
+    // token — because it deletes every operator credential on the install.
+    // Only authentication state goes; providers, keys, and routing stay.
+    if (deps.drainToken) {
+      app.post(
+        "/admin/reset-console-account",
+        createConsoleAccountResetHandler({
+          token: deps.drainToken,
+          resolvePeerAddress: (request) => peerAddresses.get(request) ?? null,
+          resetConsoleAccount: async () => {
+            const users = await deps.db.delete(consoleUsers);
+            return users.rowCount ?? 0;
+          },
+        }),
+      );
     }
 
     // Manual task trigger. Same gate as drain: loopback plus the drain token,

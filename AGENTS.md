@@ -107,8 +107,9 @@ development or production database.
   modules, secrets, or Node-only runtime dependencies.
 - `scripts/` — CLI, development, build, generation, operations, and test
   utilities. Check the existing subdirectory before adding a script.
-- `migrations/` — PostgreSQL and generated SQLite database baselines; older
-  databases recover through backup/restore rather than forward migrations.
+- `migrations/` — PostgreSQL and generated SQLite database baselines, plus the
+  numbered forward migrations (0000–0012) applied at boot; backup/restore is the
+  escape hatch for retired history, not a replacement for them.
 - `test/` and `dashboard/test/` — backend and dashboard tests.
 - `documentation/` — getting started, reference indexes, and feature guides.
 - `.skills/` — focused, repository-specific procedures and domain guidance.

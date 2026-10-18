@@ -1,14 +1,17 @@
 /**
- * Claude slow-lane support: per-response header parsing (§1) and the
- * in-memory per-account lane registry (§3) of
- * `documentation/research/slow-lane-design.md`.
+ * Claude slow-lane support: per-response header parsing and the in-memory
+ * per-account lane registry. The upstream response headers declare whether the
+ * account is in the slow lane and what its lifecycle status is; this module
+ * parses them into `ClaudeSlowStatus` / `ClaudeSlowOffer` and keeps the stamp
+ * on the candidate so routing can order a slow account behind fresh siblings.
  *
  * Owner note: `claude-quota.ts` owns quota *endpoint* reads. The slow lane is a
  * per-*response* header observation — different lifecycle, different owner, so
  * it lives here.
  *
- * Scope: §1 (parsing) and §3 (registry). §4 (routing integration) and §5 (retry
- * behavior) are deliberately not implemented here.
+ * Scope: header parsing and the registry are implemented here. Routing
+ * integration and retry behavior live at the caller
+ * (`src/transport/routing/router.ts`, `applySlowLane`).
  */
 
 /** Lifecycle status the upstream reports for the account's slow lane. */

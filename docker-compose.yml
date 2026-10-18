@@ -1,9 +1,16 @@
 services:
-  cartethyia:
-    image: wildanmuttaqi/cartethyia:20261018
-    container_name: cartethyia
-    expose:
-      - "12800"
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: cartethyia:local
+    ports:
+      - "${PORT:-12800}:12800"
+    # .env supplies the app's own secrets, but Redis location is set below so it
+    # overrides that file. Inside the Compose network the app reaches Redis by
+    # service name. The interpolation deliberately does not read the host
+    # REDIS_URL: environment overrides env_file, so a host-run bun dev value
+    # such as redis://localhost:6379 would otherwise enter the container.
     env_file:
       - "${CARTETHYIA_ENV_FILE:-.env}"
     environment:
@@ -11,16 +18,10 @@ services:
       PORT: "12800"
       DASHBOARD_DIST: /app/dist/dashboard
       CARTETHYIA_DATA_DIR: /app/data
-      CARTETHYIA_PUBLIC_ORIGIN: ${CARTETHYIA_PUBLIC_ORIGIN:-http://localhost}
-      CARTETHYIA_DB_MODE: full
-      TRUSTED_PROXY_CIDRS: ${TRUSTED_PROXY_CIDRS:-172.18.0.0/16}
-      DATABASE_URL: postgres://cartethyia:local-only-cartethyia@cartethyia-postgres:5432/cartethyia
-      REDIS_URL: redis://cartethyia-redis:6379
+      CARTETHYIA_DB_MODE: ${CARTETHYIA_DB_MODE:-full}
+      REDIS_URL: ${CARTETHYIA_REDIS_URL-redis://redis:6379}
     depends_on:
-      cartethyia-redis:
-        condition: service_healthy
-      cartethyia-postgres:
-        condition: service_healthy
+      - redis
     volumes:
       # Lite database, install id, and payload captures live under /app/data;
       # without this mount a container replace wipes them.
@@ -29,38 +30,14 @@ services:
     networks:
       - cartethyia
 
-  nginx:
-    image: nginx:alpine
-    container_name: cartethyia-nginx
-    ports:
-      - "80:80"
-    depends_on:
-      cartethyia:
-        condition: service_healthy
-    volumes:
-      - ./nginx.conf:/etc/nginx/conf.d/default.conf:ro
-      - ./robots.txt:/usr/share/nginx/html/robots.txt:ro
-    restart: unless-stopped
-    networks:
-      - cartethyia
-
-  cloudflared:
-    image: cloudflare/cloudflared:latest
-    container_name: cartethyia-cloudflared
-    command: tunnel --no-autoupdate run --token ${CLOUDFLARE_TUNNEL_TOKEN:-}
-    depends_on:
-      nginx:
-        condition: service_started
-    profiles:
-      - cloudflare
-    restart: unless-stopped
-    networks:
-      - cartethyia
-
-  cartethyia-redis:
+  # Redis is bundled for Docker's default full capabilities. Set
+  # CARTETHYIA_REDIS_URL empty for the in-memory backend. PostgreSQL is never
+  # bundled; full mode reaches it through DATABASE_URL in .env.
+  redis:
     image: redis:7.4.2-alpine
-    container_name: cartethyia-redis
     restart: unless-stopped
+    ports:
+      - "127.0.0.1:6379:6379"
     volumes:
       - redisdata:/data
     healthcheck:
@@ -71,28 +48,9 @@ services:
     networks:
       - cartethyia
 
-  cartethyia-postgres:
-    image: postgres:16-alpine
-    container_name: cartethyia-postgres
-    environment:
-      POSTGRES_USER: cartethyia
-      POSTGRES_PASSWORD: local-only-cartethyia
-      POSTGRES_DB: cartethyia
-    volumes:
-      - postgresdata:/var/lib/postgresql/data
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U cartethyia -d cartethyia"]
-      interval: 5s
-      timeout: 3s
-      retries: 10
-    restart: unless-stopped
-    networks:
-      - cartethyia
-
 volumes:
   redisdata:
   cartethyia-data:
-  postgresdata:
 
 networks:
   cartethyia:

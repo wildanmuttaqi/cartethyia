@@ -61,9 +61,11 @@ sequenceDiagram
 
 The canonical model is the boundary between client wire and provider wire. A chat
 client can be served by a Responses or Messages provider because both sides are
-encoded from the same request. `src/protocol/registry.ts` is the only switch:
-`chat`, `responses`, `messages`. There is no `native` family. A provider that
-frames its own wire says so on its metadata, not in the enum.
+encoded from the same request. `src/protocol/registry.ts` is the switch, selected
+by the provider's `wire_family` (`src/protocol/canonical-model.ts:16`):
+`chat`, `responses`, `messages`, and `gemini` — Factory's native
+`generateContent` wire. There is no `native` family. A provider that frames its
+own wire says so on its metadata, not in the enum.
 
 ## Ownership
 
@@ -102,6 +104,9 @@ for the per-key slot table that merges into the same resolver.
 | model cooldown | no | `model_cooldown` |
 | hard cooldown | no | `cooldown_hard` |
 | soft cooldown | yes | `cooldown` |
+| quota exhausted | no | `quota_exhausted` |
+| usage floor | no | `quota_exhausted` |
+| slow lane | yes | `slow` |
 | otherwise | yes | `healthy` |
 
 Admission is separate from eligibility. Eligibility says the account may be tried.
@@ -168,6 +173,6 @@ not push state into the gateway by any other path.
 
 ## What is intentionally absent
 
-- Fusion combos. Existing rows become `fallback` in `0003`.
+- Fusion combos. Existing rows become `fallback` on restore (`src/console/backup/validate.ts:120-121`).
 - A `native` wire family and a `degraded` health status.
 - Per-request rows in Postgres. The file log is the source for those reads.

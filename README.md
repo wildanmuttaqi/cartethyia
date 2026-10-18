@@ -20,6 +20,11 @@ cartethyia setup
 carte
 ```
 
+Install it **globally**. A local `npm install cartethyia` puts `cartethyia` and
+`carte` in `./node_modules/.bin/`, which is not on your `PATH` — the commands
+will not be found. Either install globally, or run a local one through
+`npx cartethyia`.
+
 Full install guide, modes, Docker, VPS, systemd, and the one-shot script:
 [getting started](documentation/getting-started.md). To remove it:
 `npm uninstall --global cartethyia`.
@@ -38,6 +43,26 @@ Full install guide, modes, Docker, VPS, systemd, and the one-shot script:
 
 Full list, with the custom-built capabilities and how they differ from plain
 forwarders: [Why Cartethyia](documentation/why-cartethyia.md).
+
+## <img src="https://api.iconify.design/lucide/image.svg?color=%238b949e" width="20" height="20" alt=""> Showcase
+
+One install, one console: watch traffic land, watch accounts stay healthy,
+and change routing without restarting anything.
+
+<table>
+<tr>
+<td align="center"><img src="documentation/assets/screenshots/overview.png" width="100%" alt="Overview" /><br /><b>Overview</b><br /><sub>Health of the whole install at a glance</sub></td>
+<td align="center"><img src="documentation/assets/screenshots/usage.png" width="100%" alt="Usage" /><br /><b>Usage</b><br /><sub>Volume, latency, cached tokens, spend per model</sub></td>
+</tr>
+<tr>
+<td align="center"><img src="documentation/assets/screenshots/provider.png" width="100%" alt="Provider detail" /><br /><b>Provider detail</b><br /><sub>Accounts, quota, health, and routing controls per provider</sub></td>
+<td align="center"><img src="documentation/assets/screenshots/model-lab.png" width="100%" alt="Model Lab" /><br /><b>Model Lab</b><br /><sub>Chat a routed model through the real gateway path</sub></td>
+</tr>
+<tr>
+<td align="center"><img src="documentation/assets/screenshots/customization.png" width="100%" alt="Customization" /><br /><b>Customization</b><br /><sub>Background, transparency, and per-surface blur</sub></td>
+<td align="center"><img src="documentation/assets/screenshots/settings.png" width="100%" alt="Settings" /><br /><b>Settings</b><br /><sub>Backup, retention, payload capture, update checks</sub></td>
+</tr>
+</table>
 
 ## <img src="https://api.iconify.design/lucide/route.svg?color=%238b949e" width="20" height="20" alt=""> Routes
 
@@ -72,7 +97,7 @@ Docker Compose defaults to Full. A local `.env` defaults to Lite. When Lite
 gets tight, export a JSON backup and restore it into Full. You do not rebuild
 the config.
 
-Details: [Getting started](documentation/getting-started.md#choose-a-database-mode).
+Details: [Getting started](documentation/getting-started.md#2-choose-a-database-mode).
 
 ## <img src="https://api.iconify.design/lucide/scale.svg?color=%238b949e" width="20" height="20" alt=""> License
 

@@ -40,8 +40,8 @@ aliases and combos, Usage floor, and Buddy media generation.
 
 ## The split
 
-The reference pages hold the **indexes** — route tables, console domain
-inventory, dashboard page map, snapshot mechanics. They summarise one row and
+The reference pages hold the **indexes** — route tables, snapshot mechanics, and
+one summary per layer. They summarise one row and
 link into `features/` for the narrative behind it. Do not grow them into feature
 manuals; add a page under `features/` instead.
 
@@ -50,7 +50,10 @@ documentation/
 ├── agent-context.md      repository onboarding and verified subsystem map
 ├── getting-started.md    installing and running it
 ├── installation.md       VPS/systemd, reverse proxy, one-shot script
+├── why-cartethyia.md     the problem it was built for and how it differs
 ├── archive/              superseded investigations, kept for the record
+├── research/             live investigations, kept while they are open
+├── assets/screenshots/   console screenshots the README showcases
 ├── reference/            how it is built, one page per layer
 └── features/             one page per feature
 ```

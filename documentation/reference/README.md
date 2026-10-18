@@ -1,7 +1,7 @@
 # Reference — how Cartethyia is built
 
-One page per layer. These are the **indexes**: route tables, console domain
-inventory, dashboard page map, snapshot mechanics. Each summarises one row and
+One page per layer. These are the **indexes**: route tables, snapshot mechanics,
+and one summary per layer. Each summarises one row and
 links into [`../features/`](../features/README.md) for the narrative behind it.
 Keep it that way — a feature that needs prose gets a page under `features/`.
 
@@ -11,6 +11,7 @@ Keep it that way — a feature that needs prose gets a page under `features/`.
 | [Providers](providers.md) | Provider layers, boot and bundled vs BYOK, credentials and auth, discovery, quota, per-family notes |
 | [Codebase size](codebase-size.md) | Tracked backend and frontend source-line counts and counting scope |
 | [Configuration](configuration.md) | Every environment variable. **Generated** from `src/config/spec.ts` by `scripts/generate/config-reference.ts`; regenerate it, never edit it by hand |
+| [Model name forms](model-name-forms.md) | Every spelling a model name takes and where each is resolved |
 | [SQLite parity](sqlite-parity.md) | Measured dialect differences between Lite and Full, and which ones are not defects |
 
 The backend, protocol, console, and dashboard maps moved into the skill that

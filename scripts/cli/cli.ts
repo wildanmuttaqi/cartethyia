@@ -1,25 +1,36 @@
-import { randomBytes } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
-import { spawn, type ChildProcess } from "node:child_process";
+import { existsSync, mkdirSync, openSync, writeFileSync } from "node:fs";
+import { spawn } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import SysTray from "systray2";
 import { isNewerRelease } from "../../src/console/updates/version-compare";
 import { PACKAGE_ROOT, resolvePackagePath, resolveUserConfigDir } from "../../src/config/package-paths";
+import { resolvePort } from "../../src/config/runtime";
 import { MINIMUM_BUN_VERSION, bunVersionAtLeast } from "../shared/env";
+import { chooseFromMenu, confirmByTyping, confirmStep } from "./menu";
+import { ensureDrainToken, readPersistedDrainToken } from "./runtime-state";
+import { createTray } from "./tray";
+import { readInstalledVersion, readLatestPublishedVersion } from "./version";
+import { renderWordmark } from "./wordmark";
 
 process.env.CARTETHYIA_CONFIG_DIR ??= resolveUserConfigDir();
 
 const HELP = `Cartethyia ${MINIMUM_BUN_VERSION}+ (Bun is required)
 
 Usage:
-  carte
+  carte                  start, then show an arrow-key menu (no GUI needed)
+  carte --tray           start with a system-tray icon instead
   cartethyia setup [--non-interactive]
   cartethyia start
-  cartethyia tray
+  cartethyia menu
+  cartethyia stop           stop a gateway left running in the background
   cartethyia update
 
-The short carte command starts Cartethyia in the system tray.
+carte starts the gateway in the background and leaves only the console menu on
+your terminal — Open Console, Reset password, Backup, Visit
+repository, Update, Exit. Arrow keys and Enter; no desktop environment needed,
+so it works over SSH and headless. Exiting the menu drains the gateway.
+carte --tray uses a system-tray icon instead, which needs a graphical session.
+Stop a gateway whose terminal is gone with "cartethyia stop".
 Setup explains Lite (embedded SQLite) and Full (external PostgreSQL), then saves
 configuration under the current user's Cartethyia config directory.
 `;
@@ -42,6 +53,7 @@ async function loadUserConfig(): Promise<void> {
   }
 }
 
+
 type TrayStartupSignal =
   | { readonly status: "ready"; readonly url: string }
   | { readonly status: "failed"; readonly message: string };
@@ -56,60 +68,7 @@ function reportTrayStartup(signal: TrayStartupSignal): void {
   }
 }
 
-async function waitForTrayStartupSignal(
-  signalPath: string,
-  child: ChildProcess,
-  timeoutMs: number,
-): Promise<string> {
-  let spawnError: Error | undefined;
-  child.once("error", (error) => {
-    spawnError = error;
-  });
-  const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
-    if (existsSync(signalPath)) {
-      try {
-        const parsed: unknown = JSON.parse(readFileSync(signalPath, "utf8"));
-        if (parsed !== null && typeof parsed === "object" && "status" in parsed) {
-          if (parsed.status === "ready" && "url" in parsed && typeof parsed.url === "string") return parsed.url;
-          if (parsed.status === "failed" && "message" in parsed && typeof parsed.message === "string") {
-            throw new Error(parsed.message);
-          }
-        }
-      } catch (error) {
-        if (!(error instanceof SyntaxError)) throw error;
-      }
-    }
-    if (spawnError) throw spawnError;
-    if (child.exitCode !== null) throw new Error(`updated Cartethyia exited during startup (exit code ${child.exitCode})`);
-    await Bun.sleep(150);
-  }
-  throw new Error("Cartethyia did not finish tray and gateway startup within 45 seconds");
-}
 
-function npmUpdate(): Promise<number> {
-  return new Promise((resolveExit) => {
-    const command = process.platform === "win32"
-      ? "cmd.exe"
-      : "npm";
-    const args = process.platform === "win32"
-      ? ["/d", "/s", "/c", "npm install --global cartethyia@latest"]
-      : ["install", "--global", "cartethyia@latest"];
-    let child;
-    try {
-      child = spawn(command, args, { cwd: tmpdir(), stdio: "inherit" });
-    } catch {
-      console.error("Could not start npm. Install Node.js with npm, then retry the update.");
-      resolveExit(1);
-      return;
-    }
-    child.once("error", () => {
-      console.error("Could not start npm. Install Node.js with npm, then retry the update.");
-      resolveExit(1);
-    });
-    child.once("exit", (code) => resolveExit(code ?? 1));
-  });
-}
 
 function openUrl(url: string): Promise<void> {
   const command = process.platform === "win32"
@@ -125,51 +84,58 @@ function openUrl(url: string): Promise<void> {
   return child.exited.then(() => undefined);
 }
 
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return value !== null && typeof value === "object";
-}
 
-async function readInstalledVersion(): Promise<string> {
-  const metadata: unknown = await Bun.file(resolvePackagePath("package.json")).json();
-  if (!isRecord(metadata) || typeof metadata["version"] !== "string") {
-    throw new Error("Cartethyia package version is unavailable");
+
+async function startGateway(
+  port: number,
+  drainToken: string,
+  options: { readonly detached?: boolean } = {},
+): Promise<Bun.Subprocess> {
+  // Starting a second gateway on the same port used to fail with "stopped
+  // before becoming ready (exit code 1)", which says nothing about the real
+  // cause. Probe the port first and say what is actually there.
+  const existing = await fetch(`http://127.0.0.1:${port}/health`, {
+    signal: AbortSignal.timeout(1_000),
+  }).catch(() => null);
+  if (existing !== null) {
+    throw new Error(
+      `Cartethyia is already running on port ${port}. Use \`cartethyia stop\` to stop it, or open http://127.0.0.1:${port}/console.`,
+    );
   }
-  return metadata["version"];
-}
-
-async function readLatestPublishedVersion(): Promise<string | null> {
-  try {
-    const response = await fetch("https://registry.npmjs.org/cartethyia/latest", {
-      signal: AbortSignal.timeout(4_000),
-    });
-    if (!response.ok) return null;
-    const metadata: unknown = await response.json();
-    return isRecord(metadata) && typeof metadata["version"] === "string" ? metadata["version"] : null;
-  } catch {
-    return null;
+  // The gateway logs a startup phase line per stage. In menu mode those lines
+  // would scroll through the same terminal the menu is drawing on, so they go
+  // to a file instead and the operator sees only the menu.
+  const configDir = process.env.CARTETHYIA_CONFIG_DIR;
+  let logFd: number | null = null;
+  if (configDir) {
+    try {
+      logFd = openSync(join(configDir, "gateway.log"), "a");
+    } catch {
+      // A read-only config directory costs only the log, not startup.
+    }
   }
-}
-
-function launchUpdatedTray(signalPath: string): ChildProcess {
-  const env = { ...process.env, CARTETHYIA_TRAY_STARTUP_SIGNAL: signalPath };
-  const child = spawn(
-    process.execPath,
-    ["run", resolvePackagePath("scripts", "cli", "cli.ts"), "tray"],
-    { cwd: tmpdir(), detached: true, stdio: "ignore", windowsHide: true, env },
-  );
-  child.unref();
-  return child;
-}
-
-async function startGateway(port: number, drainToken: string): Promise<ReturnType<typeof Bun.spawn>> {
   const child = Bun.spawn(
     [process.execPath, "run", resolvePackagePath("src", "main.ts")],
     {
       cwd: PACKAGE_ROOT,
       env: { ...process.env, CARTETHYIA_DRAIN_TOKEN: drainToken },
-      stdin: "inherit",
-      stdout: "inherit",
-      stderr: "inherit",
+      // "ignore", not "inherit": the gateway does not read stdin, and in menu
+      // mode the menu is the only stdin consumer. With "inherit" the gateway
+      // held the fd and swallowed every keypress after the first, so the menu
+      // rendered but never received Enter.
+      stdin: "ignore",
+      stdout: logFd ?? "ignore",
+      // stderr goes to the same file: "inherit" ties the gateway to the
+      // terminal, so closing that terminal took the gateway down with it and
+      // "Hide to tray" left nothing running.
+      stderr: logFd ?? "ignore",
+      // Attached by default. A detached child cannot be killed from an `exit`
+      // handler on Windows (measured: kill() runs, the gateway keeps serving),
+      // and a terminal's Ctrl-C only reaches children in the same process
+      // group. Staying attached means Ctrl-C and the `exit` backstop both stop
+      // the gateway. "Hide to tray" passes detached: true because that gateway
+      // must outlive this process.
+      detached: options.detached === true,
     },
   );
   const startupController = new AbortController();
@@ -252,270 +218,480 @@ async function stopGateway(
   }
 }
 
-async function waitForTray(tray: SysTray): Promise<void> {
-  let timer: ReturnType<typeof setTimeout> | undefined;
-  try {
-    await Promise.race([
-      tray.ready(),
-      new Promise<never>((_, reject) => {
-        timer = setTimeout(() => reject(new Error("System tray startup timed out")), 15_000);
-      }),
-    ]);
-  } finally {
-    if (timer !== undefined) clearTimeout(timer);
-  }
-}
 
-async function stopTray(tray: SysTray, ready: boolean, exited: boolean): Promise<void> {
-  if (exited) return;
-  if (!ready) {
-    tray.process.kill();
-    return;
+
+/**
+ * The default `carte` experience: start the gateway, then offer an arrow-key
+ * menu. This needs no desktop environment, so it works over SSH, on a headless
+ * box, and on Windows where the tray icon lands in the hidden-icons overflow
+ * and is never seen. `carte --tray` opts into the icon instead.
+ */
+async function startMenu(): Promise<void> {
+  // A fresh install has no config file yet, and the gateway refuses to boot
+  // without CARTETHYIA_DB_MODE — which surfaced as a stack trace about a
+  // missing database mode rather than "you have not set this up". Run setup
+  // first, the way `carte` is expected to behave on a new install.
+  const { ENV_PATH, readEnvFile } = await import("../shared/env");
+  const configured = existsSync(ENV_PATH) && (await readEnvFile(ENV_PATH)).CARTETHYIA_DB_MODE;
+  if (!configured) {
+    console.log(
+      existsSync(ENV_PATH)
+        ? "Cartethyia is missing its database mode. Starting setup.\n"
+        : "Cartethyia is not set up yet. Starting setup.\n",
+    );
+    const { setup } = await import("./setup");
+    await setup();
+    const after = existsSync(ENV_PATH) ? (await readEnvFile(ENV_PATH)).CARTETHYIA_DB_MODE : undefined;
+    if (!after) {
+      console.error(
+        `Setup did not record CARTETHYIA_DB_MODE in ${ENV_PATH}; run \`cartethyia setup\` and try again.`,
+      );
+      process.exitCode = 1;
+      return;
+    }
+    process.env.CARTETHYIA_DB_MODE = after;
   }
 
-  let timer: ReturnType<typeof setTimeout> | undefined;
-  try {
-    await Promise.race([
-      tray.kill(false),
-      new Promise<void>((resolveExit) => {
-        timer = setTimeout(() => resolveExit(), 5_000);
-      }),
-    ]);
-  } catch {
-    // Fall through to a direct child termination below.
-  } finally {
-    if (timer !== undefined) clearTimeout(timer);
-  }
-  if (!tray.killed) tray.process.kill();
-}
-
-async function startTray(): Promise<void> {
-  const { resolvePort } = await import("../../src/config/runtime");
   const port = resolvePort();
-  const drainToken = randomBytes(32).toString("hex");
-  const currentVersion = await readInstalledVersion();
+  const drainToken = ensureDrainToken();
   const dashboardUrl = `http://127.0.0.1:${port}/console`;
-  const settingsUrl = `${dashboardUrl}/settings`;
-  const icon = resolvePackagePath(
-    "tray-assets",
-    process.platform === "win32" ? "cartethyia.ico" : "cartethyia.png",
-  );
-  const version = {
-    title: `Current Cartethyia version: ${currentVersion}`,
-    tooltip: `Running Cartethyia ${currentVersion}`,
-    enabled: false,
-  };
-  const repository = {
-    title: "Repository: risunCode/cartethyia",
-    tooltip: "Open the Cartethyia GitHub repository",
-    enabled: true,
-  };
-  const updateStatus = {
-    title: "Version tracker: checking npm…",
-    tooltip: "Latest published Cartethyia version on npm",
-    enabled: false,
-  };
-  const update = {
-    title: "Checking for updates…",
-    tooltip: "Update Cartethyia and restart the tray process",
-    enabled: false,
-  };
-  const openConsole = {
-    title: `Open Console · ${dashboardUrl}`,
-    tooltip: `Open the local Console at ${dashboardUrl}`,
-    enabled: true,
-  };
-  const resetPassword = {
-    title: "Reset password",
-    tooltip: "Open Console settings to change the administrator password",
-    enabled: true,
-  };
-  const backupRestore = {
-    title: "Backup & Restore",
-    tooltip: "Open Console settings to export or restore configuration",
-    enabled: true,
-  };
-  const exit = {
-    title: "Exit",
-    tooltip: "Stop Cartethyia gracefully and close the tray",
-    enabled: true,
-  };
-  const tray = new SysTray({
-    menu: {
-      icon,
-      title: "Cartethyia",
-      tooltip: "Cartethyia AI gateway",
-      items: [
-        version,
-        repository,
-        updateStatus,
-        update,
-        SysTray.separator,
-        openConsole,
-        resetPassword,
-        backupRestore,
-        SysTray.separator,
-        exit,
-      ],
-    },
-    copyDir: true,
-  });
+  const repositoryUrl = "https://github.com/risunCode/cartethyia";
+  const currentVersion = await readInstalledVersion();
 
-  let gateway: ReturnType<typeof Bun.spawn> | null = null;
-  let trayReady = false;
-  let trayExited = false;
+  // The gateway is detached and holds no stdio, so this process owns the
+  // terminal outright: nothing else can consume the keys the menu needs. The
+  // drain token is persisted before the menu opens because `cartethyia stop`
+  // runs in a later shell and has no other handle on this process.
+  const gateway = await startGateway(port, drainToken);
+  gateway.unref();
+
+  let stopping = false;
+  let handedOff = false;
+  const shutDown = async (): Promise<void> => {
+    if (stopping) return;
+    stopping = true;
+    await stopGateway(gateway, port, drainToken);
+  };
+  // Ctrl-C has to stop the gateway, and the drain endpoint cannot be called
+  // from an exit path: it is async, and enquirer's own Ctrl-C handler calls
+  // process.exit(130) while a prompt is live. So the gateway is a child in this
+  // process group — a terminal's Ctrl-C signals the whole group, and the
+  // gateway drains through the SIGINT handler it already has in src/main.ts —
+  // and `process.on("exit")` is the synchronous backstop for every other way
+  // this process can end (a closed terminal, a crash, a signal Bun cannot
+  // deliver on Windows). That handler can only call synchronous APIs, which is
+  // why it signals the child rather than awaiting the drain endpoint.
+  // `handedOff` is set by "Hide to tray": the gateway is being given to a tray
+  // that will own it, so this process must not kill it on the way out.
+  process.on("exit", () => {
+    if (stopping || handedOff) return;
+    try {
+      gateway.kill();
+    } catch {
+      // Already gone; nothing to stop.
+    }
+  });
+  const interrupt = async (): Promise<void> => {
+    process.stdout.write("\u001b[2J\u001b[H");
+    console.log("Stopping Cartethyia…");
+    await shutDown();
+    process.exit(0);
+  };
+  process.on("SIGTERM", () => void interrupt());
+  process.on("SIGINT", () => void interrupt());
+
+  let latestVersion = await readLatestPublishedVersion();
+  let running = true;
+
+  const header = [...renderWordmark(), `Cartethyia ${currentVersion} \u00b7 ${dashboardUrl}`];
+
+  while (running) {
+    const upToDate = latestVersion === null || !isNewerRelease(currentVersion, latestVersion);
+    const updateLabel =
+      latestVersion === null
+        ? "Check for updates"
+        : upToDate
+          ? `Up to date (${currentVersion})`
+          : `Update to ${latestVersion}`;
+
+    const actions: readonly (() => Promise<void>)[] = [
+      async () => openUrl(dashboardUrl),
+      async () => {
+        // Deleting the console account is the only real password recovery:
+        // /change-password needs the current password, and first-boot setup
+        // only runs when no user exists. Removing the user puts the wizard
+        // back. Providers, keys, and routing are untouched.
+        console.log("");
+        console.log("This deletes every console account and its sessions.");
+        console.log("The next visit to /console asks you to create a new one.");
+        console.log("Providers, API keys, and routing are not touched.");
+        console.log("");
+        if (!(await confirmStep("Continue with the reset?"))) {
+          console.log("Cancelled.");
+          return;
+        }
+        if (!(await confirmByTyping("RESET", "Confirm deleting the console account"))) {
+          console.log("Cancelled.");
+          return;
+        }
+        const status = await resetConsoleAccount(port, drainToken);
+        console.log(
+          status === 0
+            ? `Console account removed. Open ${dashboardUrl} to create a new one.`
+            : "Reset failed; see the gateway log.",
+        );
+      },
+      async () => {
+        // Export straight to the download directory. The console page asks for
+        // the operator password, which is exactly the thing a locked-out
+        // operator does not have; the CLI already runs as the OS user who owns
+        // the database, so the loopback token is the whole gate.
+        const result = await exportBackup(port, drainToken);
+        if (result === null) return;
+        console.log(
+          `Backup written to ${result.path} (${(result.bytes / 1024).toFixed(1)} KiB, ${Object.keys(result.counts).length} tables).`,
+        );
+        console.log("Telemetry is not included: it is per-request history, not configuration.");
+      },
+      async () => openUrl(repositoryUrl),
+      async () => {
+        if (upToDate) return;
+        // npm cannot replace this package's directory while this process is
+        // running out of it: on Windows the rename fails with EBUSY and npm
+        // exits 14. Even with the gateway stopped, the CLI itself is executing
+        // from that directory, so an in-process install can never succeed.
+        // Print the command and exit, the way 9router does.
+        await shutDown();
+        console.log("");
+        console.log(`Update available: ${currentVersion} \u2192 ${latestVersion}`);
+        console.log("");
+        console.log("Run this now that Cartethyia has stopped:");
+        console.log("");
+        console.log(`   ${updateCommand()}`);
+        console.log("");
+        running = false;
+        process.exitCode = 0;
+        return;
+      },
+      async () => {
+        // Start a detached `tray` process that owns the gateway from scratch,
+        // then drain this one so the new process can claim the port. This is
+        // the pattern 9router uses and it is simpler than handing a live
+        // gateway between processes: the tray is a normal first-class run, not
+        // an adopted orphan, so Exit and update behave the same whether the
+        // gateway was started here or from `carte --tray`.
+        console.log("Starting the tray in the background…");
+        const tray = spawn(
+          process.execPath,
+          ["run", resolvePackagePath("scripts", "cli", "cli.ts"), "tray"],
+          {
+            cwd: tmpdir(),
+            detached: true,
+            stdio: "ignore",
+            windowsHide: true,
+            env: process.env,
+          },
+        );
+        tray.unref();
+        running = false;
+        stopping = true;
+        handedOff = true;
+        await shutDown();
+        console.log(`Cartethyia is running in the background at ${dashboardUrl}.`);
+        console.log("The tray icon owns it. Stop it with: cartethyia stop");
+      },
+      async () => {
+        running = false;
+      },
+    ];
+
+    const choice = await chooseFromMenu(header, [
+        { kind: "action", label: "Open Console", hint: `browser \u00b7 ${dashboardUrl}` },
+        { kind: "action", label: "Reset console password", hint: "deletes the account" },
+        { kind: "action", label: "Backup", hint: "export config to Downloads" },
+        { kind: "action", label: "Visit repository", hint: "github.com/risunCode/cartethyia" },
+        { kind: "action", label: updateLabel, hint: upToDate ? "no update available" : "installs now" },
+        { kind: "action", label: "Hide to tray", hint: "keep the gateway running" },
+        { kind: "rule" },
+        { kind: "action", label: "Exit", hint: "stop the gateway" },
+      ],
+    );
+    if (choice === -1) break;
+    const action = actions[choice];
+    if (action) await action();
+  }
+  // "Hide to tray" has already given the gateway to the tray. Draining here
+  // would stop the very process the tray just adopted, which is why the menu
+  // appeared to hand over a gateway that was not listening.
+  if (handedOff) return;
+  await shutDown();
+}
+
+/**
+ * Asks the gateway to write a gzipped config backup into the download
+ * directory. Returns the written path and counts, or null when it failed.
+ *
+ * The file is produced by the gateway, not here: the gateway owns the database
+ * connection and the schema is dialect-dependent, so reading the tables from
+ * this process would need a second implementation of both.
+ */
+/** The command an operator runs to update, printed instead of run in-process. */
+function updateCommand(): string {
+  return "npm install --global cartethyia@latest --prefer-online";
+}
+
+async function exportBackup(
+  port: number,
+  token: string,
+): Promise<{ path: string; bytes: number; counts: Record<string, number> } | null> {
+  try {
+    const response = await fetch(`http://127.0.0.1:${port}/admin/export-backup`, {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-drain-token": token },
+      body: JSON.stringify({}),
+      signal: AbortSignal.timeout(60_000),
+    });
+    if (!response.ok) {
+      const detail = await response.text().catch(() => "");
+      console.error(`The gateway refused the backup (HTTP ${response.status}). ${detail}`.trim());
+      return null;
+    }
+    return (await response.json()) as {
+      path: string;
+      bytes: number;
+      counts: Record<string, number>;
+    };
+  } catch {
+    console.error("Could not reach the gateway. Is it still running?");
+    return null;
+  }
+}
+
+/**
+ * Posts the console-account reset to the running gateway.
+ *
+ * The reset has to go through the gateway, not the database file, because the
+ * gateway holds the connection and the schema is dialect-dependent. Returns 0
+ * on success and 1 on any failure so the caller can print one line either way.
+ */
+async function resetConsoleAccount(port: number, token: string): Promise<number> {
+  try {
+    const response = await fetch(`http://127.0.0.1:${port}/admin/reset-console-account`, {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-drain-token": token },
+      body: JSON.stringify({ confirm: "RESET" }),
+      signal: AbortSignal.timeout(10_000),
+    });
+    if (!response.ok) {
+      const detail = await response.text().catch(() => "");
+      console.error(`The gateway refused the reset (HTTP ${response.status}). ${detail}`.trim());
+      return 1;
+    }
+    return 0;
+  } catch {
+    console.error("Could not reach the gateway. Is it still running?");
+    return 1;
+  }
+}
+
+/**
+ * Asks a gateway we do not own to drain, then waits for its port to close.
+ *
+ * Used by `cartethyia stop` and by an adopted tray's Exit: in both cases the
+ * gateway is a separate process, so the loopback endpoint is the only handle.
+ * Returns 0 only once the port stops answering — a drain that is accepted but
+ * leaves the listener up is not a stop.
+ */
+async function drainThroughEndpoint(port: number, token: string): Promise<number> {
+  try {
+    const response = await fetch(`http://127.0.0.1:${port}/admin/drain`, {
+      method: "POST",
+      headers: { "x-drain-token": token },
+      signal: AbortSignal.timeout(3_000),
+    });
+    if (response.status !== 202) {
+      console.error(
+        response.status === 401
+          ? `The gateway on port ${port} rejected the drain token. It was started by a different install; stop it where it was started.`
+          : `The gateway refused the drain request (HTTP ${response.status}).`,
+      );
+      return 1;
+    }
+  } catch {
+    console.error(`No gateway is listening on port ${port}. It may already be stopped.`);
+    return 1;
+  }
+
+  const deadline = Date.now() + 20_000;
+  while (Date.now() < deadline) {
+    const alive = await fetch(`http://127.0.0.1:${port}/health`, {
+      signal: AbortSignal.timeout(500),
+    })
+      .then(() => true)
+      .catch(() => false);
+    if (!alive) return 0;
+    await Bun.sleep(250);
+  }
+  console.error(
+    `The gateway accepted the drain but is still answering on port ${port} after 20 seconds.`,
+  );
+  return 1;
+}
+
+/**
+ * Stops a running gateway through its loopback drain endpoint.
+ *
+ * That process is not a child of this one, so it cannot be signalled directly —
+ * the token in the config directory is the only handle. A 202 means the drain
+ * was accepted, not that the process is gone, so this waits for the port to
+ * stop answering before reporting success; a `stop` that returns while the
+ * gateway is still serving is worse than one that fails.
+ */
+async function stopRunningGateway(): Promise<number> {
+  const port = resolvePort();
+  const token = readPersistedDrainToken();
+  if (token === null) {
+    console.error(
+      "This install has no saved drain token, so there is no background gateway to stop. Start one with `carte`, or stop a foreground run with Ctrl-C.",
+    );
+    return 1;
+  }
+  const code = await drainThroughEndpoint(port, token);
+  if (code === 0) console.log("Cartethyia stopped.");
+  return code;
+}
+
+
+/**
+ * Runs the gateway with a tray icon. The tray is platform-specific (`tray.ts`):
+ * on Windows it is a PowerShell NotifyIcon, because a Node tray library leaves
+ * an empty console tab open for the tray's whole lifetime, and that window is
+ * owned by Windows Terminal — not by this process, so it cannot be found and
+ * hidden from inside.
+ */
+async function startTray(): Promise<void> {
+  const port = resolvePort();
+  const drainToken = ensureDrainToken();
+  const dashboardUrl = `http://127.0.0.1:${port}/console`;
+  const repositoryUrl = "https://github.com/risunCode/cartethyia";
+  const currentVersion = await readInstalledVersion();
+
+  let gateway: Bun.Subprocess | null = null;
   let closing = false;
   let busy = false;
-  let latestVersion: string | null = null;
+  let resetArmed = false;
   let closePromise: Promise<void> | undefined;
+
+  const tray = createTray({
+    iconPath: resolvePackagePath(
+      "tray-assets",
+      process.platform === "win32" ? "cartethyia.ico" : "cartethyia.png",
+    ),
+    tooltip: `Cartethyia ${currentVersion}`,
+    items: [
+      { kind: "action", id: "repository", title: "Visit repository" },
+      { kind: "action", id: "update", title: `Cartethyia ${currentVersion} \u00b7 checking\u2026`, enabled: false },
+      { kind: "separator" },
+      { kind: "action", id: "console", title: `Open Console \u00b7 ${dashboardUrl}` },
+      { kind: "action", id: "reset", title: "Reset console password" },
+      { kind: "action", id: "backup", title: "Backup" },
+      { kind: "separator" },
+      { kind: "action", id: "exit", title: "Exit" },
+    ],
+    onSelect: (id: string) => void handleSelect(id),
+    onExit: () => void close(1),
+  });
 
   const close = (exitCode = 0): Promise<void> => {
     if (closePromise) return closePromise;
     closing = true;
     closePromise = (async () => {
-      const current: ReturnType<typeof Bun.spawn> | null = gateway;
+      const current: Bun.Subprocess | null = gateway;
       gateway = null;
       if (current) await stopGateway(current, port, drainToken);
-      await stopTray(tray, trayReady, trayExited);
+      await tray.close();
       process.exitCode = exitCode;
     })();
     return closePromise;
   };
 
   const refreshVersion = async (): Promise<void> => {
-    const fetchedVersion = await readLatestPublishedVersion();
+    const fetched = await readLatestPublishedVersion();
     if (closing) return;
-    latestVersion = fetchedVersion;
-    if (fetchedVersion === null) {
-      updateStatus.title = "Version tracker: unavailable";
-      update.title = "Check for updates";
-      update.enabled = true;
-    } else {
-      updateStatus.title = `Latest published version: ${fetchedVersion}`;
-      if (isNewerRelease(currentVersion, fetchedVersion)) {
-        update.title = `Update to ${fetchedVersion}`;
-        update.enabled = true;
-      } else {
-        update.title = `Up to date (${currentVersion})`;
-        update.enabled = false;
-      }
+    if (fetched === null) {
+      tray.update("update", `Cartethyia ${currentVersion} \u00b7 check for updates`, true);
+      return;
     }
-    try {
-      await tray.sendAction({ type: "update-item", item: updateStatus });
-      await tray.sendAction({ type: "update-item", item: update });
-    } catch {
-      // The tray may be closing while the background version check completes.
-    }
+    const newer = isNewerRelease(currentVersion, fetched);
+    tray.update(
+      "update",
+      newer
+        ? `Cartethyia ${currentVersion} \u00b7 update to ${fetched}`
+        : `Cartethyia ${currentVersion} \u00b7 up to date`,
+      newer,
+    );
   };
 
-  const handleClick = async (title: string): Promise<void> => {
-    if (closing) return;
-    if (title === "Exit") {
-      await close();
-      return;
-    }
-    if (title === openConsole.title) {
-      await openUrl(dashboardUrl);
-      return;
-    }
-    if (title === resetPassword.title || title === backupRestore.title) {
-      await openUrl(settingsUrl);
-      return;
-    }
-    if (title === repository.title) {
-      await openUrl("https://github.com/risunCode/cartethyia");
-      return;
-    }
-    if (title === "Check for updates" && !busy) {
-      await refreshVersion();
-      return;
-    }
-    if (title !== update.title || !update.enabled || busy) return;
-    if (latestVersion === null || !isNewerRelease(currentVersion, latestVersion)) {
-      await refreshVersion();
-      return;
-    }
-
+  const runUpdate = async (): Promise<void> => {
+    if (busy) return;
     busy = true;
-    update.title = "Updating Cartethyia…";
-    update.enabled = false;
-    try {
-      await tray.sendAction({ type: "update-item", item: update });
-      const current = gateway;
-      if (!current) throw new Error("Cartethyia gateway is not running");
-      gateway = null;
-      await stopGateway(current, port, drainToken);
-      if (closing) return;
+    // npm cannot replace this package's directory while this process is
+    // running out of it: on Windows the rename fails with EBUSY and npm exits
+    // 14, and stopping only the gateway is not enough because the tray itself
+    // is executing from that directory. Stop everything and print the command.
+    const latest = await readLatestPublishedVersion();
+    await close();
+    console.log("");
+    console.log(`Update available: ${currentVersion} \u2192 ${latest ?? "latest"}`);
+    console.log("");
+    console.log("Run this now that Cartethyia has stopped:");
+    console.log("");
+    console.log(`   ${updateCommand()}`);
+    console.log("");
+    process.exit(0);
+  };
 
-      console.log("Updating Cartethyia through npm...");
-      const code = await npmUpdate();
-      if (closing) return;
-      if (code !== 0) {
-        console.error(`npm update failed with exit code ${code}; restarting the current installation.`);
-        gateway = await startGateway(port, drainToken);
-        await refreshVersion();
+  async function handleSelect(id: string): Promise<void> {
+    if (closing) return;
+    if (id === "exit") return void (await close());
+    if (id === "console") return void (await openUrl(dashboardUrl));
+    if (id === "repository") return void (await openUrl(repositoryUrl));
+    if (id === "backup") {
+      const result = await exportBackup(port, drainToken);
+      if (result !== null) {
+        console.log(
+          `Backup written to ${result.path} (${(result.bytes / 1024).toFixed(1)} KiB). Telemetry is not included.`,
+        );
+      }
+      return;
+    }
+    if (id === "reset") {
+      // A tray click cannot ask for the typed confirmation the menu uses, so
+      // the first click arms the action and the second one runs it.
+      if (!resetArmed) {
+        resetArmed = true;
+        tray.update("reset", "Reset console password \u00b7 click again to delete", true);
         return;
       }
-
-      const signalPath = join(tmpdir(), `cartethyia-tray-update-${randomBytes(16).toString("hex")}.json`);
-      try {
-        const updatedProcess = launchUpdatedTray(signalPath);
-        const updatedUrl = await waitForTrayStartupSignal(signalPath, updatedProcess, 60_000);
-        console.log(`Cartethyia updated to ${await readInstalledVersion()} and restarted at ${updatedUrl}`);
-        await close();
-      } finally {
-        if (existsSync(signalPath)) unlinkSync(signalPath);
-      }
-    } catch (error) {
-      const reason = error instanceof Error ? error.message : "unknown error";
-      console.error(`Cartethyia update or restart failed: ${reason}`);
-      if (!closing && gateway === null) {
-        try {
-          gateway = await startGateway(port, drainToken);
-        } catch {
-          await close(1);
-        }
-      }
-      if (!closing) {
-        update.title = "Update failed — retry";
-        update.enabled = true;
-        try {
-          await tray.sendAction({ type: "update-item", item: update });
-        } catch {
-          // The tray may have failed while the update was being recovered.
-        }
-      }
-    } finally {
-      busy = false;
+      resetArmed = false;
+      tray.update("reset", "Reset console password", true);
+      await resetConsoleAccount(port, drainToken);
+      return;
     }
-  };
+    if (id === "update") await runUpdate();
+  }
 
-  await tray.onClick((event) => {
-    void handleClick(event.item.title).catch(() => {
-      console.error("The selected system-tray action failed.");
-    });
-  });
-  tray.onExit(() => {
-    trayExited = true;
-    if (!closing) void close(1);
-  });
-  tray.onError(() => {
-    console.error("The system-tray process failed; stopping Cartethyia.");
-    if (!closing) void close(1);
-  });
   process.once("SIGINT", () => void close());
   process.once("SIGTERM", () => void close());
 
   try {
-    await waitForTray(tray);
-    trayReady = true;
+    await tray.ready();
     gateway = await startGateway(port, drainToken);
-    reportTrayStartup({ status: "ready", url: dashboardUrl });
     console.log(`Cartethyia is running at ${dashboardUrl}`);
     void refreshVersion();
 
     while (!closing) {
-      const current: ReturnType<typeof Bun.spawn> | null = gateway;
+      const current: Bun.Subprocess | null = gateway;
       if (!current) {
         await Bun.sleep(100);
         continue;
@@ -532,10 +708,11 @@ async function startTray(): Promise<void> {
   }
 }
 
+
 async function main(): Promise<void> {
   assertBunVersion();
   const [command] = process.argv.slice(2);
-  if (command === "setup" || command === "start" || command === "tray") {
+  if (command === "setup" || command === "start" || command === "tray" || command === "menu" || command === "stop") {
     await loadUserConfig();
   }
 
@@ -545,16 +722,34 @@ async function main(): Promise<void> {
       await setup();
       return;
     }
-    case "start":
+    case "start": {
+      // A foreground run still needs a drain token on disk: `cartethyia stop`
+      // in another shell has no other handle on it, and without the token the
+      // gateway has no /admin/drain route at all.
+      process.env.CARTETHYIA_DRAIN_TOKEN ??= ensureDrainToken();
       await import("../../src/main");
+      return;
+    }
+    case "menu":
+      await startMenu();
       return;
     case "tray":
       await startTray();
       return;
+    case "stop":
+      process.exitCode = await stopRunningGateway();
+      return;
     case "update": {
-      const code = await npmUpdate();
-      if (code !== 0) process.exitCode = code;
-      else console.log("Cartethyia is up to date.");
+      // Running the install from here can never work: this process is itself
+      // executing out of the package directory npm would have to rename, and on
+      // Windows that rename fails with EBUSY. Stop any running gateway and print
+      // the command instead.
+      process.exitCode = await stopRunningGateway();
+      console.log("");
+      console.log("Now run:");
+      console.log("");
+      console.log(`   ${updateCommand()}`);
+      console.log("");
       return;
     }
     case "--help":

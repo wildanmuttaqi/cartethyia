@@ -146,7 +146,10 @@ export function renderConfigReference(): string {
     "a row there plus a `.env.example` line.",
     "",
     "Variables read outside the spec are therefore **not** listed below:",
-    "`CARTETHYIA_DB_MODE`, `DATABASE_URL`, `REDIS_URL`, and the Compose-only",
+    "`CARTETHYIA_DB_MODE`, `DATABASE_URL`, `REDIS_URL`, `NODE_ENV`, `LOG_LEVEL`,",
+    "`CARTETHYIA_TELEMETRY_PAYLOAD_DIR`, `CARTETHYIA_DATA_DIR`,",
+    "`CARTETHYIA_INSTALL_ID_DIR`, `CARTETHYIA_CONFIG_DIR`,",
+    "`CARTETHYIA_TEST_DATABASE_URL`, and the Compose-only",
     "`CARTETHYIA_REDIS_URL`. See `documentation/getting-started.md`.",
     "",
   ];

@@ -11,4 +11,7 @@ import pkg from "../../../package.json";
 
 export const DASHBOARD_VERSION = pkg.version;
 export const DASHBOARD_CODENAME = "Zhezhi";
-export const DASHBOARD_RELEASE_LABEL = `v${DASHBOARD_VERSION} (${DASHBOARD_CODENAME})`;
+// The manifest is a semver triple (npm requires it); the user-facing label
+// keeps the two-part form the dashboard has always shown.
+const DASHBOARD_LABEL_VERSION = DASHBOARD_VERSION.replace(/\.0$/, "");
+export const DASHBOARD_RELEASE_LABEL = `v${DASHBOARD_LABEL_VERSION} (${DASHBOARD_CODENAME})`;

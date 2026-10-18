@@ -312,10 +312,13 @@ describe("COMBO_STRATEGY_OPTIONS", () => {
 });
 
 describe("version metadata", () => {
-  test("the release label is composed from the version and codename", () => {
+  test("the release label drops the patch so the footer stays two-part", () => {
     // The footer reads this; a mismatch between the three constants would show a
-    // version that is not the one in package.json.
-    expect(DASHBOARD_RELEASE_LABEL).toBe(`v${DASHBOARD_VERSION} (${DASHBOARD_CODENAME})`);
+    // version that is not the one in package.json. The manifest is a semver
+    // triple (npm requires it); the label keeps the two-part form.
+    expect(DASHBOARD_RELEASE_LABEL).toBe(
+      `v${DASHBOARD_VERSION.replace(/\.0$/, "")} (${DASHBOARD_CODENAME})`,
+    );
   });
 
   test("the version is the root manifest's, not the dashboard's own copy", () => {
@@ -338,11 +341,10 @@ describe("version metadata", () => {
   });
 
   test("the version is a non-empty string taken from package.json", () => {
-    // MEASURED: the root manifest carries a two-part version ("2.2"), not a
-    // semver triple. I first asserted `/^\d+\.\d+\.\d+/` and was wrong.
-    // Asserting the actual shape rather than a stricter guess keeps this a real
-    // test of "it comes from package.json and is numeric", which is what the
-    // release label needs.
+    // MEASURED: the root manifest carries a semver triple ("2.2.0"). It was a
+    // two-part version until the npm publish gate rejected it; npm requires
+    // three parts. Asserting the actual shape rather than a stricter guess keeps
+    // this a real test of "it comes from package.json and is numeric".
     expect(typeof DASHBOARD_VERSION).toBe("string");
     expect(DASHBOARD_VERSION.length).toBeGreaterThan(0);
     expect(DASHBOARD_VERSION).toMatch(/^\d+(\.\d+)+/);
