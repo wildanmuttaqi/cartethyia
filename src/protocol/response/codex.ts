@@ -285,6 +285,47 @@ export class CodexStreamFrameProcessor {
   // Track tool call argument accumulation, retained for diagnostics and
   // future reconciliation of streamed arguments against authoritative ones.
   readonly #toolCallArgs = new Map<string, string[]>();
+  readonly #toolOutput = new Map<string, { callId: string; name?: string; arguments: string; emitted: string; started: boolean }>();
+
+  #emitTool(json: Record<string, unknown>, text: string, final: boolean): CanonicalEvent[] {
+    const identity = this.#resolveToolIdentity(json);
+    const itemId = typeof json["item_id"] === "string" ? json["item_id"] : undefined;
+    const outputIndex = readOutputIndex(json);
+    const keys = [
+      ...(itemId === undefined ? [] : [`item:${itemId}`]),
+      ...(outputIndex === undefined ? [] : [`output:${outputIndex}`]),
+      `call:${identity.callId}`,
+    ];
+    const previous = keys.map((key) => this.#toolOutput.get(key)).find((entry) => entry !== undefined);
+    const state: { callId: string; name?: string; arguments: string; emitted: string; started: boolean } = previous ?? { callId: identity.callId, arguments: "", emitted: "", started: false };
+    if (!state.started) state.callId = identity.callId;
+    if (identity.name !== undefined) state.name = identity.name;
+    for (const key of keys) this.#toolOutput.set(key, state);
+    state.arguments = final ? text : state.arguments + text;
+    this.hasToolCall = true;
+    if (state.name === undefined) return [];
+    // A final snapshot is authoritative, but must never replay arguments
+    // already streamed. Only an exact prefix can safely be completed.
+    const remaining = state.arguments.startsWith(state.emitted)
+      ? state.arguments.slice(state.emitted.length)
+      : "";
+    if (state.started && remaining.length === 0) return [];
+    state.started = true;
+    state.emitted += remaining;
+    return [{ type: "tool_call_delta", sequence_number: this.#seq++,
+      call_id: state.callId, name: state.name, arguments_delta: remaining }];
+  }
+
+  #emitToolItem(item: unknown, outputIndex: number | undefined): CanonicalEvent[] {
+    if (!isRecord(item)) return [];
+    const type = item["type"];
+    if (type !== "function_call" && type !== "custom_tool_call" && type !== "computer_call") return [];
+    const value = type === "custom_tool_call" ? item["input"] : item["arguments"];
+    const text = type === "computer_call" ? JSON.stringify(item["action"] ?? {})
+      : typeof value === "string" ? value : "";
+    return this.#emitTool({ ...item, item_id: item["id"], output_index: outputIndex,
+      ...(type === "computer_call" ? { name: "computer" } : {}) }, text, true);
+  }
   // Whitespace-loop guard: a model stuck emitting only whitespace tool-call
   // argument deltas would otherwise hang the dispatch loop forever.
   readonly #whitespaceDeltaTracking = new Map<
@@ -407,6 +448,19 @@ export class CodexStreamFrameProcessor {
     }];
   }
 
+  #emitMessageOutputText(item: unknown, outputIndex: number | undefined): CanonicalEvent[] {
+    if (!isRecord(item) || item["type"] !== "message" || !Array.isArray(item["content"]))
+      return [];
+    const itemId = typeof item["id"] === "string" ? item["id"] : undefined;
+    const events: CanonicalEvent[] = [];
+    for (const [contentIndex, block] of item["content"].entries()) {
+      if (isRecord(block) && block["type"] === "output_text" && typeof block["text"] === "string") {
+        events.push(...this.#emitFinalOutputText(itemId, outputIndex, contentIndex, block["text"]));
+      }
+    }
+    return events;
+  }
+
   /** Returns true once a frame carrying the terminal status/type has been seen. */
   get isDone(): boolean {
     return this.terminalStatus !== undefined;
@@ -432,8 +486,9 @@ export class CodexStreamFrameProcessor {
       if (itemId !== undefined) this.#openItems.set(itemId, entry);
       if (outputIndex !== undefined)
         this.#openItemsByOutputIndex.set(outputIndex, entry);
-      // `function_call` items carry no state this decoder needs at `added`
-      // time; the arguments arrive through the `.delta`/`.done` events below.
+      if (item?.["type"] === "function_call" || item?.["type"] === "custom_tool_call") {
+        events.push(...this.#emitTool({ ...item, item_id: itemId, output_index: outputIndex }, "", false));
+      }
     } else if (
       t === "response.output_text.delta" &&
       typeof json["delta"] === "string" &&
@@ -486,7 +541,7 @@ export class CodexStreamFrameProcessor {
       t === "response.function_call_arguments.delta" &&
       typeof json["delta"] === "string"
     ) {
-      const { callId, name } = this.#resolveToolIdentity(json);
+      const { callId } = this.#resolveToolIdentity(json);
       const itemId =
         typeof json["item_id"] === "string"
           ? (json["item_id"] as string)
@@ -496,19 +551,13 @@ export class CodexStreamFrameProcessor {
       const chunks = this.#toolCallArgs.get(key) ?? [];
       chunks.push(json["delta"] as string);
       this.#toolCallArgs.set(key, chunks);
-      events.push({
-        type: "tool_call_delta",
-        sequence_number: this.#seq++,
-        call_id: callId,
-        name,
-        arguments_delta: json["delta"] as string,
-      } as CanonicalEvent);
+      events.push(...this.#emitTool(json, json["delta"] as string, false));
       this.hasToolCall = true;
     } else if (
       t === "response.custom_tool_call_input.delta" &&
       typeof json["delta"] === "string"
     ) {
-      const { callId, name } = this.#resolveToolIdentity(json);
+      const { callId } = this.#resolveToolIdentity(json);
       const itemId =
         typeof json["item_id"] === "string"
           ? (json["item_id"] as string)
@@ -517,13 +566,7 @@ export class CodexStreamFrameProcessor {
       const chunks = this.#toolCallArgs.get(key) ?? [];
       chunks.push(json["delta"] as string);
       this.#toolCallArgs.set(key, chunks);
-      events.push({
-        type: "tool_call_delta",
-        sequence_number: this.#seq++,
-        call_id: callId,
-        name,
-        arguments_delta: json["delta"] as string,
-      } as CanonicalEvent);
+      events.push(...this.#emitTool(json, json["delta"] as string, false));
       this.hasToolCall = true;
     } else if (
       t === "response.reasoning_summary_text.delta" &&
@@ -588,6 +631,7 @@ export class CodexStreamFrameProcessor {
       const finalArgs = (json as Record<string, unknown>)["arguments"];
       if (typeof finalArgs === "string" && key !== undefined) {
         this.#toolCallArgs.set(key, [finalArgs]);
+        events.push(...this.#emitTool(json, finalArgs, true));
       }
       this.hasToolCall = true;
     } else if (t === "response.custom_tool_call_input.done") {
@@ -600,8 +644,10 @@ export class CodexStreamFrameProcessor {
       if (itemId !== undefined) key = itemId;
       else if (rawCallId !== undefined) key = decodeCodexToolCallId(rawCallId);
       const finalInput = (json as Record<string, unknown>)["input"];
-      if (typeof finalInput === "string" && key !== undefined)
+      if (typeof finalInput === "string" && key !== undefined) {
         this.#toolCallArgs.set(key, [finalInput]);
+        events.push(...this.#emitTool(json, finalInput, true));
+      }
       this.hasToolCall = true;
     } else if (t === "response.output_item.done") {
       const item = json["item"];
@@ -611,27 +657,8 @@ export class CodexStreamFrameProcessor {
           typeof outputItem["id"] === "string" ? outputItem["id"] : undefined;
         const outputIndex = readOutputIndex(json);
         const encrypted = outputItem["encrypted_content"];
-        if (
-          outputItem["type"] === "message" &&
-          Array.isArray(outputItem["content"])
-        ) {
-          for (const [contentIndex, block] of outputItem.content.entries()) {
-            if (
-              isRecord(block) &&
-              block["type"] === "output_text" &&
-              typeof block["text"] === "string"
-            ) {
-              events.push(
-                ...this.#emitFinalOutputText(
-                  outputItemId,
-                  outputIndex,
-                  contentIndex,
-                  block["text"],
-                ),
-              );
-            }
-          }
-        }
+        events.push(...this.#emitMessageOutputText(outputItem, outputIndex));
+        events.push(...this.#emitToolItem(outputItem, outputIndex));
         if (
           this.#captureWebSearchCitations &&
           outputItem["type"] === "message" &&
@@ -747,6 +774,17 @@ export class CodexStreamFrameProcessor {
       const response = json["response"];
       if (response && typeof response === "object") {
         const responseObj = response as Record<string, unknown>;
+        if (
+          (t === "response.completed" || t === "response.done") &&
+          Array.isArray(responseObj["output"])
+        ) {
+          // Terminal snapshots can be the only source of text. Reuse the
+          // item/content identities so streamed or done text is not replayed.
+          for (const [outputIndex, item] of responseObj["output"].entries()) {
+            events.push(...this.#emitMessageOutputText(item, outputIndex));
+            events.push(...this.#emitToolItem(item, outputIndex));
+          }
+        }
         if (typeof responseObj["status"] === "string")
           this.terminalStatus = responseObj["status"];
         if (responseObj["usage"] && typeof responseObj["usage"] === "object") {

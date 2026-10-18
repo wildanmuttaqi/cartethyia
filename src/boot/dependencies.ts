@@ -84,6 +84,7 @@ import type { ByokUpstreamHost } from "../providers/operations/provider-catalog-
 import type { ReadinessCheckResult } from "../persistence/readiness";
 import { log } from "../observability/logger";
 import { refreshProviderClientVersions } from "../providers/operations/client-versions";
+import { recoverMissingDefaultGatewayApiKeys } from "../console/auth/setup-service";
 
 
 export interface ProductionDeps {
@@ -147,6 +148,7 @@ export async function buildProductionDeps(): Promise<ProductionDeps> {
     // connection budget to fit into.
     if (handle.kind === "pg") await assertPoolFitsServerCapacity(poolMaxFromEnv());
   });
+  await measureStartupPhase("default-gateway-key-recovery", () => recoverMissingDefaultGatewayApiKeys(db));
   await measureStartupPhase("provider-seed", () => seedBundledProviders(db));
   // Boot-only: retire global rows for providers the bundle has dropped, so a
   // retired provider cannot linger as a card the console can no longer delete.

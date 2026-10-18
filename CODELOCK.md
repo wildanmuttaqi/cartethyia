@@ -23,6 +23,8 @@ The implementation may change across upstream versions; preserve the behavior, n
 
 - Final text frames recover an answer when no text delta was sent.
 - An `output_item.done` frame alone can recover the answer.
+- Terminal-only `response.completed` and `response.done` recover message text from `response.output`, without replaying earlier deltas or done frames (dedup by item/output/content identity).
+- Malformed terminal entries are skipped; terminal status, usage, and non-text handling remain intact.
 - Existing streamed text is not duplicated by either final frame.
 
 Run:
@@ -32,6 +34,12 @@ bun test test/protocol/codex-response.test.ts
 ```
 
 The test imports `CanonicalEvent` from `src/protocol/canonical-model.ts`.
+
+## Codex Tool Calls Must Survive Responses-to-Chat Conversion
+
+Reference checked: `../referensi/9router/open-sse/translator/response/openai-responses.js`, `openaiResponsesToOpenAIResponse`. The reference emits tool identity at `response.output_item.added` and recovers arguments at `response.output_item.done` when argument deltas were absent. Cartethyia previously stored these final arguments without emitting them, producing a `tool_calls` finish reason with no tool payload. VS Code can reject this as an empty response.
+
+Keep the Codex decoder's per-call recovery and deduplication: named identities on added, final input from argument-done/item-done/terminal output, buffering unnamed deltas until a name arrives, and no replay of already emitted arguments. Cover function/custom/computer calls and parallel calls. The tests in `test/protocol/codex-response.test.ts` verify actual `ChatStreamEncoder` chunks and `jsonCompletion`, not just internal flags. Preserve these tests when updating upstream. This does not guarantee a live upstream always sends usable output.
 
 ## Model Lab Requires a Default Gateway Key
 
@@ -45,6 +53,8 @@ The test imports `CanonicalEvent` from `src/protocol/canonical-model.ts`.
 
 - A first-boot restore without `api_keys` creates exactly one encrypted default key.
 - A first-boot restore containing a default key preserves it without adding another.
+- Existing installations with console users but no default key are repaired on startup. `recoverMissingDefaultGatewayApiKeys` is called by `src/boot/dependencies.ts` after migrations, under the same transaction lock as first-boot setup. Do not remove this call: setup/restore fixes alone do not repair an already-initialized database.
+- Running recovery repeatedly creates no duplicate. Existing default keys (including disabled/revoked keys) are not replaced or re-enabled. Configuration and administrator accounts remain intact.
 
 Run:
 
@@ -55,3 +65,5 @@ bun test test/console/backup-sqlite-restore.test.ts
 ## Deployment
 
 These are source changes. If Cartethyia runs from a Docker image, rebuild and deploy the updated image before expecting the fixes to take effect; updating source or this document alone does not update a running container.
+
+For an offline SCP workflow: build the new image locally, export it with Docker save, transfer the archive, load it on the VPS with Docker load, then force-recreate service `app` using the loaded tag. SCP alone or restarting the old container does not select the newly loaded image. Do not delete the data volume. Check startup logs for the `default-gateway-key-recovery` phase, then reload Model Lab and test a Codex request. Prefer a unique image tag per build to avoid confusing old and new archives.

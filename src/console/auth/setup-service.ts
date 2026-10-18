@@ -125,7 +125,7 @@ export class FirstBootSetupService {
       }
 
       await this.createConsoleUser(db, tenantId, password, username, displayName);
-      await this.ensureDefaultGatewayApiKey(db, tenantId);
+      await ensureDefaultGatewayApiKey(db, tenantId);
     };
 
     // First boot creates the default tenant, the platform-admin user, and the
@@ -195,7 +195,7 @@ export class FirstBootSetupService {
         verifyPassword: async () => false,
       });
       result = await backup.restoreFirstBoot(payload, tenantId);
-      await this.ensureDefaultGatewayApiKey(this.db, tenantId);
+      await ensureDefaultGatewayApiKey(this.db, tenantId);
       // Inside the same guard as the restore: a failure to create the
       // administrator must leave no tenant behind, exactly as a failed restore
       // does, or the next attempt finds setup already completed and locked.
@@ -211,32 +211,6 @@ export class FirstBootSetupService {
       throw error;
     }
     return { ...result, createdAdmin: true };
-  }
-
-  private async ensureDefaultGatewayApiKey(
-    db: CartethyiaDatabase,
-    tenantId: string,
-  ): Promise<void> {
-    const existing = await db
-      .select({ id: apiKeys.id })
-      .from(apiKeys)
-      .where(and(eq(apiKeys.tenantId, tenantId), eq(apiKeys.isDefault, true)))
-      .limit(1);
-    if (existing.length > 0) return;
-
-    const configuredSecret = resolveDefaultGatewayApiKey();
-    const secret = configuredSecret ?? generateApiKeySecret().secret;
-    await db.insert(apiKeys).values({
-      id: randomUUID(),
-      tenantId,
-      keyHash: hashSecret(secret),
-      label: DEFAULT_API_KEY_LABEL,
-      scopes: TENANT_KEY_SCOPES,
-      keyPrefix: configuredSecret === undefined ? DEFAULT_API_KEY_PREFIX : secret.slice(0, 3),
-      keyEncrypted: encryptCredential(secret),
-      requestsPerMinute: 240,
-      isDefault: true,
-    });
   }
 
   /**
@@ -270,4 +244,37 @@ export class FirstBootSetupService {
   }
 }
 
-/** One privileged console mutation to record. */
+/** Shared seed operation; never replaces or re-enables an existing default key. */
+async function ensureDefaultGatewayApiKey(db: CartethyiaDatabase, tenantId: string): Promise<void> {
+  const existing = await db
+    .select({ id: apiKeys.id })
+    .from(apiKeys)
+    .where(and(eq(apiKeys.tenantId, tenantId), eq(apiKeys.isDefault, true)))
+    .limit(1);
+  if (existing.length > 0) return;
+  const configuredSecret = resolveDefaultGatewayApiKey();
+  const secret = configuredSecret ?? generateApiKeySecret().secret;
+  await db.insert(apiKeys).values({
+    id: randomUUID(),
+    tenantId,
+    keyHash: hashSecret(secret),
+    label: DEFAULT_API_KEY_LABEL,
+    scopes: TENANT_KEY_SCOPES,
+    keyPrefix: configuredSecret === undefined ? DEFAULT_API_KEY_PREFIX : secret.slice(0, 3),
+    keyEncrypted: encryptCredential(secret),
+    requestsPerMinute: 240,
+    isDefault: true,
+  });
+}
+
+/** Repairs existing console tenants without resetting their configuration or credentials. */
+export async function recoverMissingDefaultGatewayApiKeys(db: CartethyiaDatabase): Promise<void> {
+  await db.transaction(async (transaction) => {
+    await transaction.execute(firstBootSetupLock());
+    const scoped = transaction as unknown as CartethyiaDatabase;
+    const users = await scoped.select({ tenantId: consoleUsers.tenantId }).from(consoleUsers);
+    for (const tenantId of new Set(users.map((user) => user.tenantId))) {
+      if (tenantId !== null) await ensureDefaultGatewayApiKey(scoped, tenantId);
+    }
+  });
+}

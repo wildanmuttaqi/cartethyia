@@ -2,7 +2,7 @@ import { expect, test } from "bun:test";
 import { randomBytes, randomUUID } from "node:crypto";
 import { applySqliteMigrations, buildSqliteHandle, createSqliteDatabase } from "../../src/persistence/db-sqlite";
 import { BackupService } from "../../src/console/backup/service";
-import { FirstBootSetupService } from "../../src/console/auth/setup-service";
+import { FirstBootSetupService, recoverMissingDefaultGatewayApiKeys } from "../../src/console/auth/setup-service";
 import { apiKeys, providerAccounts } from "../../src/persistence/schema";
 import {
   decryptCredentialToString,
@@ -44,6 +44,27 @@ test("first-boot restore creates a default gateway key when the backup has none"
     expect(keys[0]?.keyEncrypted).not.toBeNull();
     if (keys[0]?.keyEncrypted == null) throw new Error("default key secret was not stored");
     expect(decryptCredentialToString(keys[0].keyEncrypted)).toStartWith("carte_");
+
+    // Reproduce an existing installation: administrator remains, but the
+    // historical restore did not leave a default key behind.
+    await db.delete(apiKeys);
+    expect(await setup.requiresSetup()).toBe(false);
+    await recoverMissingDefaultGatewayApiKeys(db);
+    await recoverMissingDefaultGatewayApiKeys(db);
+    const recovered = await db.select().from(apiKeys);
+    expect(recovered).toHaveLength(1);
+    expect(recovered[0]?.isDefault).toBe(true);
+    if (recovered[0]?.keyEncrypted == null) throw new Error("recovered key secret missing");
+    expect(decryptCredentialToString(recovered[0].keyEncrypted)).toStartWith("carte_");
+
+    // Startup must not undo an operator's decision to disable/revoke a key.
+    await db.update(apiKeys).set({ enabled: false, revokedAt: new Date() });
+    await recoverMissingDefaultGatewayApiKeys(db);
+    const preserved = await db.select().from(apiKeys);
+    expect(preserved).toHaveLength(1);
+    expect(preserved[0]?.id).toBe(recovered[0]?.id);
+    expect(preserved[0]?.enabled).toBe(false);
+    expect(preserved[0]?.revokedAt).not.toBeNull();
   } finally {
     sqlite.close();
     setCredentialEncryptionKeyForTesting(previousEncryptionKey);
