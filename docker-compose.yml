@@ -1,8 +1,5 @@
 services:
   cartethyia:
-    build:
-      context: .
-      dockerfile: Dockerfile
     image: wildanmuttaqi/cartethyia:20261018
     container_name: cartethyia
     expose:
