@@ -278,6 +278,7 @@ export class CodexStreamFrameProcessor {
   terminalEndTurn: boolean | undefined;
   terminalIncompleteDetails: unknown | undefined;
   readonly #reasoningDeltaIds = new Set<string>();
+  readonly #seenOutputText = new Set<string>();
   // output_index routing + `output_item.added` registration.
   readonly #openItems = new Map<string, OpenItemEntry>();
   readonly #openItemsByOutputIndex = new Map<number, OpenItemEntry>();
@@ -369,6 +370,43 @@ export class CodexStreamFrameProcessor {
     }
   }
 
+  #outputTextKeys(
+    itemId: string | undefined,
+    outputIndex: number | undefined,
+    contentIndex: number,
+  ): string[] {
+    return [
+      ...(itemId === undefined ? [] : [`item:${itemId}:${contentIndex}`]),
+      ...(outputIndex === undefined ? [] : [`output:${outputIndex}:${contentIndex}`]),
+    ];
+  }
+
+  #markOutputTextSeen(
+    itemId: string | undefined,
+    outputIndex: number | undefined,
+    contentIndex: number,
+  ): void {
+    for (const key of this.#outputTextKeys(itemId, outputIndex, contentIndex))
+      this.#seenOutputText.add(key);
+  }
+
+  #emitFinalOutputText(
+    itemId: string | undefined,
+    outputIndex: number | undefined,
+    contentIndex: number,
+    text: string,
+  ): CanonicalEvent[] {
+    const keys = this.#outputTextKeys(itemId, outputIndex, contentIndex);
+    const alreadySeen = keys.some((key) => this.#seenOutputText.has(key));
+    for (const key of keys) this.#seenOutputText.add(key);
+    if (alreadySeen || text.length === 0) return [];
+    return [{
+      type: "content_delta",
+      sequence_number: this.#seq++,
+      content: { kind: "text", text },
+    }];
+  }
+
   /** Returns true once a frame carrying the terminal status/type has been seen. */
   get isDone(): boolean {
     return this.terminalStatus !== undefined;
@@ -401,11 +439,39 @@ export class CodexStreamFrameProcessor {
       typeof json["delta"] === "string" &&
       json["delta"].length > 0
     ) {
+      const itemId =
+        typeof json["item_id"] === "string" ? json["item_id"] : undefined;
+      const outputIndex = readOutputIndex(json);
+      const contentIndex =
+        typeof json["content_index"] === "number" &&
+        Number.isInteger(json["content_index"])
+          ? json["content_index"]
+          : 0;
+      this.#markOutputTextSeen(itemId, outputIndex, contentIndex);
       events.push({
         type: "content_delta",
         sequence_number: this.#seq++,
         content: { kind: "text", text: json["delta"] as string },
       } as CanonicalEvent);
+    } else if (
+      t === "response.output_text.done" &&
+      typeof json["text"] === "string"
+    ) {
+      const itemId =
+        typeof json["item_id"] === "string" ? json["item_id"] : undefined;
+      const contentIndex =
+        typeof json["content_index"] === "number" &&
+        Number.isInteger(json["content_index"])
+          ? json["content_index"]
+          : 0;
+      events.push(
+        ...this.#emitFinalOutputText(
+          itemId,
+          readOutputIndex(json),
+          contentIndex,
+          json["text"],
+        ),
+      );
     } else if (
       t === "response.refusal.delta" &&
       typeof json["delta"] === "string" &&
@@ -545,6 +611,27 @@ export class CodexStreamFrameProcessor {
           typeof outputItem["id"] === "string" ? outputItem["id"] : undefined;
         const outputIndex = readOutputIndex(json);
         const encrypted = outputItem["encrypted_content"];
+        if (
+          outputItem["type"] === "message" &&
+          Array.isArray(outputItem["content"])
+        ) {
+          for (const [contentIndex, block] of outputItem.content.entries()) {
+            if (
+              isRecord(block) &&
+              block["type"] === "output_text" &&
+              typeof block["text"] === "string"
+            ) {
+              events.push(
+                ...this.#emitFinalOutputText(
+                  outputItemId,
+                  outputIndex,
+                  contentIndex,
+                  block["text"],
+                ),
+              );
+            }
+          }
+        }
         if (
           this.#captureWebSearchCitations &&
           outputItem["type"] === "message" &&

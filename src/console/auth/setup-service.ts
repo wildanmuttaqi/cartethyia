@@ -125,33 +125,7 @@ export class FirstBootSetupService {
       }
 
       await this.createConsoleUser(db, tenantId, password, username, displayName);
-      const defaultApiKey = resolveDefaultGatewayApiKey();
-      // The gateway key is mandatory, not optional: routing keys every request
-      // off it, and the CLI reads it from there. When `CARTETHYIA_API_KEY` is
-      // unset the secret is generated here with the same strength as the
-      // encryption key, so an install that never touched the variable still
-      // boots with a usable key instead of failing later with
-      // "the default gateway API key is missing".
-      const secret = defaultApiKey ?? generateApiKeySecret().secret;
-      const keyHash = hashSecret(secret);
-      const existingApiKey = await db
-        .select({ id: apiKeys.id })
-        .from(apiKeys)
-        .where(and(eq(apiKeys.tenantId, tenantId), eq(apiKeys.isDefault, true)))
-        .limit(1);
-      if (existingApiKey.length === 0) {
-        await db.insert(apiKeys).values({
-          id: randomUUID(),
-          tenantId,
-          keyHash,
-          label: DEFAULT_API_KEY_LABEL,
-          scopes: TENANT_KEY_SCOPES,
-          keyPrefix: defaultApiKey === undefined ? DEFAULT_API_KEY_PREFIX : secret.slice(0, 3),
-          keyEncrypted: encryptCredential(secret),
-          requestsPerMinute: 240,
-          isDefault: true,
-        });
-      }
+      await this.ensureDefaultGatewayApiKey(db, tenantId);
     };
 
     // First boot creates the default tenant, the platform-admin user, and the
@@ -221,6 +195,7 @@ export class FirstBootSetupService {
         verifyPassword: async () => false,
       });
       result = await backup.restoreFirstBoot(payload, tenantId);
+      await this.ensureDefaultGatewayApiKey(this.db, tenantId);
       // Inside the same guard as the restore: a failure to create the
       // administrator must leave no tenant behind, exactly as a failed restore
       // does, or the next attempt finds setup already completed and locked.
@@ -236,6 +211,32 @@ export class FirstBootSetupService {
       throw error;
     }
     return { ...result, createdAdmin: true };
+  }
+
+  private async ensureDefaultGatewayApiKey(
+    db: CartethyiaDatabase,
+    tenantId: string,
+  ): Promise<void> {
+    const existing = await db
+      .select({ id: apiKeys.id })
+      .from(apiKeys)
+      .where(and(eq(apiKeys.tenantId, tenantId), eq(apiKeys.isDefault, true)))
+      .limit(1);
+    if (existing.length > 0) return;
+
+    const configuredSecret = resolveDefaultGatewayApiKey();
+    const secret = configuredSecret ?? generateApiKeySecret().secret;
+    await db.insert(apiKeys).values({
+      id: randomUUID(),
+      tenantId,
+      keyHash: hashSecret(secret),
+      label: DEFAULT_API_KEY_LABEL,
+      scopes: TENANT_KEY_SCOPES,
+      keyPrefix: configuredSecret === undefined ? DEFAULT_API_KEY_PREFIX : secret.slice(0, 3),
+      keyEncrypted: encryptCredential(secret),
+      requestsPerMinute: 240,
+      isDefault: true,
+    });
   }
 
   /**

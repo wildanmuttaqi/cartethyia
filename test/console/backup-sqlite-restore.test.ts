@@ -2,7 +2,8 @@ import { expect, test } from "bun:test";
 import { randomBytes, randomUUID } from "node:crypto";
 import { applySqliteMigrations, buildSqliteHandle, createSqliteDatabase } from "../../src/persistence/db-sqlite";
 import { BackupService } from "../../src/console/backup/service";
-import { providerAccounts } from "../../src/persistence/schema";
+import { FirstBootSetupService } from "../../src/console/auth/setup-service";
+import { apiKeys, providerAccounts } from "../../src/persistence/schema";
 import {
   decryptCredentialToString,
   encryptCredential,
@@ -10,6 +11,104 @@ import {
   snapshotCredentialEncryptionKeyForTesting,
 } from "../../src/security/crypto";
 import { seedBundledProviders } from "../../src/providers/operations/provider-catalog-service";
+
+test("first-boot restore creates a default gateway key when the backup has none", async () => {
+  const previousMode = process.env.CARTETHYIA_DB_MODE;
+  const previousApiKey = process.env.CARTETHYIA_API_KEY;
+  const previousEncryptionKey = snapshotCredentialEncryptionKeyForTesting();
+  const sqlite = createSqliteDatabase(":memory:");
+  process.env.CARTETHYIA_DB_MODE = "lite";
+  delete process.env.CARTETHYIA_API_KEY;
+  setCredentialEncryptionKeyForTesting(randomBytes(32));
+  try {
+    await applySqliteMigrations(sqlite);
+    const { db } = buildSqliteHandle(sqlite);
+    const setup = new FirstBootSetupService(db, {
+      hashPassword: async () => "test-password-hash",
+      verifyPassword: async () => true,
+    });
+    const result = await setup.restoreBackup(
+      {
+        app: "cartethyia",
+        version: 1,
+        exportedAt: new Date().toISOString(),
+        sections: { config: {} },
+      },
+      { password: "test-password" },
+    );
+    const keys = await db.select().from(apiKeys);
+
+    expect(result.createdAdmin).toBe(true);
+    expect(keys).toHaveLength(1);
+    expect(keys[0]?.isDefault).toBe(true);
+    expect(keys[0]?.keyEncrypted).not.toBeNull();
+    if (keys[0]?.keyEncrypted == null) throw new Error("default key secret was not stored");
+    expect(decryptCredentialToString(keys[0].keyEncrypted)).toStartWith("carte_");
+  } finally {
+    sqlite.close();
+    setCredentialEncryptionKeyForTesting(previousEncryptionKey);
+    if (previousMode === undefined) delete process.env.CARTETHYIA_DB_MODE;
+    else process.env.CARTETHYIA_DB_MODE = previousMode;
+    if (previousApiKey === undefined) delete process.env.CARTETHYIA_API_KEY;
+    else process.env.CARTETHYIA_API_KEY = previousApiKey;
+  }
+});
+
+test("first-boot restore preserves a default gateway key included in the backup", async () => {
+  const previousMode = process.env.CARTETHYIA_DB_MODE;
+  const previousApiKey = process.env.CARTETHYIA_API_KEY;
+  const previousEncryptionKey = snapshotCredentialEncryptionKeyForTesting();
+  const sqlite = createSqliteDatabase(":memory:");
+  process.env.CARTETHYIA_DB_MODE = "lite";
+  delete process.env.CARTETHYIA_API_KEY;
+  setCredentialEncryptionKeyForTesting(randomBytes(32));
+  try {
+    await applySqliteMigrations(sqlite);
+    const { db } = buildSqliteHandle(sqlite);
+    const setup = new FirstBootSetupService(db, {
+      hashPassword: async () => "test-password-hash",
+      verifyPassword: async () => true,
+    });
+    await setup.restoreBackup(
+      {
+        app: "cartethyia",
+        version: 1,
+        exportedAt: new Date().toISOString(),
+        sections: {
+          config: {
+            api_keys: [
+              {
+                id: randomUUID(),
+                key_hash: "restored-key-hash",
+                key_mode: "personal",
+                label: "Restored gateway key",
+                scopes: ["tenant:invoke"],
+                key_prefix: "carte_",
+                api_key: "carte_restored-secret",
+                is_default: true,
+              },
+            ],
+          },
+        },
+      },
+      { password: "test-password" },
+    );
+    const keys = await db.select().from(apiKeys);
+
+    expect(keys).toHaveLength(1);
+    expect(keys[0]?.isDefault).toBe(true);
+    expect(keys[0]?.label).toBe("Restored gateway key");
+    if (keys[0]?.keyEncrypted == null) throw new Error("restored default key secret was not sealed");
+    expect(decryptCredentialToString(keys[0].keyEncrypted)).toBe("carte_restored-secret");
+  } finally {
+    sqlite.close();
+    setCredentialEncryptionKeyForTesting(previousEncryptionKey);
+    if (previousMode === undefined) delete process.env.CARTETHYIA_DB_MODE;
+    else process.env.CARTETHYIA_DB_MODE = previousMode;
+    if (previousApiKey === undefined) delete process.env.CARTETHYIA_API_KEY;
+    else process.env.CARTETHYIA_API_KEY = previousApiKey;
+  }
+});
 
 test("restores legacy sealed credentials with the active encryption key", async () => {
   const previousKey = snapshotCredentialEncryptionKeyForTesting();
