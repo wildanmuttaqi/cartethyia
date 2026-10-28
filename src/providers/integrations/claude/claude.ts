@@ -49,7 +49,7 @@ import { getClaudeCliVersion, adoptClaudeCliVersion, getClaudeSdkVersion } from 
 import { adoptRequiredVersion } from "../../operations/client-version-resolver";
 import { getOrCreateInstallId } from "../shared/install-id";
 import { canonicalToClaudeMessagesPayload } from "../../../protocol/request/messages";
-import { applyParamQuirks } from "../../../transport/translation/quirks";
+import { applyParamQuirks } from "../../../protocol/translation/quirks";
 import { CLAUDE_BILLING_HEADER_PREFIX, endpointUrl } from "../../../protocol/codecs";
 import { sendClaudeMessagesRequest } from "../../../protocol/upstream/send-claude-messages";
 import {
@@ -96,7 +96,9 @@ export const CLAUDE_MODELS: readonly ModelDefinition[] = [
   claudeMessagesModel("claude-sonnet-5", 1_000_000, 128_000, true),
   claudeMessagesModel("claude-sonnet-4-6", 1_000_000, 128_000, true),
   claudeMessagesModel("claude-opus-4-5", 200_000, 64_000, true),
-  claudeMessagesModel("claude-sonnet-4-5", 1_000_000, 64_000, true),
+  // 200K: the 4.5 trio predates the million-token window, which arrived with
+  // Opus 4.6. Only this row claimed 1M while its own siblings said 200K.
+  claudeMessagesModel("claude-sonnet-4-5", 200_000, 64_000, true),
   claudeMessagesModel("claude-haiku-4-5", 200_000, 64_000, true),
 ];
 
@@ -245,15 +247,15 @@ export class ClaudeAdapter implements ProviderAdapter {
     const profileId = request.generation_controls["extension:user_profile_id"];
     // A profile id travels two ways on the same request: the `user-profiles`
     // beta that unlocks profile scoping, and the header that names *which*
-    // profile. Carrying only the beta (the state before this change) declares
-    // the capability without ever addressing a profile, so a profile-scoped
-    // credential could not be selected.
+    // profile. Carrying only the beta declares the capability without ever
+    // addressing a profile, so a profile-scoped credential could not be
+    // selected.
     if (typeof profileId === "string" && profileId.length > 0) {
       // Dated, not bare: the donor sends `user-profiles-2026-09-04`
       // (the reference client `packages/ai/src/providers/anthropic-user-profiles.ts:4`).
-      // `ensureAnthropicBeta` takes any string, so the bare "user-profiles"
-      // this used to send passed every check while being a beta Anthropic has
-      // never published — an undocumented value the upstream ignores.
+      // `ensureAnthropicBeta` takes any string, so a bare "user-profiles" would
+      // pass every check while being a beta Anthropic has never published — an
+      // undocumented value the upstream ignores.
       ensureAnthropicBeta(headers, CLAUDE_USER_PROFILES_BETA);
       if (!HEADER_CONTROL.test(profileId)) {
         headers["anthropic-user-profile-id"] = profileId;
@@ -303,10 +305,14 @@ export class ClaudeAdapter implements ProviderAdapter {
         type: "text",
         text: createClaudeBillingText(userText, cliVersion),
       };
+      // The breakpoint is NOT pinned here. The reference client caches the
+      // *last* system block, so when the caller supplies its own prompt the
+      // breakpoint belongs on that, not on the identity — pinning it here put
+      // a breakpoint mid-prefix and left the caller's prompt uncached, which
+      // is both a fingerprint delta and a cache miss on every request.
       const instruction = {
         type: "text",
         text: CLAUDE_CODE_SYSTEM_INSTRUCTION,
-        cache_control: { type: "ephemeral" },
       };
       const hasInstruction = system.some(
         (block) => isRecord(block) && block["text"] === CLAUDE_CODE_SYSTEM_INSTRUCTION,
@@ -319,11 +325,31 @@ export class ClaudeAdapter implements ProviderAdapter {
       );
       // Captured-client placement: billing first, instruction second. The
       // patch anchor assumes this order — never reorder around it.
-      payload.system = [
+      const assembled = [
         ...(hasBilling ? [] : [billing]),
         ...(hasInstruction ? [] : [instruction]),
         ...system,
       ];
+      // The cache breakpoint rides the last system block: everything before it
+      // is stable prefix, and caching the tail is what the reference client
+      // does. Billing is never breakpointed — it varies per request.
+      const lastIndex = assembled.length - 1;
+      if (lastIndex > 0) {
+        const last = assembled[lastIndex];
+        const existing = isRecord(last) ? last["cache_control"] : undefined;
+        // A caller's own breakpoint is kept, but upgraded to the reference
+        // client's 1h retention when it stated none: that is the default the
+        // real CLI sends, and leaving it bare caches a shorter prefix than the
+        // upstream will honour.
+        const breakpoint =
+          isRecord(existing) && existing["ttl"] !== undefined
+            ? existing
+            : { type: "ephemeral", ttl: "1h" };
+        if (isRecord(last)) {
+          assembled[lastIndex] = { ...last, cache_control: breakpoint };
+        }
+      }
+      payload.system = assembled;
     }
     const url = endpointUrl(
       this.baseUrl,
@@ -458,14 +484,13 @@ export class ClaudeAdapter implements ProviderAdapter {
         type: "text",
         text: createClaudeBillingText(firstUserText(request), retryCliVersion),
       };
-      const parsedBody = JSON.parse(requestBody) as Record<string, unknown>;
-      const existingSystem = Array.isArray(parsedBody["system"])
-        ? (parsedBody["system"] as unknown[])
+      const existingSystem = Array.isArray(payload["system"])
+        ? (payload["system"] as unknown[])
         : [];
       const retryBody = isClaudeCodeOAuth
         ? patchClaudeCchBody(
             JSON.stringify({
-              ...parsedBody,
+              ...payload,
               system: [
                 retryBilling,
                 ...existingSystem.filter(

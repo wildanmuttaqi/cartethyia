@@ -7,14 +7,13 @@ import type { UsageRecord } from "../../protocol/canonical-model";
 import { classifyUpstreamFailure } from "../failure-policy";
 import type { AdmissionLease } from "../../security/admission/contracts";
 import type { CartethyiaDatabase } from "../../persistence/db-handle";
-import { TelemetryPayloadCapture } from "../../observability/payload-capture";
+import { resolvePayloadCapture, TelemetryPayloadCapture, truncateUtf8 } from "../../observability/payload-capture";
 import { payloadDirectory } from "../../observability/payload-store";
 import type { TelemetryBatchBuffer } from "../../observability/telemetry-buffer";
-import type { TelemetryPayloadDepth } from "../../console/settings/contracts";
 import type { ProxyRequestOutcome, ProxyRequestState } from "../request/state";
 import type { PayloadCaptureState } from "../../observability/payload-capture";
 import { finalizeRequestTelemetry } from "../guards/error-lifecycle";
-import { debitCachedQuota, quotaLens } from "../../console/quota/cache";
+import { debitCachedQuota, quotaLens } from "../../providers/quota/cache";
 import { BUDDY_PROVIDER_IDS } from "../../providers/provider-metadata";
 import { log } from "../../observability/logger";
 import {
@@ -22,43 +21,14 @@ import {
   recordPoolDispatchOutcome,
 } from "../../network/pool-health-machine";
 import { ProxyConnectRefusalError } from "../../network/pool/agent";
-import {
-  payloadCaptureKeepsBodies,
-  resolvePayloadCapture,
-} from "../../observability/payload-capture";
-
-/**
- * True when the tenant keeps response bodies (mode `full`). The dispatch
- * path calls this once per attempt to decide whether the provider-response
- * tee is worth its clone + bounded read; `none`/`metadata` skip the body.
- */
-export async function shouldCaptureProviderBody(
-  db: CartethyiaDatabase,
-  tenantId: string | null,
-): Promise<boolean> {
-  return payloadCaptureKeepsBodies(db, tenantId);
-}
-
-/**
- * Combined body cap for one capture depth. Fixed size tiers: every depth
- * stores all four drawer panels (client request, translated provider
- * request, raw provider response, final client response) — only the cap
- * changes, so raising the depth never changes *what* is visible, only how
- * much of large bodies survives. Moderate and maximum spike CPU/memory while
- * active; minimum is light enough to leave on.
- */
-function captureDepthMaxBytes(depth: TelemetryPayloadDepth): number {
-  if (depth === "moderate") return 8 * 1024 * 1024;
-  if (depth === "maximum") return 16 * 1024 * 1024;
-  return 1 * 1024 * 1024;
-}
+import { captureDepthMaxBytes, providerCaptureMaxBytes } from "./capture-policy";
 
 /**
  * What the client received for a failed terminal attempt, in the same public
  * envelope the error middleware sends on the wire (`{ error: { origin, code,
  * message, details } }`). Stored so Request Detail's "Client Response"
- * panel can trace an error exactly as the client saw it — failures used to
- * leave that panel empty.
+ * panel can trace an error exactly as the client saw it, including for failures
+ * that never produced a response body.
  */
 export function errorClientResponseBody(error: unknown): string {
   if (error instanceof GatewayError) {
@@ -80,7 +50,6 @@ export function parseCapturedBody(value: unknown): unknown {
   }
 }
 
-const PROVIDER_CAPTURE_MAX_BYTES = 256 * 1024;
 const PROVIDER_CAPTURE_AWAIT_MS = 2_000;
 const CAPTURABLE_RESPONSE_TYPES = /^(text\/|application\/(json|x-ndjson|sse))/i;
 
@@ -97,21 +66,24 @@ async function readBoundedBody(response: Response, maxBytes: number): Promise<st
   const reader = response.body.getReader();
   const decoder = new TextDecoder();
   // Collect decoded chunks and join once: `+=` per chunk reallocates the
-  // prefix (O(n^2)). Truncation stays at the same decoded-char boundary.
+  // prefix (O(n^2)). The budget is UTF-8 **bytes** — the same basis the record
+  // budget and the request-line slice use — measured per decoded chunk, with
+  // the final chunk trimmed by truncateUtf8 so a code point is never split.
   const parts: string[] = [];
-  let total = 0;
+  let totalBytes = 0;
   try {
-    while (total < maxBytes) {
+    while (totalBytes < maxBytes) {
       const { done, value } = await reader.read();
       if (done) break;
       const chunk = decoder.decode(value, { stream: true });
-      if (total + chunk.length > maxBytes) {
-        parts.push(chunk.slice(0, maxBytes - total));
-        total = maxBytes;
+      const chunkBytes = Buffer.byteLength(chunk, "utf8");
+      if (totalBytes + chunkBytes > maxBytes) {
+        parts.push(truncateUtf8(chunk, maxBytes - totalBytes));
+        totalBytes = maxBytes;
         break;
       }
       parts.push(chunk);
-      total += chunk.length;
+      totalBytes += chunkBytes;
     }
   } catch {
     // Best-effort capture must never fail the request path.
@@ -235,6 +207,7 @@ export function captureProviderExchange(
   inner: ValidatedOutboundFetch,
   sink: ProviderExchangeCapture,
   captureBody = true,
+  maxBytes = providerCaptureMaxBytes(),
 ): ValidatedOutboundFetch {
   return async (input, init) => {
     const url =
@@ -249,12 +222,21 @@ export function captureProviderExchange(
       method: init?.method ?? "GET",
       url,
       ...(headers === undefined ? {} : { headers }),
-      ...(rawBody === null ? {} : { body: parseCapturedBody(rawBody) }),
+      // `captureBody=false` is the `none`/`metadata` path: record that a body
+      // was sent and how big it was, without slicing or parsing it. The old
+      // shape sliced up to `maxBytes` of the translated body and ran it through
+      // `JSON.parse` for every attempt — content a metadata-mode tenant had
+      // explicitly declined to retain, paid on every dispatch.
+      ...(rawBody === null
+        ? {}
+        : captureBody
+          ? { body: parseCapturedBody(truncateUtf8(rawBody, maxBytes)) }
+          : { body_present: true, body_bytes: Buffer.byteLength(rawBody, "utf8") }),
     };
     const response = await inner(input, init);
     sink.response =
       captureBody && shouldCaptureProviderResponse(response)
-        ? readBoundedBody(response.clone(), PROVIDER_CAPTURE_MAX_BYTES).then(parseCapturedBody)
+        ? readBoundedBody(response.clone(), maxBytes).then(parseCapturedBody)
         : Promise.resolve(null);
     // Read regardless of `captureBody`: this is metadata about the dispatch, not
     // payload retention, so a tenant in `metadata` mode still records which
@@ -274,7 +256,8 @@ async function resolvedProviderResponse(
     new Promise<null>((resolve) => setTimeout(() => { timedOut = true; resolve(null); }, PROVIDER_CAPTURE_AWAIT_MS)),
   ]);
   if (settled === null || settled === undefined) {
-    // Distinguish "slow payload" from "no payload": a null used to mean both.
+    // Distinguish "slow payload" from "no payload": a bare null cannot tell the
+    // two apart, so the timeout is reported explicitly.
     return timedOut ? { _truncated: true, _reason: "provider_capture_timeout" } : null;
   }
   return settled;
@@ -307,12 +290,20 @@ async function captureTerminalPayload(
     return;
   }
   try {
-    const resolved = await resolvePayloadCapture(db, tenantId);
+    // Resolved once per request and memoized on the request state. The
+    // per-attempt call in the dispatch paths and this terminal call were
+    // resolving the same tenant setting independently, so a request with
+    // several attempts paid for it repeatedly and the two call sites could
+    // disagree about whether capture is on at all.
+    if (state.payloadCapturePreference === undefined) {
+      state.payloadCapturePreference = await resolvePayloadCapture(db, tenantId);
+    }
+    const resolved = state.payloadCapturePreference;
     if (!resolved.ok) {
       note("skipped_preference_read_failed");
       return;
     }
-    const { mode, depth } = resolved;
+    const { mode, depth, retentionMs } = resolved;
     if (mode === "none") {
       note("skipped_mode_none");
       return;
@@ -323,22 +314,23 @@ async function captureTerminalPayload(
         note("captured_metadata");
         return;
       }
-      await new TelemetryPayloadCapture(db).capture({
+      const metadataCapture = await new TelemetryPayloadCapture(db).capture({
         tenantId,
         requestId,
         requestBody: null,
         responseBody: null,
         providerRequestBody: providerRequest,
+        retentionMs,
         scope: "tenant",
         tenantOptIn: true,
       });
-      note("captured_metadata");
+      note(metadataCapture.payloadCaptureState ?? "captured_metadata");
       return;
     }
     const maxBytes = captureDepthMaxBytes(depth);
     const providerRequest = providerCapture?.request ?? null;
     const providerResponse = await resolvedProviderResponse(providerCapture);
-    await new TelemetryPayloadCapture(db).capture({
+    const terminalCapture = await new TelemetryPayloadCapture(db).capture({
       tenantId,
       requestId,
       requestBody: requestBody ?? null,
@@ -347,10 +339,11 @@ async function captureTerminalPayload(
       ...(providerRequest === null ? {} : { providerRequestBody: providerRequest }),
       ...(providerResponse === null ? {} : { providerResponseBody: providerResponse }),
       maxBytes,
+      retentionMs,
       scope: "tenant",
       tenantOptIn: true,
     });
-    note("captured");
+    note(terminalCapture.payloadCaptureState ?? "captured");
   } catch (error) {
     note("failed_write");
     reportCaptureFailure(error);
@@ -408,7 +401,22 @@ export function terminalFailure(
     if (terminal.provider_stop_reason) details["provider_code"] = terminal.provider_stop_reason;
     if (terminal.stop_details) Object.assign(details, terminal.stop_details);
     const message = typeof details["message"] === "string" ? details["message"] : "upstream request failed";
-    return new GatewayError("transport_unavailable", 502, message, details, "upstream");
+   // Preserve the upstream's error code when the provider embedded it in
+   // `stop_details` (Cursor writes `quota_exceeded` and `authentication_failed`
+   // there). Wrapping every terminal failure as `transport_unavailable` discarded
+   // those codes, so `quota_exceeded` was never seen by the classifier and the
+   // exhausted account was never cooled.
+   const code = typeof details["code"] === "string" ? details["code"] : undefined;
+   const status = typeof details["status"] === "number" ? details["status"] : 502;
+   const gatewayCode =
+     code === "quota_exceeded" ? "quota_exceeded" :
+     code === "authentication_failed" ? "authentication_failed" :
+     "transport_unavailable";
+   const gatewayStatus =
+     gatewayCode === "quota_exceeded" ? 429 :
+     gatewayCode === "authentication_failed" ? 401 :
+     status;
+   return new GatewayError(gatewayCode, gatewayStatus, message, details, "upstream");
   }
   if (terminal.state === "aborted") {
     // A client-initiated cancellation is not an upstream fault; the stream path
@@ -455,6 +463,13 @@ export function estimatedUsage(inputTokens: number, outputTokens: number): Usage
 export interface AttemptCompletion extends ProxyRequestOutcome {
   readonly modelId?: string;
   readonly error?: unknown;
+  /**
+   * The HTTP status the terminal classifier derived for a raw (non-GatewayError)
+   * failure — an upstream socket drop is 502, not the 500 the fallback implied.
+   * Only consulted when the error carries no status of its own and no wire
+   * response named one.
+   */
+  readonly terminalHttpStatus?: number;
   readonly lease?: AdmissionLease;
   /** Usage to reconcile, or undefined when this attempt consumed nothing billable. */
   readonly commitUsage?: UsageRecord;
@@ -527,6 +542,63 @@ export function completionContext(input: {
     ...(input.lease === undefined ? {} : { lease: input.lease }),
     ...(input.telemetryBuffer === undefined ? {} : { telemetryBuffer: input.telemetryBuffer }),
     ...(input.snapshotService === undefined ? {} : { snapshotService: input.snapshotService }),
+  };
+}
+
+/**
+ * The terminal-completion base the native routes (generation, responses
+ * compact, system one, web search, token count) all assemble. The proxy and
+ * streaming paths use `completionContext`; these routes previously spelled
+ * the same twelve fields by hand in six places. Callers spread this and add
+ * only what differs: status, response body, error classification.
+ */
+export function nativeCompletionBase(input: {
+  readonly providerId: string;
+  readonly modelId: string;
+  readonly tenantId: string | null;
+  readonly ingressBody: unknown;
+  readonly accountId?: string;
+  readonly accountLabel?: string;
+  readonly networkPoolId?: string;
+  readonly lease?: AdmissionLease;
+  readonly db: CartethyiaDatabase;
+  readonly telemetryBuffer?: TelemetryBatchBuffer;
+  readonly snapshotService?: { invalidate(): unknown };
+  readonly providerCapture?: ProviderExchangeCapture;
+  readonly usage?: AttemptCompletion["usage"];
+  readonly commitUsage?: AttemptCompletion["commitUsage"];
+}): Omit<
+  AttemptCompletion,
+  | "status"
+  | "responseBody"
+  | "httpStatus"
+  | "terminalHttpStatus"
+  | "error"
+  | "clientResponseText"
+  | "firstContentDeltaAtMs"
+  | "lastEventAtMs"
+  | "reportedModel"
+  | "errorCategory"
+  | "errorOrigin"
+  | "ttfbMs"
+  | "tokensPerSec"
+> {
+  return {
+    providerId: input.providerId,
+    modelId: input.modelId,
+    tenantId: input.tenantId,
+    ingressBody: input.ingressBody,
+    terminal: true,
+    ...(input.accountId === undefined ? {} : { accountId: input.accountId }),
+    ...(input.accountLabel === undefined ? {} : { accountLabel: input.accountLabel }),
+    ...(input.networkPoolId === undefined ? {} : { networkPoolId: input.networkPoolId }),
+    ...(input.lease === undefined ? {} : { lease: input.lease }),
+    db: input.db,
+    ...(input.telemetryBuffer === undefined ? {} : { telemetryBuffer: input.telemetryBuffer }),
+    ...(input.snapshotService === undefined ? {} : { snapshotService: input.snapshotService }),
+    ...(input.providerCapture === undefined ? {} : { providerCapture: input.providerCapture }),
+    ...(input.usage === undefined ? {} : { usage: input.usage }),
+    ...(input.commitUsage === undefined ? {} : { commitUsage: input.commitUsage }),
   };
 }
 
@@ -631,13 +703,14 @@ export async function completeAttempt(
       completion.httpStatus ??
       (completion.error instanceof GatewayError
         ? completion.error.status
-        : completion.status === "completed"
-          ? 200
-          : completion.status === "cancelled"
-            ? 499
-            : completion.status === "truncated"
-              ? 502
-              : 500),
+        : completion.terminalHttpStatus ??
+          (completion.status === "completed"
+            ? 200
+            : completion.status === "cancelled"
+              ? 499
+              : completion.status === "truncated"
+                ? 502
+                : 500)),
     ...(completion.providerId === undefined ? {} : { providerId: completion.providerId }),
     ...(completion.accountId === undefined ? {} : { accountId: completion.accountId }),
     ...(completion.accountLabel === undefined ? {} : { accountLabel: completion.accountLabel }),

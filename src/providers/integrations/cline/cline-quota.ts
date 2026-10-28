@@ -1,33 +1,34 @@
 import type { FetchLike, ProviderQuotaResult, ProviderQuotaWindow } from "../../quota/quota-contracts";
 import { authCredential, getJson, record, text } from "../../quota/quota-contracts";
 import { parseLimitWindows } from "../../quota/quota-limit-windows";
-import { probeApiKeyConnectivity } from "../../quota/quota-support";
-import { getClineClientVersion, getClineSdkVersion } from "../../operations/client-versions";
+import { getClineCliVersion, getClineSdkVersion } from "../../operations/client-versions";
 import { clinePlatform, clinePlatformVersion } from "../../operations/cli-platform";
 
 /**
  * Quota headers always carry the currently resolved CLI version.
  *
  * The two version headers are two different versions and must stay that way.
- * `x-client-version` is the Cline client the operator is running, from the
- * shared pooler. `x-core-version` is the `@cline/sdk` version, which is a
- * separate npm package with its own release line — this used to send the
- * *client* version in both slots, so the billing surface was told our core was
- * `4.1.23`, a vscode client version that `@cline/sdk` never published.
+ * `x-client-version` is the Cline CLI the operator is running (`cline` on npm),
+ * from the shared pooler. `x-core-version` is the `@cline/sdk` version — a
+ * separate npm package with its own release line, though one the CLI pins as a
+ * dependency — sending the client version in both slots would tell the billing
+ * surface our core was `4.1.23`, a vscode extension version
+ * that `@cline/sdk` never published.
  *
- * `src/providers/integrations/cline/cline.ts` has always sent the correct
- * pairing (`clientVersion` / `sdkVersion`) on the dispatch path, and that is
- * the identity proven to work against this provider. A header the upstream can
- * validate is not cosmetic: an implausible core version is exactly what a
- * "please update and re-authenticate" refusal is shaped like, and it is
- * indistinguishable from a dead credential from the response alone.
+ * Both surfaces send the same pairing (`cliVersion` / `sdkVersion`) and the
+ * same `cline-cli` client type. A header the upstream can validate is not
+ * cosmetic: an implausible core version is exactly what a "please update and
+ * re-authenticate" refusal is shaped like, and it is indistinguishable from a
+ * dead credential from the response alone.
  *
- * `x-client-type` stays `cline-cli`: the billing surface is read by the CLI,
- * while `cline.ts` correctly claims `cline-sdk` for the chat surface it talks
- * to. Not verified against a live billing response — see the roadmap note.
+ * Header identity is not what gates these endpoints: probing `/users/me`,
+ * `/users/me/plan` and `/users/me/plan/usage-limits` with no identity headers,
+ * the SDK identity and the CLI identity all returned identical responses. The
+ * 404 from the plan routes is "no plan history found for user", i.e. account
+ * state, not a rejected client.
  */
 function clineQuotaHeaders(): Record<string, string> {
-  const version = getClineClientVersion();
+  const version = getClineCliVersion();
   return {
     accept: "application/json",
     "content-type": "application/json",
@@ -72,7 +73,6 @@ function isMissingPlanHistory(reason: unknown): boolean {
   return /\b404\b|\bno plan history\b/i.test(message);
 }
 
-const CLINE_PROVIDER_ID = "cline" as const;
 /** Envelope marking a resolved secret as an api key rather than an OAuth grant. */
 export const CLINE_API_KEY_PREFIX = "cline-api-key:" as const;
 
@@ -85,24 +85,30 @@ export async function fetchClineQuota(
   credential: string,
   fetcher: FetchLike,
 ): Promise<ProviderQuotaResult> {
-  // API-key accounts carry no OAuth envelope and upstream exposes no quota
-  // surface for them, so an api key must never reach the OAuth-only
-  // users/me endpoint (a 401 there is not dispatchable either). The account
-  // test for keys is plain validity via /models.
-  if (credential.startsWith(CLINE_API_KEY_PREFIX)) {
-    return probeApiKeyConnectivity(
-      CLINE_PROVIDER_ID,
-      credential.slice(CLINE_API_KEY_PREFIX.length),
-      fetcher,
-    );
+  const isApiKey = credential.startsWith(CLINE_API_KEY_PREFIX);
+  const bearer = isApiKey ? credential.slice(CLINE_API_KEY_PREFIX.length) : null;
+
+  let headers: Record<string, string>;
+  if (isApiKey && bearer) {
+    // An api key is its own bearer token: `Authorization: Bearer sk_...`, with
+    // no `workos:` prefix.
+    //
+    // Prefixing it is what produced "Unauthorized: please make sure you're
+    // using the latest version of Cline and re-authenticate" — verified against
+    // a live key, where the same key returned 200 on `/users/me` bare and 401
+    // once `workos:` was prepended. The message names a version problem, so it
+    // reads as a client the upstream refuses rather than a malformed header,
+    // which is why it went unrecognised for so long.
+    headers = { ...clineQuotaHeaders(), authorization: `Bearer ${bearer}` };
+  } else {
+    const fields = authCredential(credential);
+    const access = text(fields.accessToken);
+    if (!access) throw new Error("Cline credential has no access token.");
+    headers = {
+      ...clineQuotaHeaders(),
+      authorization: `Bearer ${access.startsWith("workos:") ? access : `workos:${access}`}`,
+    };
   }
-  const fields = authCredential(credential);
-  const access = text(fields.accessToken);
-  if (!access) throw new Error("Cline credential has no access token.");
-  const headers = {
-    ...clineQuotaHeaders(),
-    authorization: `Bearer ${access.startsWith("workos:") ? access : `workos:${access}`}`,
-  };
   const me = record(await getJson("https://api.cline.bot/api/v1/users/me", headers, fetcher));
   const userId = text(me?.id);
   if (!userId) throw new Error("Cline account response has no user id.");

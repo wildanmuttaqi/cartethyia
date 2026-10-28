@@ -15,6 +15,7 @@ import { GatewayError, publicGatewayErrorBody } from "../protocol/gateway-error"
 import { shutdownError, shutdownNotice } from "../transport/shutdown-notice";
 import type { CanonicalAdapter } from "../transport/contracts";
 import type { ApiKeyAuthorizationSnapshot } from "../security/api-key-auth";
+import { modelsListApiKeyError } from "../security/api-key-auth";
 import { getDbHandle } from "../persistence/boot";
 import { isPgHandle } from "../persistence/db-pg";
 import { resolveRedisClient } from "../persistence/redis";
@@ -29,19 +30,26 @@ import { ProxyRequestStateStore } from "../transport/request/state";
 import { fastPathname } from "../transport/pathname";
 import {
   handleProviderProxyRequest,
-  type ProviderProxyHandlerDeps,
 } from "../transport/dispatch/proxy-request";
+import type { GatewayHandlerDeps } from "../transport/dispatch/handler-deps";
 import { createResponsesCompactHandler } from "../transport/dispatch/responses-compact";
 import { createSystemoneHandler } from "../transport/dispatch/systemone";
 import { createWebsearchHandler } from "../transport/dispatch/websearch";
-import { createImageGenerationHandler, createVideoGenerationHandler } from "../transport/dispatch/generation";
+import {
+  createAudioSpeechHandler,
+  createAudioTranscriptionHandler,
+  createEmbeddingHandler,
+  createImageGenerationHandler,
+  createVideoGenerationHandler,
+} from "../transport/dispatch/generation";
 import { createTokenCountHandler } from "../transport/dispatch/token-count";
 
 import { createTransportPipeline } from "../transport/guards/pipeline";
 import { createDrainHandler, isLoopbackPeer, tokenMatches } from "../transport/drain-endpoint";
 import { createConsoleAccountResetHandler } from "../console/auth/account-reset";
+import { resetConsoleAuthState } from "../console/auth/account-reset-store";
 import { createBackupExportHandler } from "../console/backup/export-endpoint";
-import { consoleUsers, tenants } from "../persistence/schema";
+import { tenants } from "../persistence/schema";
 import { PublicModelCatalogStore, type AllowedModelEntry } from "../console/providers/catalog/public-model-store";
 import type { IpAbuseProtectionService } from "../security/abuse";
 import type { ReadinessCheckResult } from "../persistence/readiness";
@@ -52,7 +60,6 @@ import type { ValidatedNetworkBindingFactory } from "../network/pool/resolver";
 import { metrics } from "../observability/metrics";
 import type { RuntimeMetricsSampler } from "../observability/runtime-metrics";
 import { API_CONTENT_SECURITY_POLICY, X_FRAME_OPTIONS } from "../security/outbound-headers";
-import type { ModelStrikeService } from "../security/model-abuse";
 
 
 import type { TelemetryBatchBuffer } from "../observability/telemetry-buffer";
@@ -72,7 +79,7 @@ import type { ShutdownDrainSource } from "../transport/contracts";
  * discriminant narrows `deps` to `ProductionAppDeps`. Listing them here would
  * let a caller pass a value the shell silently ignores.
  */
-export interface GatewayShellDeps {
+interface GatewayShellDeps {
   readonly mode: "route-only";
   readonly dashboardDist?: string;
   readonly checkDb?: () => Promise<void>;
@@ -103,7 +110,6 @@ export interface ProductionAppDeps {
   readonly db: CartethyiaDatabase;
   readonly proxyPreparer: ProxyRequestPreparer;
   readonly resolveProviderAdapter: (providerId: string) => Promise<ProviderAdapter | undefined>;
-  readonly providerAdapters?: ReadonlyMap<string, ProviderAdapter>;
   /** Live lookup of a provider's SSRF-validated upstream host. */
   readonly byokUpstreamHosts: { readonly get: (providerId: string) => ByokUpstreamHost | undefined };
   readonly networkBindingFactory: ValidatedNetworkBindingFactory;
@@ -116,7 +122,6 @@ export interface ProductionAppDeps {
   readonly resolveOAuthRefresher: (providerId: string) => Promise<OAuthTokenRefresher | undefined>;
   readonly oauthRefreshService: OAuthRefreshService;
   /** Graduated strikes for repeated invalid-model requests. */
-  readonly modelStrikes?: ModelStrikeService;
   /**
    * The console control plane. Optional so reduced compositions (route-only
    * shell, console stubs) stay valid; production always mounts it. Without
@@ -151,7 +156,7 @@ export interface ProductionAppDeps {
 }
 
 /** Either app mode. The discriminant decides which builder path runs. */
-export type GatewayAppDeps = GatewayShellDeps | ProductionAppDeps;
+type GatewayAppDeps = GatewayShellDeps | ProductionAppDeps;
 
 function checkDatabaseConnection(): Promise<void> {
   return getDbHandle()
@@ -196,7 +201,9 @@ export function createGatewayApp(deps: GatewayAppDeps) {
   const peerAddresses = new WeakMap<Request, string>();
   const serveDashboard = async ({ request }: { request: Request }): Promise<Response> => {
     const pathname = fastPathname(request.url);
-    const result = await staticHandler(pathname);
+    // The client's `accept-encoding` is what decides whether a precompressed
+    // `.gz` sibling can be served instead of the plain asset.
+    const result = await staticHandler(pathname, request.headers.get("accept-encoding"));
     return new Response(result.body ? (result.body as unknown as BodyInit) : null, {
       status: result.status,
       headers: result.headers,
@@ -254,9 +261,22 @@ export function createGatewayApp(deps: GatewayAppDeps) {
   const INFLIGHT_BACKSTOP_INTERVAL_MS = 30_000;
   const INFLIGHT_BACKSTOP_GRACE_MS = 30_000;
   const INFLIGHT_BACKSTOP_HARD_GRACE_MS = 120_000;
-  if (deps.mode === "production") deps.scheduledTasks?.register({
+  // Registered in every mode, not just production. The gauge is the operator's
+  // concurrency signal, and a cancelled request that never ran a finalizer
+  // leaves its flight behind — gating the only thing that reaps those on
+  // production made a permanently wrong count depend on how the gateway was
+  // started. The registry exists in every mode, so there is no mode where
+  // running this is wrong.
+  // `scheduledTasks` is declared on the production shape only, so it is
+  // narrowed rather than reached through the union — a shell composition
+  // without the registry simply skips the backstop, exactly as before.
+  const backstopTasks = "scheduledTasks" in deps ? deps.scheduledTasks : undefined;
+  backstopTasks?.register({
     name: "inflight-backstop",
     intervalMs: INFLIGHT_BACKSTOP_INTERVAL_MS,
+    // Same stagger rationale as account-health-sweep: keep the 30s cluster
+    // from aligning under the single-flight gate.
+    initialDelayMs: 15_000,
     run: () => {
       requestStateStore.sweepOverdueInFlight(
         Date.now(),
@@ -367,26 +387,40 @@ export function createGatewayApp(deps: GatewayAppDeps) {
       ...(deps.verifiedHttps ? { verifiedHttps: true } : {}),
       shutdownCoordinator: deps.shutdownCoordinator,
       telemetry: deps.telemetryBuffer,
-      ...(deps.modelStrikes ? { modelStrikes: deps.modelStrikes } : {}),
       ...(deps.consoleApi?.redis ? { redis: deps.consoleApi.redis } : {}),
+      // Bound at construction so the guard holds the sampler's live snapshot
+      // rather than a value captured at boot.
+      ...(deps.runtimeMetricsSampler
+        ? { memorySnapshot: () => deps.runtimeMetricsSampler?.memorySnapshot() }
+        : {}),
+      // Reads the cached route snapshot, which the settings route invalidates
+      // when the switch is saved — so flipping it takes effect on the next
+      // request and adds no query to the proxy path.
+      isInvokeDisabled: async (tenantId) =>
+        (await deps.snapshotService.getSnapshot())?.invokeDisabledTenants?.has(tenantId),
     });
     transportPipeline.mountRoot(app);
-    const proxyDeps: ProviderProxyHandlerDeps = {
+    // One dependency bundle for every gateway handler. Proxy, generation,
+    // responses-compact, system one, web search, and token count all receive
+    // the same wiring — a handler dep is added once, here, not in five
+    // literals.
+    const gatewayDeps: GatewayHandlerDeps = {
       db: deps.db,
-      providerAdapters: deps.providerAdapters ?? new Map(),
       resolveProviderAdapter: deps.resolveProviderAdapter,
       stateStore: requestStateStore,
       proxyPreparer: deps.proxyPreparer,
       snapshotService: deps.snapshotService,
       networkBindingFactory: deps.networkBindingFactory,
-      byokUpstreamHosts: deps.byokUpstreamHosts,
       poolSelector: deps.poolSelector,
       telemetryBuffer: deps.telemetryBuffer,
       resolveOAuthRefresher: deps.resolveOAuthRefresher,
       oauthRefreshService: deps.oauthRefreshService,
     };
     const proxyHandler = ({ request }: { request: Request }) =>
-      handleProviderProxyRequest(request, proxyDeps);
+      handleProviderProxyRequest(request, {
+        ...gatewayDeps,
+        byokUpstreamHosts: deps.byokUpstreamHosts,
+      });
 
     const publicModelStore = new PublicModelCatalogStore(deps.db);
     const queryAllowedModels = (auth: {
@@ -399,7 +433,7 @@ export function createGatewayApp(deps: GatewayAppDeps) {
     const handleModelsList = async ({ request }: { request: Request }): Promise<Response> => {
       const state = requestStateStore.require(request);
       const auth = state.authorization;
-      if (!auth) throw new GatewayError("invalid_request", 401, "This API key is unknown, revoked, or expired. Issue a new key and send it as: Authorization: Bearer <key>.");
+      if (!auth) throw modelsListApiKeyError();
       const data = await queryAllowedModels(auth);
       return new Response(JSON.stringify({ object: "list", data }), {
         headers: {
@@ -422,7 +456,7 @@ export function createGatewayApp(deps: GatewayAppDeps) {
     }): Promise<Response> => {
       const state = requestStateStore.require(request);
       const auth = state.authorization;
-      if (!auth) throw new GatewayError("invalid_request", 401, "This API key is unknown, revoked, or expired. Issue a new key and send it as: Authorization: Bearer <key>.");
+      if (!auth) throw modelsListApiKeyError();
       const raw = params?.["*"] ?? params?.id ?? "";
       const targetId = new URL(request.url).searchParams.get("id") ?? raw;
       const found = await publicModelStore.getPublicModelDetail(
@@ -448,16 +482,7 @@ export function createGatewayApp(deps: GatewayAppDeps) {
     };
 
     const handleResponsesCompact = createResponsesCompactHandler({
-      db: deps.db,
-      providerAdapters: deps.providerAdapters ?? new Map(),
-      resolveProviderAdapter: deps.resolveProviderAdapter,
-      proxyPreparer: deps.proxyPreparer,
-      stateStore: requestStateStore,
-      poolSelector: deps.poolSelector,
-      networkBindingFactory: deps.networkBindingFactory,
-      snapshotService: deps.snapshotService,
-      resolveOAuthRefresher: deps.resolveOAuthRefresher,
-      oauthRefreshService: deps.oauthRefreshService,
+      ...gatewayDeps,
       // The compact handler completes its attempt through `completeAttempt`,
       // which marks the request completed and finalizes telemetry itself —
       // so the afterResponse lifecycle skips it. Without the buffer here the
@@ -466,52 +491,25 @@ export function createGatewayApp(deps: GatewayAppDeps) {
     });
 
     const handleSystemone = createSystemoneHandler({
-      db: deps.db,
-      providerAdapters: deps.providerAdapters ?? new Map(),
-      resolveProviderAdapter: deps.resolveProviderAdapter,
-      proxyPreparer: deps.proxyPreparer,
-      stateStore: requestStateStore,
-      poolSelector: deps.poolSelector,
-      networkBindingFactory: deps.networkBindingFactory,
-      snapshotService: deps.snapshotService,
-      resolveOAuthRefresher: deps.resolveOAuthRefresher,
-      oauthRefreshService: deps.oauthRefreshService,
+      ...gatewayDeps,
       // Same reasoning as compact: the handler finalizes telemetry itself, so
       // the buffer must be threaded here or the route emits no row.
       telemetryBuffer: deps.telemetryBuffer,
     });
 
-    const handleWebsearch = createWebsearchHandler({
-      db: deps.db,
-      providerAdapters: deps.providerAdapters ?? new Map(),
-      resolveProviderAdapter: deps.resolveProviderAdapter,
-      proxyPreparer: deps.proxyPreparer,
-      stateStore: requestStateStore,
-      poolSelector: deps.poolSelector,
-      networkBindingFactory: deps.networkBindingFactory,
-      snapshotService: deps.snapshotService,
-      resolveOAuthRefresher: deps.resolveOAuthRefresher,
-      oauthRefreshService: deps.oauthRefreshService,
-      telemetryBuffer: deps.telemetryBuffer,
-    });
-
-    const generationDeps = {
-      db: deps.db,
-      providerAdapters: deps.providerAdapters ?? new Map(),
-      resolveProviderAdapter: deps.resolveProviderAdapter,
-      proxyPreparer: deps.proxyPreparer,
-      stateStore: requestStateStore,
-      poolSelector: deps.poolSelector,
-      networkBindingFactory: deps.networkBindingFactory,
-      snapshotService: deps.snapshotService,
-      resolveOAuthRefresher: deps.resolveOAuthRefresher,
-      oauthRefreshService: deps.oauthRefreshService,
-      telemetryBuffer: deps.telemetryBuffer,
-    };
+    const handleWebsearch = createWebsearchHandler(gatewayDeps);
+    const generationDeps = gatewayDeps;
     const handleImageGeneration = createImageGenerationHandler(generationDeps);
     // Mounted with no model behind it on purpose: the surface exists so it can
     // be finished when an upstream is known, rather than 404ing like a typo.
     const handleVideoGeneration = createVideoGenerationHandler(generationDeps);
+    // Passthrough surfaces: routed and accounted for, but never interpreted.
+    // No bundled adapter implements embeddings or audio, and inventing a wire
+    // for them would be a guess; what these need to be useful is the route, the
+    // pipeline, and a compatible upstream behind it.
+    const handleEmbedding = createEmbeddingHandler(generationDeps);
+    const handleAudioTranscription = createAudioTranscriptionHandler(generationDeps);
+    const handleAudioSpeech = createAudioSpeechHandler(generationDeps);
     // Shares the generation dependency bundle: same pipeline, and a count is
     // neither chat-shaped nor generation-shaped, so it needs exactly the same
     // routing, leasing, and accounting surface.
@@ -533,6 +531,9 @@ export function createGatewayApp(deps: GatewayAppDeps) {
         routes.post("/search", handleWebsearch);
         routes.post("/images/generations", handleImageGeneration);
         routes.post("/videos/generations", handleVideoGeneration);
+        routes.post("/embeddings", handleEmbedding);
+        routes.post("/audio/transcriptions", handleAudioTranscription);
+        routes.post("/audio/speech", handleAudioSpeech);
         routes.get("/models", handleModelsList);
         routes.get("/models/info", handleModelsDetail);
         routes.get("/models/*", handleModelsDetail);
@@ -580,10 +581,7 @@ export function createGatewayApp(deps: GatewayAppDeps) {
         createConsoleAccountResetHandler({
           token: deps.drainToken,
           resolvePeerAddress: (request) => peerAddresses.get(request) ?? null,
-          resetConsoleAccount: async () => {
-            const users = await deps.db.delete(consoleUsers);
-            return users.rowCount ?? 0;
-          },
+          resetConsoleAccount: () => resetConsoleAuthState(deps.db),
         }),
       );
     }
@@ -597,10 +595,14 @@ export function createGatewayApp(deps: GatewayAppDeps) {
       const tasks = deps.scheduledTasks;
       const token = deps.drainToken;
       app.post("/admin/tasks/:name/run", async ({ request, params }) => {
+        // `policy_rejected`, not `invalid_request`: the request may be perfectly
+        // well-formed. What refused it is where it came from — the client asked
+        // for something only the local host may ask. `invalid_request` told an
+        // operator to fix the body, when the body was never the problem.
         if (!isLoopbackPeer(peerAddresses.get(request) ?? null))
-          throw new GatewayError("invalid_request", 403, "task trigger is only available from loopback");
+          throw new GatewayError("policy_rejected", 403, "task trigger is only available from loopback");
         if (!tokenMatches(request.headers.get("x-drain-token"), token))
-          throw new GatewayError("invalid_request", 401, "invalid drain token");
+          throw new GatewayError("authentication_failed", 401, "invalid drain token");
         const name = params.name;
         if (!tasks.names().includes(name))
           throw new GatewayError("invalid_request", 404, `no such task: ${name}`);
@@ -614,6 +616,11 @@ export function createGatewayApp(deps: GatewayAppDeps) {
       });
     }
 
+    // One share-link store for both surfaces: the public share router and the
+    // console's API-key/share domain wrap the same table, and one instance
+    // keeps the "one owner per store" convention.
+    const shareStore = new DrizzleShareLinkStore(deps.db);
+
     // `peerAddresses` is populated by the root `beforeHandle` above from
     // `server.requestIP`. The console login route needs it to key its lockout
     // bucket, and the trusted-proxy boundary decides whether an
@@ -623,6 +630,7 @@ export function createGatewayApp(deps: GatewayAppDeps) {
       app.use(
         createConsoleRouter({
           ...deps.consoleApi,
+          ...(shareStore ? { shareStore } : {}),
           stateStore: requestStateStore,
           resolvePeerAddress: (request) => peerAddresses.get(request) ?? null,
           trustedProxyBoundary: deps.trustedProxyBoundary,
@@ -635,8 +643,8 @@ export function createGatewayApp(deps: GatewayAppDeps) {
     app.use(
       createShareRouter({
         db: deps.db,
-        shareStore: new DrizzleShareLinkStore(deps.db),
-        stats: createShareStatsPort({ redis: deps.consoleApi?.redis }),
+        shareStore,
+        stats: createShareStatsPort({ db: deps.db, redis: deps.consoleApi?.redis }),
         resolveClientIp: (request) => {
           const peer = peerAddresses.get(request);
           return peer

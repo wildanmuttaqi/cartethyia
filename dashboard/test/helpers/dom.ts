@@ -27,10 +27,15 @@ let registered = false;
  * import time would otherwise see `undefined`.
  */
 export function registerDom(): void {
-  if (registered || typeof globalThis.document !== "undefined") {
-    registered = true;
-    return;
-  }
+  // Both globals must be present, not just `document`. This module installs
+  // them as a pair, but a suite that stubs `window` for its own helpers and
+  // then deletes it (`update-dismissal.test.ts`) leaves `document` behind with
+  // no `window`. Testing `document` alone made the next file in the same
+  // worker early-return here, so it rendered against a DOM whose `window` —
+  // and therefore `window.localStorage` — was gone.
+  const installed =
+    typeof globalThis.document !== "undefined" && typeof globalThis.window !== "undefined";
+  if (registered && installed) return;
   const window = new Window({ url: "http://localhost/" });
   // React 19 refuses to run `act()` unless the environment declares itself a
   // test environment. Without this the mount helper still renders, but React
@@ -48,6 +53,9 @@ export function registerDom(): void {
     HTMLButtonElement: window.HTMLButtonElement,
     HTMLAnchorElement: window.HTMLAnchorElement,
     HTMLTextAreaElement: window.HTMLTextAreaElement,
+    // Radix Select walks up to the owning form through `HTMLFormElement` on
+    // mount; without it every rendered Select throws in this DOM.
+    HTMLFormElement: window.HTMLFormElement,
     Element: window.Element,
     Node: window.Node,
     Event: window.Event,

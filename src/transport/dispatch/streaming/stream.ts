@@ -43,8 +43,17 @@ import type { AdmissionLease } from "../../../security/admission/contracts";
 import type { NetworkPoolSelector } from "../../../network/pool/selector";
 import type { TelemetryBatchBuffer } from "../../../observability/telemetry-buffer";
 import type { ProviderExchangeCapture } from "../attempt-finalize";
-import { captureProviderExchange, shouldCaptureProviderBody } from "../attempt-finalize";
+import { captureProviderExchange } from "../attempt-finalize";
+import {
+  providerCaptureMaxBytes,
+  resolveCaptureDepthForRequest,
+  resolveCaptureModeForRequest,
+  shouldCaptureProviderBodyForRequest,
+} from "../capture-policy";
+import { resolveTenantImageClampMaxBytes } from "../../request/tenant-preferences";
 import { proxySuccessHeaders, buildUpstreamDispatchContext } from "../upstream";
+import type { AttemptLeaseOwnership } from "../leases";
+import type { ProviderContinuationScope } from "../../../providers/provider-contracts";
 import { resolveStreamFirstChunkTimeoutMs, resolveStreamStallTimeoutMs, resolveUpstreamTimeoutMs } from "../../../config/timeouts";
 import type { ProxyRequestState } from "../../request/state";
 import type { PreparedProxyRequest } from "../../request/preparer";
@@ -81,6 +90,10 @@ export interface StreamingDispatchInput {
   readonly proxySlot: { poolId: string; release: () => void } | undefined;
   readonly networkPoolId: string | undefined;
   readonly providerCapture: ProviderExchangeCapture;
+  /** Ownership of this attempt's account/network-pool release, when one was acquired. */
+  readonly leaseOwnership?: AttemptLeaseOwnership | undefined;
+  /** Caller identity authorizing a provider session held across requests. */
+  readonly continuationScope?: ProviderContinuationScope | undefined;
   /** Hands lease ownership to the returned `Response`'s async lifetime. */
   retainLeases: () => void;
   /** First-token latency in the spread shape `completeAttempt` accepts. */
@@ -151,19 +164,48 @@ export async function dispatchStreamingAttempt(input: StreamingDispatchInput): P
     providerCapture,
     retainLeases,
     ttfbFields,
+    leaseOwnership,
+    continuationScope,
   } = input;
 
   const outboundFetch = deps.networkBindingFactory?.fetch(
     networkPoolId,
     prepared.authorization.snapshot.tenant_id,
   );
+  const captureBody = outboundFetch
+    ? await shouldCaptureProviderBodyForRequest(deps.db, prepared.authorization.snapshot.tenant_id, state)
+    : false;
+  const captureDepth = await resolveCaptureDepthForRequest(
+    deps.db,
+    prepared.authorization.snapshot.tenant_id,
+    state,
+  );
+  // Resolved once, before the pipeline exists: the pipeline's diagnostics are
+  // gated on it from construction, so `none`/`metadata` tenants never pay the
+  // transcript serialization or the client-response copy for any event.
+  const captureMode = await resolveCaptureModeForRequest(
+    deps.db,
+    prepared.authorization.snapshot.tenant_id,
+    state,
+  );
   const wrappedOutboundFetch = outboundFetch
     ? captureProviderExchange(
         outboundFetch,
         providerCapture,
-        await shouldCaptureProviderBody(deps.db, prepared.authorization.snapshot.tenant_id),
+        captureBody,
+        providerCaptureMaxBytes(captureDepth),
       )
     : undefined;
+  // Same memoized ceiling the non-streaming path resolves, read before the
+  // dispatch context is built so a stream gets the same limit as a normal
+  // request rather than silently falling back to the deployment default.
+  if (state.imageClampMaxBytes === undefined) {
+    const clampMaxBytes = await resolveTenantImageClampMaxBytes(
+      deps.db,
+      prepared.authorization.snapshot.tenant_id,
+    );
+    if (clampMaxBytes !== undefined) state.imageClampMaxBytes = clampMaxBytes;
+  }
   const dispatchContext = buildUpstreamDispatchContext({
     credential,
     deadline: state.deadlineMs,
@@ -171,24 +213,29 @@ export async function dispatchStreamingAttempt(input: StreamingDispatchInput): P
     headers: inboundHeaders,
     requestId: state.requestId,
     requestIdentity: state,
+    ...(state.imageClampMaxBytes === undefined
+      ? {}
+      : { imageClampMaxBytes: state.imageClampMaxBytes }),
     ...(conversationAffinity ? { conversationAffinity } : {}),
     ...(candidate.user_agent === undefined ? {} : { userAgent: candidate.user_agent }),
     ...(wrappedOutboundFetch ? { outboundFetch: wrappedOutboundFetch } : {}),
+    ...(outboundFetch ? { outboundAttachmentFetch: outboundFetch } : {}),
     ...(deps.networkBindingFactory
       ? {
-          outboundWebSocket: deps.networkBindingFactory.webSocket(
+          outboundHttp2: deps.networkBindingFactory.http2Bidi(
             networkPoolId,
             prepared.authorization.snapshot.tenant_id,
           ),
         }
       : {}),
+    ...(leaseOwnership === undefined ? {} : { leaseOwnership }),
+    ...(continuationScope === undefined ? {} : { continuationScope }),
   });
   // `ProviderAdapter.dispatch` is declared to return a non-nullable
   // `AsyncIterable`, so an adapter that returned `undefined` would be a
-  // type violation rather than a state this code could handle. The guard
-  // that used to sit here (`if (!iterable) throw ...`) was therefore
-  // unreachable, and it advertised a contract the interface does not
-  // have. Enforcing it belongs at the adapter boundary, not here.
+  // type violation rather than a state this code could handle — no null check
+  // is needed here, and adding one would advertise a contract the interface
+  // does not have. Enforcing it belongs at the adapter boundary.
   const createUpstreamIterable = () =>
     adapter.dispatch(
       dispatchRequest,
@@ -230,6 +277,7 @@ export async function dispatchStreamingAttempt(input: StreamingDispatchInput): P
         ? { response_id: `msg-${crypto.randomUUID()}`, model: candidate.model_id }
         : streamOptions,
     recoverableResponsesPrelude,
+    { captureMode },
   );
   const finalizer = new StreamFinalizer(
     {
@@ -248,6 +296,7 @@ export async function dispatchStreamingAttempt(input: StreamingDispatchInput): P
       providerCapture,
       getIterator: () => iterator,
       ttfbFields,
+      ...(leaseOwnership === undefined ? {} : { leaseOwnership }),
     },
     pipeline,
     {
@@ -327,8 +376,8 @@ export async function dispatchStreamingAttempt(input: StreamingDispatchInput): P
           // reasoning item when the client is Chat Completions). Keep
           // pulling until at least one wire chunk is enqueued; returning
           // from pull with an empty queue can leave Web Streams waiting
-          // forever, which is why real clients previously saw one
-          // assistant header and then a 60s socket reset.
+          // forever — a client then sees one assistant header and then a
+          // 60s socket reset.
           for (;;) {
             // Re-arm on every upstream read: the watchdog fires only
             // when the provider stays silent longer than the bound.
@@ -353,6 +402,13 @@ export async function dispatchStreamingAttempt(input: StreamingDispatchInput): P
             }
             sawUpstreamActivity = true;
             if (pipeline.enqueueEvent(result.value, controller)) return;
+            // The guard terminated the stream early: stop consuming. Pulling
+            // on would keep the runaway upstream alive and bill tokens the
+            // client was already told are not coming.
+            if (pipeline.loopDetected) {
+              await finalizer.finalizeStream(controller);
+              return;
+            }
           }
         } catch (err) {
           finalizer.clearStallWatchdog();

@@ -6,8 +6,14 @@
  * origin, and a CORS or rate-limit failure would surface as a console error
  * nobody can act on. The request is made here, server-side, and any failure
  * degrades to "no update known" rather than an error the operator must read.
+ *
+ * Releases are read from the primary repository `risunCodex/Cartethyia`. The
+ * historical original `risunCode/Cartethyia` is hidden from public view, so
+ * its releases endpoint answers 404; the primary is where releases are
+ * published and where this check must point so the update indicator does not
+ * silently read "no update known" forever.
  */
-const REPOSITORY = "risunCode/Cartethyia";
+const REPOSITORY = "risunCodex/Cartethyia";
 
 /** Timeout for one GitHub read. A hung read must not hold a console query open. */
 const REQUEST_TIMEOUT_MS = 10_000;

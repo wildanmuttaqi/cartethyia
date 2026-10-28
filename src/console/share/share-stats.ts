@@ -12,7 +12,9 @@
 
 import { createHash } from "node:crypto";
 import { maskClientIp } from "../../observability/redaction";
-import { queryTelemetryEvents, type TelemetryEventRecord } from "../../observability/event-log";
+import { type TelemetryEventRecord } from "../../observability/event-log";
+import { queryTelemetryEvents as querySqlEvents } from "../../observability/event-query";
+import type { CartethyiaDatabase } from "../../persistence/db-handle";
 import { isGatewayError } from "../../observability/telemetry-status";
 import type { RedisClient } from "../../persistence/redis";
 import { cachedRead } from "../shared/read-through-cache";
@@ -227,12 +229,19 @@ const TOP_IPS_LIMIT = 50;
 const HOURS_WINDOW = 24;
 
 /**
- * Cache lifetime for one family's rollup. Equal to the share page's 2 s SSE
- * tick: a viewer cannot observe staleness longer than the refresh it already
- * accepts, while every viewer of one link shares a single computation. Declared
- * here rather than imported from the router so this port does not depend on it.
+ * Cache lifetime for one family's rollup.
+ *
+ * Matched to the share page's SSE tick, which was the point of the old 2 s
+ * value — but at 2 s the cache expired on every tick, so every single push was
+ * a full parse of the retained telemetry window. A share page's numbers move
+ * when a request does, not every 2 s; 10 s still reads as live, and cuts the
+ * parse rate by five.
+ *
+ * Declared here rather than imported from the router so this port does not
+ * depend on it. `SHARE_STATS_STREAM_INTERVAL_MS` must be raised with it, or
+ * the two drift apart and the cache expires between ticks for no reason.
  */
-export const SHARE_STATS_CACHE_TTL_SECONDS = 2;
+export const SHARE_STATS_CACHE_TTL_SECONDS = 10;
 
 /**
  * Cache key for one family's rollup. Both inputs change the payload — `keyIds`
@@ -252,18 +261,22 @@ function shareFamilyStatsKey(
   return `share:v1:stats:${tenantId}:${hash}`;
 }
 
+/** Cap on the bounded SQL read a family rollup performs. */
+const MAX_FAMILY_EVENTS = 5_000;
+
 interface ShareStatsPortDeps {
+  readonly db: CartethyiaDatabase;
   readonly redis?: RedisClient | undefined;
 }
 
-export function createShareStatsPort(deps: ShareStatsPortDeps = {}): ShareStatsPort {
+export function createShareStatsPort(deps: ShareStatsPortDeps): ShareStatsPort {
   return {
     async getFamilyStats(tenantId, keyIds, recipients, allowedModels) {
       if (keyIds.length === 0) return emptyStats(recipients);
       const cached = await cachedRead<Omit<ShareFamilyStats, "recipients">>(
         deps.redis,
         shareFamilyStatsKey(tenantId, keyIds, allowedModels),
-        () => computeFamilyStatsBody(tenantId, keyIds, allowedModels),
+        () => computeFamilyStatsBody(deps.db, tenantId, keyIds, allowedModels),
         SHARE_STATS_CACHE_TTL_SECONDS,
       );
       return { ...cached, recipients };
@@ -273,6 +286,7 @@ export function createShareStatsPort(deps: ShareStatsPortDeps = {}): ShareStatsP
 
 /** The telemetry-derived remainder of a family rollup; `recipients` is Postgres-derived. */
 async function computeFamilyStatsBody(
+  db: CartethyiaDatabase,
   tenantId: string,
   keyIds: readonly string[],
   allowedModels: readonly string[] | undefined,
@@ -295,7 +309,18 @@ async function computeFamilyStatsBody(
   // would list exactly the invalid names an abuser probed. Filtering before
   // the top-50 cut means refused names cannot hide a model the recipient may
   // use.
-  const events = await queryTelemetryEvents({ tenantId, apiKeyIds: [...keyIds] });
+  //
+  // Bounded by the retention floor, not by the oldest counter: `totalTokens`
+  // is all-time, so cutting at `monthStart` would silently drop the rows that
+  // make it differ from `monthTokens`. Retention already caps the window, and
+  // the rows are read newest-first under a page cap, so a very large family
+  // cannot pull the whole table.
+  const page = await querySqlEvents(db, {
+    tenantId,
+    apiKeyIds: [...keyIds],
+    limit: MAX_FAMILY_EVENTS,
+  });
+  const events = page.events;
   const rollup = rollupFamily(events, {
     dayStart: dayStart.getTime(),
     monthStart: monthStart.getTime(),

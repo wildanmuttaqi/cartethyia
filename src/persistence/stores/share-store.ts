@@ -1,17 +1,40 @@
-import { createHash, randomInt } from "node:crypto";
+import { createHash, randomBytes, randomInt } from "node:crypto";
 
 // Share-link persistence and atomic child-key issuance. The hash is the lookup
 // key; the bearer token is retained encrypted so the console can re-display a
 // stable link, and is never selected by a public lookup.
 
-import { and, desc, eq, isNull, sql } from "drizzle-orm";
+import { and, desc, eq, isNull, or, sql, type SQL } from "drizzle-orm";
 import type { CartethyiaDatabase } from "../db-handle";
 import { lockRows } from "../dialect";
 import { apiKeys, shareLinks, sharePopups, type ShareLinkKind, type ApiKeyModelAccessMode } from "../schema";
 
 /** Hashes a share bearer token for storage and lookup. */
+/**
+ * A fresh public slug for a share page.
+ *
+ * Held in the clear and looked up by index, so it must be unguessable on its
+ * own: the same 256 bits of entropy as the bearer token, base64url-encoded.
+ */
+export function generateShareSlug(): string {
+  return randomBytes(32).toString("base64url");
+}
+
 export function hashShareToken(token: string): string {
   return createHash("sha256").update(token, "utf8").digest("hex");
+}
+
+/**
+ * The predicate matching one link's two public address forms.
+ *
+ * `slug` is held in the clear — that is what lets a restore onto a fresh
+ * deployment keep every address — while the bearer token is only ever stored
+ * as `hashShareToken(token)`. So the two columns cannot be compared against
+ * one value: a lookup built from a hash alone silently never matches the slug
+ * column, which is how a freshly generated link answered "not found".
+ */
+function addressMatches(address: string): SQL {
+  return or(eq(shareLinks.slug, address), eq(shareLinks.tokenHash, hashShareToken(address)))!;
 }
 
 /** Newly created share-link metadata. */
@@ -44,6 +67,8 @@ export interface ShareLinkToken {
   readonly kind: ShareLinkKind;
   readonly expiresAt: Date | null;
   readonly tokenEncrypted: Buffer | null;
+  /** Public address fragment, held in the clear; null on pre-migration rows. */
+  readonly slug: string | null;
 }
 
 /**
@@ -205,28 +230,41 @@ export interface ShareLinkStore {
     apiKeyId: string;
     tokenHash: string;
     tokenEncrypted: Buffer;
+    /** Public address fragment; kept across rotates so the URL is stable. */
+    slug: string;
     kind: ShareLinkKind;
     expiresAt: Date | null;
     rotate: boolean;
   }): Promise<ShareLinkRecord>;
   /**
-   * Resolves a bearer token to the link it names, in one lookup.
+   * Resolves a link's public address to the link it names, in one lookup.
+   *
+   * The argument is the raw path segment — a slug or a bearer token — not a
+   * hash: the store owns hashing, so a caller cannot hand it a slug-shaped
+   * value that only matches the hashed column.
    *
    * Serving enrollment and handoff through separate methods let the browser
    * page and the router disagree about which one a given URL is: a personal
    * key's handoff link resolved on one endpoint and 404'd on the other. One
    * resolver cannot drift from itself.
    */
-  resolveShareLink(tokenHash: string): Promise<ShareLinkResolution | null>;
+  resolveShareLink(address: string): Promise<ShareLinkResolution | null>;
   /** Same lookup as `resolveShareLink`, but names why a link stopped resolving. */
-  resolveShareLinkOutcome(tokenHash: string): Promise<ShareLinkOutcome>;
+  resolveShareLinkOutcome(address: string): Promise<ShareLinkOutcome>;
   /** The key's active link with its retained token, for console re-display. */
   findTokenForApiKey(apiKeyId: string): Promise<ShareLinkToken | null>;
+  /**
+   * Mints one child key under the link named by `address`.
+   *
+   * `address` is the raw path segment, so a slug-addressed link issues
+   * exactly like a token-addressed one.
+   */
   issueSharedApiKey(
-    tokenHash: string,
+    address: string,
     material: SharedApiKeyMaterial,
   ): Promise<SharedApiKeyIssueResult>;
-  touchView(tokenHash: string): Promise<void>;
+  /** Records a view of the link named by `address` (slug or bearer token). */
+  touchView(address: string): Promise<void>;
   /** All enrollment links for one API key, newest first (never tokens). */
   listForApiKey(apiKeyId: string): Promise<readonly ShareLinkSummary[]>;
   /** Deactivates one enrollment link scoped to its owning parent API key. */
@@ -240,6 +278,7 @@ export class DrizzleShareLinkStore implements ShareLinkStore {
     apiKeyId: string;
     tokenHash: string;
     tokenEncrypted: Buffer;
+    slug: string;
     kind: ShareLinkKind;
     expiresAt: Date | null;
     rotate: boolean;
@@ -269,6 +308,10 @@ export class DrizzleShareLinkStore implements ShareLinkStore {
           .set({
             tokenHash: input.tokenHash,
             tokenEncrypted: input.tokenEncrypted,
+            // Rotating the slug changes the public URL, so the old link stops resolving.
+            // Callers always generate a fresh slug via generateShareSlug() before calling
+            // create() with rotate: true.
+            slug: input.slug,
             expiresAt: input.expiresAt,
             lastViewedAt: null,
           })
@@ -290,6 +333,7 @@ export class DrizzleShareLinkStore implements ShareLinkStore {
           apiKeyId: input.apiKeyId,
           tokenHash: input.tokenHash,
           tokenEncrypted: input.tokenEncrypted,
+          slug: input.slug,
           kind: input.kind,
           expiresAt: input.expiresAt,
         })
@@ -306,8 +350,8 @@ export class DrizzleShareLinkStore implements ShareLinkStore {
     });
   }
 
-  async resolveShareLink(tokenHash: string): Promise<ShareLinkResolution | null> {
-    const outcome = await this.resolveShareLinkOutcome(tokenHash);
+  async resolveShareLink(address: string): Promise<ShareLinkResolution | null> {
+    const outcome = await this.resolveShareLinkOutcome(address);
     return outcome.ok ? outcome.resolution : null;
   }
 
@@ -319,13 +363,24 @@ export class DrizzleShareLinkStore implements ShareLinkStore {
    * expired link from a revoked key from a paused one, since a row failing any
    * of them is simply absent from the filtered result.
    */
-  async resolveShareLinkOutcome(tokenHash: string): Promise<ShareLinkOutcome> {
+  async resolveShareLinkOutcome(address: string): Promise<ShareLinkOutcome> {
+    // Two address forms name one link: the public slug, and the bearer token
+    // a pre-slug page was issued with. They are matched in their own form —
+    // the slug is stored in the clear (that is how a restored deployment keeps
+    // its addresses), while the token is only ever stored as a hash. Comparing
+    // the slug against a hash can never match, which made every slug-addressed
+    // link answer "not found" for a page that had just been generated.
     const rows = await this.db
       .select({ key: apiKeys, link: shareLinks, popup: sharePopups })
       .from(shareLinks)
       .innerJoin(apiKeys, eq(shareLinks.apiKeyId, apiKeys.id))
       .leftJoin(sharePopups, eq(sharePopups.apiKeyId, apiKeys.id))
-      .where(and(eq(shareLinks.tokenHash, tokenHash), isNull(apiKeys.parentKeyId)))
+      .where(
+        and(
+          addressMatches(address),
+          isNull(apiKeys.parentKeyId),
+        ),
+      )
       .limit(1);
     const row = rows[0];
     if (row === undefined) return { ok: false, refusal: "not_found" };
@@ -361,6 +416,7 @@ export class DrizzleShareLinkStore implements ShareLinkStore {
         kind: shareLinks.kind,
         expiresAt: shareLinks.expiresAt,
         tokenEncrypted: shareLinks.tokenEncrypted,
+        slug: shareLinks.slug,
       })
       .from(shareLinks)
       .where(
@@ -376,7 +432,7 @@ export class DrizzleShareLinkStore implements ShareLinkStore {
   }
 
   async issueSharedApiKey(
-    tokenHash: string,
+    address: string,
     material: SharedApiKeyMaterial,
   ): Promise<SharedApiKeyIssueResult> {
     return this.db.transaction(async (tx) => {
@@ -388,7 +444,7 @@ export class DrizzleShareLinkStore implements ShareLinkStore {
         .from(shareLinks)
         .where(
           and(
-            eq(shareLinks.tokenHash, tokenHash),
+            addressMatches(address),
             eq(shareLinks.kind, "enroll"),
             eq(shareLinks.active, true),
             sql`(${shareLinks.expiresAt} IS NULL OR ${shareLinks.expiresAt} > now())`,
@@ -420,7 +476,7 @@ export class DrizzleShareLinkStore implements ShareLinkStore {
           .where(
             and(
               eq(shareLinks.id, linkRef.id),
-              eq(shareLinks.tokenHash, tokenHash),
+              addressMatches(address),
               eq(shareLinks.active, true),
               sql`(${shareLinks.expiresAt} IS NULL OR ${shareLinks.expiresAt} > now())`,
             ),
@@ -478,7 +534,7 @@ export class DrizzleShareLinkStore implements ShareLinkStore {
     });
   }
 
-  async touchView(tokenHash: string): Promise<void> {
+  async touchView(address: string): Promise<void> {
     // Expired-but-active links must not bump lastViewedAt: the bump makes
     // expiry auditing lie about a link that no longer serves.
     await this.db
@@ -486,7 +542,7 @@ export class DrizzleShareLinkStore implements ShareLinkStore {
       .set({ lastViewedAt: new Date() })
       .where(
         and(
-          eq(shareLinks.tokenHash, tokenHash),
+          addressMatches(address),
           eq(shareLinks.active, true),
           sql`${shareLinks.expiresAt} IS NULL OR ${shareLinks.expiresAt} > NOW()`,
         ),

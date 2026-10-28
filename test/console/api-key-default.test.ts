@@ -44,6 +44,20 @@ function owner(tenantId: string) {
 }
 
 dbDescribe("default gateway API key", () => {
+  test("the shared fixture persists modelPrefix", async () => {
+    await withRollback(async (client) => {
+      const tenant = await createTenant(client, RUN_ID);
+      const key = await createApiKey(client, {
+        tenantId: tenant.tenantId,
+        modelPrefix: "anthropic/",
+      });
+      const db = drizzle(client as never, { schema: fullSchema });
+      const store = new DrizzleApiKeyStore(db as never);
+      expect((await store.list(tenant.tenantId)).find((item) => item.id === key.id)?.modelPrefix)
+        .toBe("anthropic/");
+    });
+  });
+
   test("is flagged in the list response", async () => {
     await withRollback(async (client) => {
       const tenant = await createTenant(client, RUN_ID);
@@ -69,7 +83,7 @@ dbDescribe("default gateway API key", () => {
     });
   });
 
-  test("recognizes and promotes an unflagged legacy default key", async () => {
+  test("a key with isDefault:false is not treated as default regardless of label", async () => {
     await withRollback(async (client) => {
       const tenant = await createTenant(client, RUN_ID);
       const key = await createApiKey(client, {
@@ -84,20 +98,11 @@ dbDescribe("default gateway API key", () => {
         admissionService: { purgeKey: async () => undefined },
       });
 
+      // isDefault is determined solely by the persisted flag — label no longer used.
       expect((await operations.listKeys(owner(tenant.tenantId))).find((item) => item.id === key.id)?.isDefault)
-        .toBe(true);
-      await expect(operations.revokeKey(owner(tenant.tenantId), key.id)).rejects.toThrow(
-        /cannot be deleted/i,
-      );
-      const updated = await operations.updateKey(owner(tenant.tenantId), key.id, {
-        label: "Production gateway",
-      });
-      expect(updated.isDefault).toBe(true);
-      const stored = await client.query<{ label: string; is_default: boolean }>(
-        `select label, is_default from api_keys where id = $1`,
-        [key.id],
-      );
-      expect(stored.rows[0]).toEqual({ label: "Production gateway", is_default: true });
+        .toBe(false);
+      // Revoke succeeds because it is not flagged as default.
+      await operations.revokeKey(owner(tenant.tenantId), key.id);
     });
   });
 
@@ -242,10 +247,10 @@ dbDescribe("default gateway API key", () => {
       });
       expect(created.isDefault).toBe(false);
       expect(created.keyPrefix).toBe(DEFAULT_API_KEY_PREFIX);
-      expect(created.secret).toMatch(/^carte_[A-Za-z0-9_-]{12}$/);
+      expect(created.secret).toMatch(/^pn-carte-[A-Za-z0-9_-]{16}$/);
 
       const rotated = await operations.regenerateKey(owner(tenant.tenantId), created.id);
-      expect(rotated.secret).toMatch(/^carte_[A-Za-z0-9_-]{12}$/);
+      expect(rotated.secret).toMatch(/^pn-carte-[A-Za-z0-9_-]{16}$/);
       expect((await operations.listKeys(owner(tenant.tenantId))).find((key) => key.id === created.id)?.keyPrefix)
         .toBe(DEFAULT_API_KEY_PREFIX);
 
@@ -253,7 +258,7 @@ dbDescribe("default gateway API key", () => {
     });
   });
 
-  test("share templates default to sh-carte_ and migrate the old rk_ prefix", async () => {
+  test("share templates default to sh-carte-; rk_ prefix is kept as-is (no migration)", async () => {
     await withRollback(async (client) => {
       const tenant = await createTenant(client, RUN_ID);
       const db = drizzle(client as never, { schema: fullSchema });
@@ -267,7 +272,7 @@ dbDescribe("default gateway API key", () => {
         keyMode: "share",
         scopes: [...TENANT_KEY_SCOPES],
       });
-      expect(template.keyPrefix).toBe("sh-carte_");
+      expect(template.keyPrefix).toBe("sh-carte-");
       expect(template.secret).toBeUndefined();
 
       const legacy = await operations.createKey(owner(tenant.tenantId), {
@@ -275,7 +280,7 @@ dbDescribe("default gateway API key", () => {
         keyPrefix: "rk_",
         scopes: [...TENANT_KEY_SCOPES],
       });
-      expect(legacy.keyPrefix).toBe("sh-carte_");
+      expect(legacy.keyPrefix).toBe("rk_");
     });
   });
 });

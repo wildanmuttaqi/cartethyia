@@ -12,6 +12,8 @@ export type GatewayErrorCode =
   | "accounts_unavailable"
   | "accounts_rate_limited"
   | "capacity_exhausted"
+  | "provider_capacity_exhausted"
+  | "upstream_queued"
   | "proxy_pool_capacity_exceeded"
   | "proxy_pool_provider_capacity_exceeded"
   | "proxy_pool_blocked"
@@ -50,7 +52,6 @@ export type GatewayErrorCode =
   | "proxy_unreachable"
   | "tool_call_loop_detected"
   | "client_router_denied"
-  | "model_abuse_banned"
   | "shutting_down"
   | "restart_for_update";
 
@@ -110,11 +111,11 @@ function stripLegacyOriginLabel(message: string): string {
  * stamped into it.
  *
  * The code is not lost — it travels in the envelope's `error.code` field, and
- * the HTTP status carries the class. It used to be prefixed into the text
+ * the HTTP status carries the class. Stamping it into the text
  * (`accounts_unavailable: Model 'x' has no available account (52 candidate(s)
- * unusable: credit_floor_reached, model_cooldown)`), which put internal enum
- * names in front of the operator's sentence and made the message unreadable
- * while adding nothing the field did not already carry.
+ * unusable: credit_floor_reached, model_cooldown)`) would put internal enum
+ * names in front of the operator's sentence and make the message unreadable
+ * while adding nothing the field does not already carry.
  *
  * Stripping is idempotent, and that is the point: a message that already
  * carries a `code:` prefix — stamped by an older builder, or by a code path

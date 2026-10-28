@@ -17,12 +17,14 @@ import {
   requireTenantAnyScope,
 } from "../../shared/errors";
 import type { AccessDecision } from "../../../security/access-control";
+import type { ProviderUsageDayRow } from "../../../observability/event-query";
 import { isBundledProviderId } from "../../../providers/provider-contracts";
 import type { ProviderRegistry } from "../../../providers/provider-registry";
 import { getProviderClientVersion, getRouteIdentityVersions } from "../../../providers/operations/client-versions";
 import type { OAuthLoginField } from "../../../providers/authentication/oauth-flow-store";
 import { providerCredentialHint, providerCredentialUrl, providerDisplayName, providerHasAdapterUserAgent, providerOperatorNotice, providerServiceKinds, type CompatibilityProfile } from "../../../providers/provider-metadata";
 import type { AccountHealthEventRecord } from "../../../providers/operations/account-health-service";
+import { healthEventBuffer } from "../../../persistence/health-event-flush";
 import { CREDENTIAL_MODES, PROVIDER_READ_SCOPES, PROVIDER_WRITE_SCOPES, type BuddyGrowthTaskLedgerEntry } from "./contracts";
 import { enqueueCheckin } from "../../../workers/daily-checkin";
 import {
@@ -146,6 +148,16 @@ export interface ProviderCatalogConfig {
     }[];
   }>;
   /**
+   * Day × model usage aggregate feeding the provider's Activity Matrix card.
+   * Optional so hosts without telemetry reads (and existing test doubles) keep
+   * the route returning an empty matrix instead of failing.
+   */
+  readonly providerUsageMatrix?: (
+    tenantId: string,
+    providerId: string,
+    days: number,
+  ) => Promise<readonly ProviderUsageDayRow[]>;
+  /**
    * Resolves the stored credential and optional OAuth refresh token for export,
    * decrypting them without applying provider-specific dispatch codecs.
    */
@@ -191,6 +203,14 @@ async function attachProviderCapabilities(
       // one, so the dashboard never renders a form whose submit the server
       // would refuse.
       import: typeof client.importCredential === "function",
+      // Both halves are required: an import-only client that cannot refresh
+      // (Alibaba Coding Plan, Cloudflare AI) stores a durable static key, while
+      // one that can (Trae) stores a token pair that expires and renews. The
+      // refresher comes from the registry rather than the login client because
+      // that is where `loadAuthentication` registers it.
+      refreshable:
+        typeof client.importCredential === "function" &&
+        (await registry.resolveRefresher(response.providerId)) !== undefined,
       browserLoginFields: (client.browserLoginFields ?? []).map(toProviderLoginField),
       deviceLoginFields: (client.deviceLoginFields ?? []).map(toProviderLoginField),
       importFields: (client.importFields ?? []).map(toProviderLoginField),
@@ -240,6 +260,19 @@ export function createProviderCatalogOperations(config: ProviderCatalogConfig) {
           throw new ConsoleDomainError("provider_not_found", 404, `Provider ${providerId} not found`);
         return attachProviderCapabilities(sanitizeProviderResponse(rec, true), config.providerRegistry);
       },
+    async getUsageMatrix(
+      access: AccessDecision | undefined,
+      providerId: string,
+      days: number,
+    ): Promise<{ readonly days: number; readonly rows: readonly ProviderUsageDayRow[] }> {
+      const a = requireTenantAnyScope(access, PROVIDER_READ_SCOPES);
+      // Bounded window even on a hostile query string: the card reads a
+      // calendar, not history, and the aggregate scan cost grows with `days`.
+      const bounded = Math.min(Math.max(Math.trunc(days) || 1, 1), 366);
+      if (!config.providerUsageMatrix) return { days: bounded, rows: [] };
+      const rows = await config.providerUsageMatrix(a.tenantId, providerId, bounded);
+      return { days: bounded, rows };
+    },
     async createProvider(
         access: AccessDecision | undefined,
         request: CreateProviderRequest,
@@ -461,8 +494,8 @@ export function createProviderCatalogOperations(config: ProviderCatalogConfig) {
      * uses, so a batch cannot accept a shape the single create rejects. The
      * expensive per-account bookkeeping — the audit row and the routing snapshot
      * invalidation that forces a 10-table catalog rebuild — is done ONCE for the
-     * whole batch instead of once per account, which is most of why the old
-     * client-side loop scaled linearly with paste size.
+     * whole batch instead of once per account, so cost does not scale linearly
+     * with paste size the way a client-side loop over single creates would.
      *
      * Email/label enrichment is deliberately NOT done here. Persisting the
      * credential is local work (encrypt + hash + insert) and needs no upstream;
@@ -507,8 +540,8 @@ export function createProviderCatalogOperations(config: ProviderCatalogConfig) {
         if (created.account !== undefined) queueNewAccountCheckin(providerId, created.account);
       }
 
-      // One audit row per successful account, but written after the batch lands
-      // rather than inside the request path that used to await it per account.
+      // One audit row per batch, written after the batch lands rather than
+      // awaited per account inside the request path.
       if (result.created > 0) {
         await config.auditSink?.record({
           access: a,
@@ -561,6 +594,25 @@ export function createProviderCatalogOperations(config: ProviderCatalogConfig) {
         const a = requireTenantAnyScope(access, PROVIDER_READ_SCOPES);
         return config.store.listAccountHealthEvents(a.tenantId, providerId, accountId);
       },
+    async purgeAccountHealthEvents(
+        access: AccessDecision | undefined,
+        providerId: string,
+        accountId: string,
+      ): Promise<{ deleted: number }> {
+        const a = requireTenantAnyScope(access, PROVIDER_WRITE_SCOPES);
+        // Barrier before the delete: buffered rows for this account must not
+        // land after the purge counted them gone, or the modal refetch shows
+        // ghost history the operator just purged.
+        await healthEventBuffer()?.drain(accountId);
+        const deleted = await config.store.purgeAccountHealthEvents(a.tenantId, providerId, accountId);
+        await config.auditSink?.record({
+          access: a,
+          action: "provider_account.health_events_purged",
+          target: accountId,
+          detail: { providerId, deleted },
+        });
+        return { deleted };
+      },
     async listBuddyGrowthTasks(
       access: AccessDecision | undefined,
       providerId: string,
@@ -611,6 +663,11 @@ export function createProviderCatalogOperations(config: ProviderCatalogConfig) {
         const selected = owned.filter(
           (account) => wanted.has(account.id) && account.tenantId === a.tenantId,
         );
+        const authStates = await config.store.listAccountAuthStates(
+          a.tenantId,
+          providerId,
+          selected.map((account) => account.id),
+        );
         const accounts = await Promise.all(
           selected.map(async (account): Promise<ProviderAccountExport> => {
             let accessToken = "";
@@ -633,6 +690,15 @@ export function createProviderCatalogOperations(config: ProviderCatalogConfig) {
               status: account.status,
               accessToken,
               ...(refreshToken === undefined ? {} : { refreshToken }),
+              // Non-secret auth state is part of the credential export: without
+              // it a re-import loses the upstream user id and region that Trae
+              // refresh and dispatch are addressed by.
+              ...(() => {
+                const authState = authStates[account.id];
+                return authState !== undefined && Object.keys(authState).length > 0
+                  ? { authState }
+                  : {};
+              })(),
               ...(account.inflight === undefined ? {} : { inflight: account.inflight }),
               createdAt: account.createdAt,
               ...(account.cooldownUntil ? { cooldownUntil: account.cooldownUntil } : {}),

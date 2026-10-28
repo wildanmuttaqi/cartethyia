@@ -8,7 +8,6 @@ import type {
   AuditListPage,
 
   ModelAliasRow,
-  ModelAbuseBan,
   ModelCatalogEntry,
   ModelComboRow,
   NetworkPoolResponse,
@@ -63,13 +62,17 @@ export function assertSystemHealth(value: unknown): SystemHealthResponse {
     "memory_heap_bytes",
     "memory_external_bytes",
     "memory_percent",
-    "cpu_percent",
     "request_count",
     "error_count",
     "latency_avg_ms",
     "latency_p95_ms",
     "latency_p99_ms",
   ];
+  // `cpu_percent` is deliberately absent from that list: there is no `loadavg`
+  // on Windows, so the backend reports `null` there. Validating it as a number
+  // made the whole health payload invalid on Windows — every tile then read
+  // "Unavailable" because of one metric the platform cannot supply. It is
+  // checked as nullable separately below.
   if (
     !numericFields.every((field) => isFiniteNumber(value[field])) ||
     typeof value.database_healthy !== "boolean" ||
@@ -77,6 +80,10 @@ export function assertSystemHealth(value: unknown): SystemHealthResponse {
     typeof value.redis_configured !== "boolean" ||
     typeof value.database_in_process !== "boolean"
   ) {
+    throw invalidResponse("Invalid system health response");
+  }
+  const cpuPercent = value["cpu_percent"];
+  if (cpuPercent !== null && !isFiniteNumber(cpuPercent)) {
     throw invalidResponse("Invalid system health response");
   }
   return value as unknown as SystemHealthResponse;
@@ -177,6 +184,12 @@ function assertUsageRequestItem(value: unknown): void {
       throw invalidResponse("Invalid usage request response");
     }
   }
+  // Presence bitmask: 1|2|4|8 flag which payload stages were captured, so the
+  // highest value is 15. A larger number would mark stages that do not exist.
+  const stages: unknown = value.payloadStages;
+  if (stages !== undefined && (!Number.isInteger(stages) || (stages as number) < 0 || (stages as number) > 15)) {
+    throw invalidResponse("Invalid usage request response");
+  }
   for (const field of [
     "durationMs",
     "inputTokens",
@@ -266,6 +279,12 @@ export function assertProviders(value: unknown): ProviderResponse[] {
   });
 }
 
+export function assertProvider(value: unknown): ProviderResponse {
+  const [provider] = assertProviders([value]);
+  if (provider === undefined) throw invalidResponse("Invalid provider response");
+  return provider;
+}
+
 export function assertModels(value: unknown): ModelCatalogEntry[] {
   if (!Array.isArray(value)) throw invalidResponse("Invalid model response");
   return value.map((model) => {
@@ -353,23 +372,6 @@ export function assertPoolStrategy(value: unknown): PoolStrategySetting {
     throw invalidResponse("Invalid pool strategy response");
   }
   return value as unknown as PoolStrategySetting;
-}
-
-export function assertModelBans(value: unknown): ModelAbuseBan[] {
-  if (!isRecord(value) || !Array.isArray(value.bans)) {
-    throw invalidResponse("Invalid model ban response");
-  }
-  return value.bans.map((ban) => {
-    if (
-      !isRecord(ban) ||
-      typeof ban.ip !== "string" ||
-      ban.reason !== "repeated_invalid_model_requests" ||
-      !isFiniteNumber(ban.expiresAt)
-    ) {
-      throw invalidResponse("Invalid model ban response");
-    }
-    return ban as unknown as ModelAbuseBan;
-  });
 }
 
 export function assertApiKeys(value: unknown): ApiKeyResponse[] {

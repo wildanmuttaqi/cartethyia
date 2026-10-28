@@ -13,7 +13,6 @@ test("usage performance reports routing average and P50/P95/P99 latency", () => 
     latencyP50Ms: 50,
     latencyP95Ms: 95,
     latencyP99Ms: 99,
-    // Every row carries a latency; only two carry a resolve measurement.
     latencySampleCount: 100,
     resolveSampleCount: 2,
   });
@@ -32,8 +31,6 @@ test("usage performance returns zero metrics when the period has no events", () 
 });
 
 test("the sample count is what separates a meaningful P99 from a guess", () => {
-  // Three rows make P99 the slowest request, not a percentile. The count is
-  // the only thing in the payload that says so.
   const events = [
     { latencyMs: 10, resolveMs: null },
     { latencyMs: 20, resolveMs: null },
@@ -43,4 +40,17 @@ test("the sample count is what separates a meaningful P99 from a guess", () => {
   expect(summary.latencyP99Ms).toBe(900);
   expect(summary.latencySampleCount).toBe(3);
   expect(summary.resolveSampleCount).toBe(0);
+});
+
+test("raw events retain exact slow-tail percentiles and routing delay", () => {
+  const summary = summarizeUsagePerformance([
+    { latencyMs: 8_000, resolveMs: 40 },
+    { latencyMs: 40_000, resolveMs: 60 },
+    { latencyMs: 40_000, resolveMs: null },
+  ]);
+  expect(summary.latencyP95Ms).toBe(40_000);
+  expect(summary.latencyP99Ms).toBe(40_000);
+  expect(summary.avgDurationMs).toBeCloseTo(29_333, 0);
+  expect(summary.avgResolveMs).toBe(50);
+  expect(summary.resolveSampleCount).toBe(2);
 });

@@ -2,6 +2,7 @@ import type { ConsoleAccessResolver } from "../auth/access";
 // Telemetry domain: system health, usage, and telemetry-event read API.
 
 import { ConsoleDomainError, requireTenantScope } from "../shared/errors";
+import { conditionalResponse, type CachedResult } from "../shared/read-through-cache";
 import { parseQueryLimit } from "../shared/query";
 import type { AccessDecision } from "../../security/access-control";
 import { USAGE_DIMENSIONS, type UsageDimension } from "./usage-dimensions";
@@ -44,7 +45,17 @@ export interface SystemHealthResponse {
    * gateway itself grew.
    */
   database_in_process: boolean;
-  cpu_percent: number;
+  /**
+   * `null` when the platform does not report it — there is no `loadavg` on
+   * Windows and Node hands back a zeroed tuple rather than failing, so on
+   * Windows this is always `null` rather than a confident-looking `0`.
+   *
+   * Nullable rather than `NaN`: `NaN` is not a JSON value and serializes to
+   * `null` anyway, which means a client validating the field as a number
+   * rejects the *whole* health payload. One unavailable metric then reads as
+   * every metric being unavailable.
+   */
+  cpu_percent: number | null;
   cpu_cores: number;
   pid: number;
   platform: string;
@@ -217,6 +228,15 @@ export interface UsageRequestItem {
    * written before the column existed.
    */
   payloadCaptureState?: string;
+  /**
+   * Bitmask of the payload stages captured for this request: 1 request,
+   * 2 provider request, 4 provider response, 8 client response. Read from the
+   * payload row so the list can mark each drawer panel without inflating a
+   * frame per row. Absent when nothing was captured for the request — the same
+   * state a pre-migration row reports, rendered as every stage uncaptured
+   * rather than as a measured zero.
+   */
+  payloadStages?: number;
 }
 export interface UsageRequestsResponse {
   items: UsageRequestItem[];
@@ -262,8 +282,26 @@ export interface TelemetryEventListPage {
   nextCursor?: string;
 }
 export interface ObservabilityStore {
-  health(tenantId: string): Promise<SystemHealthResponse>;
-  usage(tenantId: string, period: string): Promise<UsageResponse>;
+  /**
+   * Every member below that is served from the read-through cache returns a
+   * {@link CachedResult}, carrying the strong validator for the bytes the
+   * client would otherwise receive. A repeated poll is then a `304` instead of
+   * a full payload. The reads that are per-row and already bounded — the event
+   * list and the detail views — have no cache entry and no validator.
+   */
+  health(tenantId: string): Promise<CachedResult<SystemHealthResponse>>;
+  /**
+   * Process memory as it is right now, bypassing the read-through cache.
+   *
+   * `health` is cached for 10 s, which is correct for a dashboard tile and
+   * wrong for anything sampling a trend: a memory watcher polling on that same
+   * 10 s cadence reads the cached bytes often enough that consecutive samples
+   * can be identical, and a monotonic-growth test over identical samples is
+   * meaningless. The values are read in-process and cost nothing, so there is
+   * no reason to serve them stale.
+   */
+  liveMemory(): Promise<{ memory_bytes: number; memory_percent: number }>;
+  usage(tenantId: string, period: string): Promise<CachedResult<UsageResponse>>;
   listEvents(tenantId: string, limit: number, cursor?: string): Promise<TelemetryEventListPage>;
   getEvent(
     tenantId: string,
@@ -271,20 +309,20 @@ export interface ObservabilityStore {
     includePayload: boolean,
     createdAt?: string,
   ): Promise<TelemetryEventDetail | undefined>;
-  usageSummary(tenantId: string, period: string): Promise<UsageSummaryResponse>;
-  usageChart(tenantId: string, period: string): Promise<UsageChartResponse>;
+  usageSummary(tenantId: string, period: string): Promise<CachedResult<UsageSummaryResponse>>;
+  usageChart(tenantId: string, period: string): Promise<CachedResult<UsageChartResponse>>;
   usageBy(
     tenantId: string,
     dimension: UsageDimension,
     period: string,
-  ): Promise<UsageByResponse>;
-  usageCache(tenantId: string, period: string): Promise<UsageCacheResponse>;
+  ): Promise<CachedResult<UsageByResponse>>;
+  usageCache(tenantId: string, period: string): Promise<CachedResult<UsageCacheResponse>>;
   usageRequests(
     tenantId: string,
     period: string,
     limit: number,
     httpStatus?: number,
-  ): Promise<UsageRequestsResponse>;
+  ): Promise<CachedResult<UsageRequestsResponse>>;
   usageRequestDetail(tenantId: string, requestId: string): Promise<UsageRequestDetail | undefined>;
 }
 export interface ObservabilityConfig {
@@ -294,12 +332,25 @@ export interface ObservabilityConfig {
 
 export function createObservabilityOperations(config: ObservabilityConfig) {
   const operations = {
-    async getSystemHealth(access: AccessDecision | undefined): Promise<SystemHealthResponse> {
+    /**
+     * The cached reads below answer with a `Response` rather than a plain
+     * object, because a repeated poll is a `304` and a `304` has no body to
+     * serialize. `ifNoneMatch` is the client's `If-None-Match`; a match costs
+     * ~200 bytes instead of the whole payload.
+     */
+    async getSystemHealth(
+        access: AccessDecision | undefined,
+        ifNoneMatch: string | null,
+      ): Promise<Response> {
         const a = requireTenantScope(access, "dashboard:read");
-        const h = await config.store.health(a.tenantId);
-        return h;
+        const result = await config.store.health(a.tenantId);
+        return conditionalResponse(ifNoneMatch, result, result.value);
       },
-    async getTenantUsage(access: AccessDecision | undefined, period = "7d"): Promise<UsageResponse> {
+    async getTenantUsage(
+        access: AccessDecision | undefined,
+        period = "7d",
+        ifNoneMatch: string | null = null,
+      ): Promise<Response> {
         const a = requireTenantScope(access, "dashboard:read");
         if (!isSupportedUsagePeriod(period)) {
           throw new ConsoleDomainError(
@@ -308,7 +359,8 @@ export function createObservabilityOperations(config: ObservabilityConfig) {
             `Unsupported usage period: ${period}. Use "24h", "7d", "30d", or "all".`,
           );
         }
-        return config.store.usage(a.tenantId, period);
+        const result = await config.store.usage(a.tenantId, period);
+        return conditionalResponse(ifNoneMatch, result, result.value);
       },
     async listEvents(
         access: AccessDecision | undefined,
@@ -354,22 +406,27 @@ export function createObservabilityOperations(config: ObservabilityConfig) {
     async getUsageSummary(
         access: AccessDecision | undefined,
         period = "24h",
-      ): Promise<UsageSummaryResponse> {
+        ifNoneMatch: string | null = null,
+      ): Promise<Response> {
         const tenantId = operations.requireTenant(access);
-        return config.store.usageSummary(tenantId, operations.requirePeriod(period));
+        const result = await config.store.usageSummary(tenantId, operations.requirePeriod(period));
+        return conditionalResponse(ifNoneMatch, result, result.value);
       },
     async getUsageChart(
         access: AccessDecision | undefined,
         period = "24h",
-      ): Promise<UsageChartResponse> {
+        ifNoneMatch: string | null = null,
+      ): Promise<Response> {
         const tenantId = operations.requireTenant(access);
-        return config.store.usageChart(tenantId, operations.requirePeriod(period));
+        const result = await config.store.usageChart(tenantId, operations.requirePeriod(period));
+        return conditionalResponse(ifNoneMatch, result, result.value);
       },
     async getUsageBy(
         access: AccessDecision | undefined,
         dimension: UsageDimension,
         period = "24h",
-      ): Promise<UsageByResponse> {
+        ifNoneMatch: string | null = null,
+      ): Promise<Response> {
         const tenantId = operations.requireTenant(access);
         if (!(USAGE_DIMENSIONS as readonly string[]).includes(dimension)) {
           throw new ConsoleDomainError(
@@ -378,21 +435,25 @@ export function createObservabilityOperations(config: ObservabilityConfig) {
             `Unsupported usage dimension: ${dimension}. Use ${USAGE_DIMENSIONS.map((d) => `"${d}"`).join(", ")}.`,
           );
         }
-        return config.store.usageBy(tenantId, dimension, operations.requirePeriod(period));
+        const result = await config.store.usageBy(tenantId, dimension, operations.requirePeriod(period));
+        return conditionalResponse(ifNoneMatch, result, result.value);
       },
     async getUsageCache(
         access: AccessDecision | undefined,
         period = "24h",
-      ): Promise<UsageCacheResponse> {
+        ifNoneMatch: string | null = null,
+      ): Promise<Response> {
         const tenantId = operations.requireTenant(access);
-        return config.store.usageCache(tenantId, operations.requirePeriod(period));
+        const result = await config.store.usageCache(tenantId, operations.requirePeriod(period));
+        return conditionalResponse(ifNoneMatch, result, result.value);
       },
     async listUsageRequests(
       access: AccessDecision | undefined,
       period = "24h",
       limit?: string,
       httpStatus?: string,
-    ): Promise<UsageRequestsResponse> {
+      ifNoneMatch: string | null = null,
+    ): Promise<Response> {
       const tenantId = operations.requireTenant(access);
       let parsedStatus: number | undefined;
       if (httpStatus !== undefined) {
@@ -401,12 +462,13 @@ export function createObservabilityOperations(config: ObservabilityConfig) {
           throw new ConsoleDomainError("invalid_request", 400, "Invalid HTTP status filter");
         }
       }
-      return config.store.usageRequests(
+      const result = await config.store.usageRequests(
         tenantId,
         operations.requirePeriod(period),
         parseQueryLimit(limit, 50, 500),
         parsedStatus,
       );
+      return conditionalResponse(ifNoneMatch, result, result.value);
     },
     async getUsageRequestDetail(
         access: AccessDecision | undefined,

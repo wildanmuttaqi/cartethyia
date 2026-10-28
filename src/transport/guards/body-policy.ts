@@ -5,6 +5,7 @@ import { assertBoundedJsonDepth } from "../../protocol/codecs";
 import type { ProxyRequestStateStore } from "../request/state";
 import { fastPathname } from "../pathname";
 import { NATIVE_SERVICE_PATHS, TOKEN_COUNT_PATH } from "../contracts";
+import { bodyTooLargeError } from "./guard-errors";
 
 /** Whether this request is a gateway (`/v1/*`) request. */
 export function isProxyRequest(request: Request): boolean {
@@ -17,10 +18,11 @@ export function isProxyRequest(request: Request): boolean {
  * This list must mirror the routes `app.ts` actually mounts. It drives
  * body-read policy — a JSON route rejects a missing or non-JSON content-type
  * with 415, while an unrouted path is not read at all — so an entry with no
- * handler behind it describes a route the gateway does not serve. Two such
- * entries (`/v1/embeddings`, `/v1/audio/speech`) sit outside this list: they
- * advertise a surface that 404s, and the route-table test pins them absent so
- * re-adding one is a deliberate act.
+ * handler behind it describes a route the gateway does not serve. Three such
+ * entries (`/v1/embeddings`, `/v1/audio/transcriptions`, `/v1/audio/speech`)
+ * were listed for a while with nothing mounted — they advertised a surface
+ * that 404d — and the route-table test pinned them absent so re-adding one was
+ * a deliberate act. They are mounted now, as passthrough surfaces.
  *
  * The native service routes (`NATIVE_SERVICE_PATHS` — System One, web search,
  * image and video generation) are included: they read a JSON body through the
@@ -86,7 +88,7 @@ export async function readIngressBody(
   const declared = request.headers.get("content-length");
   const parsed = declared === null ? undefined : Number(declared);
   if (declared !== null && (!/^\d+$/.test(declared) || parsed === undefined || parsed > maxBytes))
-    throw new GatewayError("invalid_request", 413, `The request body is larger than this endpoint accepts (${maxBytes} bytes). Shorten the prompt or split the request.`);
+    throw bodyTooLargeError(maxBytes);
 
   const reader = request.body?.getReader();
   if (!reader) throw new GatewayError("invalid_request", 400, "The request body could not be read. Resend it with a JSON body.");
@@ -103,7 +105,7 @@ export async function readIngressBody(
       totalBytes += chunk.byteLength;
       if (totalBytes > maxBytes) {
         await reader.cancel().catch(() => undefined);
-        throw new GatewayError("invalid_request", 413, `The request body is larger than this endpoint accepts (${maxBytes} bytes). Shorten the prompt or split the request.`);
+        throw bodyTooLargeError(maxBytes);
       }
       chunks.push(chunk);
     }

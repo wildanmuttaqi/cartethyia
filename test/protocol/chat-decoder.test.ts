@@ -31,11 +31,19 @@ import {
 import { GatewayError } from "../../src/protocol/gateway-error";
 import type { CanonicalEvent, CanonicalRequest, UsageRecord } from "../../src/protocol/canonical-model";
 
-/** A canonical request; the decoder reads only `model`. */
-function request(overrides: { model?: string } = {}): CanonicalRequest {
+/** A canonical request with the fields the decoder reads. */
+function request(
+  overrides: {
+    model?: string;
+    tools?: CanonicalRequest["tools"];
+    tool_choice?: CanonicalRequest["tool_choice"];
+  } = {},
+): CanonicalRequest {
   return {
     model: overrides.model ?? "gpt-5",
     messages: [{ role: "user", content: [{ kind: "text", text: "hi" }] }],
+    ...(overrides.tools === undefined ? {} : { tools: overrides.tools }),
+    ...(overrides.tool_choice === undefined ? {} : { tool_choice: overrides.tool_choice }),
     generation_controls: {},
     stream: true,
     source_surface: "chat",
@@ -67,9 +75,10 @@ function frame(payload: unknown): string {
 async function collect(
   stream: ReadableStream<Uint8Array>,
   signal?: AbortSignal,
+  canonicalRequest: CanonicalRequest = request(),
 ): Promise<CanonicalEvent[]> {
   const events: CanonicalEvent[] = [];
-  for await (const event of decodeChatSseStream(stream, request(), signal)) {
+  for await (const event of decodeChatSseStream(stream, canonicalRequest, signal)) {
     events.push(event);
   }
   return events;
@@ -251,6 +260,108 @@ describe("parseChatResponseToEvents — a complete JSON response", () => {
 });
 
 describe("parseChatResponseToEvents — tool calls", () => {
+  const todoToolRequest = request({
+    tools: [
+      {
+        name: "todo",
+        jsonSchema: {
+          type: "object",
+          properties: {
+            i: { type: "string" },
+            op: { type: "string" },
+            list: { type: "array" },
+          },
+        },
+      },
+    ],
+    tool_choice: "auto",
+  });
+
+  test("recovers the captured tool-call envelope from assistant text", () => {
+    const marker = "6124c78e";
+    const markup =
+      `<tool_calls:${marker}><tool_call:${marker}>todo` +
+      `<arg_key:${marker}>i</arg_key:${marker}>` +
+      `<arg_value:${marker}>Correct todo state after scope change</arg_value:${marker}>` +
+      `<arg_key:${marker}>op</arg_key:${marker}>` +
+      `<arg_value:${marker}>init</arg_value:${marker}>` +
+      `<arg_key:${marker}>list</arg_key:${marker}>` +
+      `<arg_value:${marker}>[{"phase":"PR2","items":["probe","tag","pill"]}]</arg_value:${marker}>` +
+      `</tool_call:${marker}></tool_calls:${marker}>`;
+    const events = parseChatResponseToEvents(
+      {
+        choices: [
+          {
+            message: {
+              content: `Before the call.\n${markup}\n`,
+              reasoning_content: `Planning.\n${markup}`,
+            },
+            finish_reason: "stop",
+          },
+        ],
+      },
+      todoToolRequest,
+    );
+    const calls = events.filter((event) => event.type === "tool_call_delta");
+    const content = events.flatMap((event) =>
+      event.type === "content_delta" && event.content.kind === "text" ? [event.content.text] : [],
+    );
+    const reasoning = events.flatMap((event) =>
+      event.type === "content_delta" && event.content.kind === "reasoning"
+        ? [event.content.summary ?? event.content.payload ?? ""]
+        : [],
+    );
+
+    expect(calls).toHaveLength(1);
+    expect(calls[0]?.name).toBe("todo");
+    expect(
+      JSON.parse(calls[0]?.arguments_delta ?? "{}"),
+    ).toEqual({
+      i: "Correct todo state after scope change",
+      op: "init",
+      list: [{ phase: "PR2", items: ["probe", "tag", "pill"] }],
+    });
+    expect(content.join("").trim()).toBe("Before the call.");
+    expect(reasoning.join("").trim()).toBe("Planning.");
+    expect(terminal(events).stop_reason).toBe("tool_use");
+  });
+
+  test("does not promote a text envelope for a tool not declared by the request", () => {
+    const marker = "6124c78e";
+    const markup =
+      `<tool_calls:${marker}><tool_call:${marker}>bash` +
+      `<arg_key:${marker}>command</arg_key:${marker}>` +
+      `<arg_value:${marker}>whoami</arg_value:${marker}>` +
+      `</tool_call:${marker}></tool_calls:${marker}>`;
+    const events = parseChatResponseToEvents(
+      { choices: [{ message: { content: markup }, finish_reason: "stop" }] },
+      todoToolRequest,
+    );
+    expect(events.filter((event) => event.type === "tool_call_delta")).toHaveLength(0);
+    const visible = events.flatMap((event) =>
+      event.type === "content_delta" && event.content.kind === "text" ? [event.content.text] : [],
+    );
+    expect(visible.join("")).toBe(markup);
+  });
+
+  test("does not promote a declared tool when the request forbids tool use", () => {
+    const marker = "6124c78e";
+    const markup =
+      `<tool_calls:${marker}><tool_call:${marker}>todo` +
+      `<arg_key:${marker}>op</arg_key:${marker}><arg_value:${marker}>init</arg_value:${marker}>` +
+      `</tool_call:${marker}></tool_calls:${marker}>`;
+    const noToolsRequest = request({
+      tools: todoToolRequest.tools,
+      tool_choice: "none",
+    });
+    const events = parseChatResponseToEvents(
+      { choices: [{ message: { content: markup }, finish_reason: "stop" }] },
+      noToolsRequest,
+    );
+    expect(events.filter((event) => event.type === "tool_call_delta")).toHaveLength(0);
+    expect(events.filter((event) => event.type === "content_delta")).toHaveLength(0);
+  });
+
   test("a well-formed tool call becomes one tool_call_delta", () => {
     const events = parseChatResponseToEvents(
       {
@@ -328,6 +439,130 @@ describe("parseChatResponseToEvents — tool calls", () => {
     );
     const calls = events.flatMap((event) => (event.type === "tool_call_delta" ? [event] : []));
     expect(calls).toHaveLength(1);
+  });
+});
+
+describe("decodeChatSseStream — recovered text tool calls", () => {
+  const todoToolRequest = request({
+    tools: [
+      {
+        name: "todo",
+        jsonSchema: {
+          type: "object",
+          properties: {
+            op: { type: "string" },
+          },
+        },
+      },
+    ],
+    tool_choice: "auto",
+  });
+
+  test("recovers a call whose envelope and argument tags span SSE deltas", async () => {
+    const marker = "6124c78e";
+    const pieces = [
+      "Progress. <tool_calls:6124",
+      `c78e><tool_call:${marker}>to`,
+      `do<arg_key:${marker}>op</arg_key:${marker}><arg_value:${marker}>`,
+      `init</arg_value:${marker}></tool_call:${marker}>`,
+      `</tool_calls:${marker}> Done.`,
+    ];
+    const wire = pieces
+      .map((content) => frame({ choices: [{ delta: { content } }] }))
+      .join("");
+    const events = await collect(
+      sseStream(wire + frame({ choices: [{ delta: {}, finish_reason: "stop" }] }) + frame("[DONE]")),
+      undefined,
+      todoToolRequest,
+    );
+    const calls = events.filter((event) => event.type === "tool_call_delta");
+    const visibleText = events.flatMap((event) =>
+      event.type === "content_delta" && event.content.kind === "text" ? [event.content.text] : [],
+    );
+
+    expect(calls).toHaveLength(1);
+    expect(calls[0]).toMatchObject({
+      name: "todo",
+      arguments_delta: JSON.stringify({ op: "init" }),
+    });
+    expect(visibleText.join("")).toBe("Progress.  Done.");
+    expect(visibleText.join("")).not.toContain("<tool_calls:");
+    expect(terminal(events).stop_reason).toBe("tool_use");
+  });
+
+  test("removes tool markup from reasoning without executing it", async () => {
+    const marker = "6124c78e";
+    const markup =
+      `Planning. <tool_calls:${marker}><tool_call:${marker}>todo` +
+      `<arg_key:${marker}>op</arg_key:${marker}><arg_value:${marker}>init</arg_value:${marker}>` +
+      `</tool_call:${marker}></tool_calls:${marker}>`;
+    const events = await collect(
+      sseStream(
+        frame({ choices: [{ delta: { reasoning_content: markup } }] }) +
+          frame({ choices: [{ delta: { content: "Answer." }, finish_reason: "stop" }] }) +
+          frame("[DONE]"),
+      ),
+      undefined,
+      todoToolRequest,
+    );
+    const reasoning = events.flatMap((event) =>
+      event.type === "content_delta" && event.content.kind === "reasoning"
+        ? [event.content.summary ?? event.content.payload ?? ""]
+        : [],
+    );
+    expect(reasoning.join("")).toBe("Planning. ");
+    expect(events.filter((event) => event.type === "tool_call_delta")).toHaveLength(0);
+  });
+
+  test("drops an unterminated captured envelope instead of leaking it or executing it", async () => {
+    const marker = "6124c78e";
+    const partial =
+      `<tool_calls:${marker}><tool_call:${marker}>todo` +
+      `<arg_key:${marker}>op</arg_key:${marker}><arg_value:${marker}>init`;
+    const events = await collect(
+      sseStream(
+        frame({ choices: [{ delta: { content: partial } }] }) +
+          frame({ choices: [{ delta: {}, finish_reason: "stop" }] }) +
+          frame("[DONE]"),
+      ),
+      undefined,
+      todoToolRequest,
+    );
+    const visibleText = events.flatMap((event) =>
+      event.type === "content_delta" && event.content.kind === "text" ? [event.content.text] : [],
+    );
+    expect(visibleText.join("")).not.toContain("<tool_calls:");
+    expect(events.filter((event) => event.type === "tool_call_delta")).toHaveLength(0);
+  });
+
+  test("prefers structured tool calls if the upstream sends both forms", async () => {
+    const marker = "6124c78e";
+    const markup =
+      `<tool_calls:${marker}><tool_call:${marker}>todo` +
+      `<arg_key:${marker}>op</arg_key:${marker}><arg_value:${marker}>from-text</arg_value:${marker}>` +
+      `</tool_call:${marker}></tool_calls:${marker}>`;
+    const events = await collect(
+      sseStream(
+        frame({ choices: [{ delta: { content: markup } }] }) +
+          frame({
+            choices: [
+              {
+                delta: {
+                  tool_calls: [
+                    { index: 0, id: "call_wire", function: { name: "todo", arguments: '{"op":"wire"}' } },
+                  ],
+                },
+                finish_reason: "tool_calls",
+              },
+            ],
+          }) +
+          frame("[DONE]"),
+      ),
+      undefined,
+      todoToolRequest,
+    );
+    const calls = events.filter((event) => event.type === "tool_call_delta");
+    expect(calls.map((call) => call.call_id)).toEqual(["call_wire"]);
   });
 });
 
@@ -928,5 +1163,158 @@ describe("decodeChatSseStream — an empty body", () => {
     // as failed rather than as an empty success.
     const events = await collect(sseStream(""));
     expect(terminal(events).state).toBe("failed");
+  });
+});
+
+describe("decodeChatSseStream — Inferhub ag/* model quirks", () => {
+  // ag/gemini-3.8-flash-high (and similar thinking models) emit two non-standard
+  // chunks when tools are called:
+  //   1. A `reasoning_details` delta (alongside finish_reason:"tool_calls") whose
+  //      entries carry opaque `thoughtSignature` blobs, NOT readable text.
+  //   2. A trailing `choices: []` usage-only chunk that arrives *after* `[DONE]`.
+  // Neither must crash the decoder or swallow the tool call from chunk 1.
+
+  const TOOL: CanonicalRequest["tools"] = [
+    {
+      name: "get_current_weather",
+      description: "Get the weather",
+      jsonSchema: {
+        type: "object",
+        properties: { location: { type: "string" } },
+        required: ["location"],
+      },
+    },
+  ];
+
+  test("reasoning_details with thoughtSignature blobs does not crash or emit phantom reasoning", async () => {
+    // Chunk 1: tool_calls delta (normal)
+    // Chunk 2: reasoning_details delta carrying only {id, name, thoughtSignature} — no .text
+    // The decoder must emit the tool call from chunk 1 and produce no reasoning event.
+    const events = await collect(
+      sseStream(
+        frame({
+          choices: [
+            {
+              delta: {
+                role: "assistant",
+                tool_calls: [
+                  {
+                    index: 0,
+                    id: "call_1197851",
+                    type: "function",
+                    function: { name: "get_current_weather", arguments: '{"location":"Tokyo"}' },
+                  },
+                ],
+              },
+              finish_reason: null,
+              index: 0,
+            },
+          ],
+        }) +
+          frame({
+            choices: [
+              {
+                delta: {
+                  reasoning_details: [
+                    {
+                      id: "call_1197851",
+                      name: "get_current_weather",
+                      thoughtSignature: "EpMHABCDEFG_opaque_base64_blob==",
+                    },
+                  ],
+                },
+                finish_reason: "tool_calls",
+                index: 0,
+              },
+            ],
+          }) +
+          frame("[DONE]"),
+      ),
+      undefined,
+      request({ tools: TOOL }),
+    );
+
+    // Exactly one tool call delta emitted, with the correct identity.
+    const calls = events.flatMap((event) => (event.type === "tool_call_delta" ? [event] : []));
+    expect(calls).toHaveLength(1);
+    expect(calls[0]?.call_id).toBe("call_1197851");
+    expect(calls[0]?.name).toBe("get_current_weather");
+    expect(calls[0]?.arguments_delta).toBe('{"location":"Tokyo"}');
+
+    // No reasoning content event: thoughtSignature blobs are not readable text.
+    const reasoning = events.filter(
+      (event) => event.type === "content_delta" && event.content.kind === "reasoning",
+    );
+    expect(reasoning).toHaveLength(0);
+
+    // Stream ends as a complete tool_use turn.
+    const term = terminal(events);
+    expect(term.state).toBe("complete");
+    expect(term.stop_reason).toBe("tool_use");
+  });
+
+  test("trailing choices:[] chunk after [DONE] is never seen by the decoder", async () => {
+    // Inferhub emits a final usage-only frame after [DONE]. The decoder must
+    // stop at [DONE] and not attempt to access choices[0] on an empty array.
+    // The trailing frame is appended to the SSE wire after [DONE] to confirm
+    // it has no effect on events or the terminal state.
+    const trailingUsageChunk = JSON.stringify({
+      choices: [],
+      object: "chat.completion.chunk",
+      usage: {
+        completion_tokens: 465,
+        completion_tokens_details: { reasoning_tokens: 428 },
+        cost: 1.4016e-5,
+        prompt_tokens: 11,
+        total_tokens: 476,
+      },
+    });
+    const events = await collect(
+      sseStream(
+        frame({ choices: [{ delta: { role: "assistant", content: "Hello" }, finish_reason: null, index: 0 }] }) +
+          frame({ choices: [{ delta: {}, finish_reason: "stop", index: 0 }] }) +
+          frame("[DONE]") +
+          // This chunk arrives after [DONE] — the decoder must not process it.
+          `data: ${trailingUsageChunk}\n\n`,
+      ),
+    );
+
+    const texts = events.flatMap((event) =>
+      event.type === "content_delta" && event.content.kind === "text" ? [event.content.text] : [],
+    );
+    expect(texts).toEqual(["Hello"]);
+    expect(terminal(events).state).toBe("complete");
+    expect(terminal(events).stop_reason).toBe("stop");
+  });
+
+  test("reasoning_details with no text parts is not confused with Qwen/MiniMax readable reasoning", async () => {
+    // Qwen/MiniMax use reasoning_details[] with {type:"thinking", text:"..."} parts
+    // that readReasoningText() concatenates into a reasoning event.
+    // Inferhub uses reasoning_details[] with {id, name, thoughtSignature} — no .text —
+    // so no reasoning event must be emitted.
+    const events = await collect(
+      sseStream(
+        frame({
+          choices: [
+            {
+              delta: {
+                reasoning_details: [
+                  // Inferhub shape: no .text field
+                  { id: "call_abc", name: "some_tool", thoughtSignature: "AAABBBCCC==" },
+                ],
+              },
+              finish_reason: "tool_calls",
+              index: 0,
+            },
+          ],
+        }) +
+          frame("[DONE]"),
+      ),
+    );
+
+    const reasoning = events.filter(
+      (event) => event.type === "content_delta" && event.content.kind === "reasoning",
+    );
+    expect(reasoning).toHaveLength(0);
   });
 });

@@ -16,6 +16,7 @@ import {
   BASELINE_MIGRATION_ID,
   assertMigrationHistorySupported,
   baselineSchemaMarker,
+  acceptedBaselineSchemaMarkers,
   migrationFiles,
   resolveMigrationsFolder,
 } from "./migrate";
@@ -157,10 +158,10 @@ export async function applySqlMigrations(
 ): Promise<void> {
   const files = migrationFiles(folder);
   const baselineFile = files.find((file) => basename(file) === BASELINE_MIGRATION_ID);
+  const baselineSource =
+    baselineFile === undefined ? undefined : readFileSync(baselineFile, "utf8");
   const baselineMarker =
-    baselineFile === undefined
-      ? undefined
-      : baselineSchemaMarker(readFileSync(baselineFile, "utf8"));
+    baselineSource === undefined ? undefined : baselineSchemaMarker(baselineSource);
   const client = await pool.connect();
   try {
     await client.query(`SELECT pg_advisory_lock(hashtext('cartethyia:migrations'))`);
@@ -177,6 +178,7 @@ export async function applySqlMigrations(
       [
         ...files.map((file) => basename(file)),
         ...(baselineMarker === undefined ? [] : [baselineMarker]),
+      ...(baselineSource === undefined ? [] : acceptedBaselineSchemaMarkers(baselineSource)),
       ],
       tenants.rows[0]?.present === true,
       baselineMarker,
@@ -227,6 +229,10 @@ async function createMigrationLedger(client: PoolClient): Promise<void> {
 
 export function createPgHandle(): PgHandle {
   const pool = getPool();
+  // No `logger`: drizzle's default logger prints the full statement *and its
+  // bound parameters* on any failed query. On the auth path that includes the
+  // key hash, so one bad request wrote a credential-shaped string to the log —
+  // and a database outage wrote one per request.
   const db: CartethyiaDatabase = drizzle(pool, { schema: fullSchema });
   return {
     kind: "pg",
@@ -243,4 +249,17 @@ export function createPgHandle(): PgHandle {
       await pool.end();
     },
   };
+}
+
+/**
+ * A Drizzle handle over an existing pool.
+ *
+ * Production builds one at boot from `getPool()`; a test that already owns a
+ * pool (the suite's shared, migrated one) needs the same query builder without
+ * booting a second connection set.
+ */
+export function pgHandleFromPool(pool: Pool): CartethyiaDatabase {
+  // No `logger`: drizzle's default logger prints the statement *and its bound
+  // parameters* on failure, which on the auth path includes a key hash.
+  return drizzle(pool, { schema: fullSchema });
 }

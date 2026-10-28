@@ -83,7 +83,7 @@ export async function buildAOT(
   // Substituted through `define` rather than by assigning `process.env`, because
   // this module is imported by tests that run in the same process as everything
   // else — mutating the environment here would flip `NODE_ENV` for every later
-  // suite in that process. `scripts/build/binary.ts` passes the same define.
+  // suite in that process. `scripts/build/compile.ts` passes the same define.
   try {
     const result = await buildFn({
       entrypoints: ["src/main.ts"],

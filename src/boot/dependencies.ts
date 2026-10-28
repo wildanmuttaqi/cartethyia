@@ -3,10 +3,14 @@ import { assertPoolFitsServerCapacity, bootDatabase, ensureMigrated } from "../p
 import { poolMaxFromEnv } from "../persistence/db-pg";
 import type { CartethyiaDatabase } from "../persistence/db-handle";
 import { resolveRedisBackend, resolveRedisClient } from "../persistence/redis";
+import { resolveProcessTopology, type ProcessTopology } from "../config/runtime";
+import { createRedisMaintenanceLeaseStore } from "../workers/maintenance-lease";
+import { resolveDbMode } from "../persistence/db-mode";
 import type { RedisClient } from "../persistence/redis";
 import {
   bundledModelCatalog,
   liveProviderUpstreamHosts,
+  markCatalogSeeded,
   refreshActiveProviderCatalogs,
   registerByokProviders,
   retireUnbundledProviders,
@@ -31,13 +35,11 @@ import { RedisAdmissionCounterStore } from "../security/admission/redis-store";
 import { sweepLeases } from "../security/admission/lease-sweep";
 import { DrizzleApiKeyStore } from "../persistence/stores/api-key-store";
 import { UsageFlushBuffer } from "../persistence/usage-flush";
+import { setPendingUsageSource } from "../security/api-key-auth";
+import { HealthEventFlushBuffer, setHealthEventBuffer } from "../persistence/health-event-flush";
+import { subscribePeerSettingsRevisions } from "../persistence/settings-revision";
 import { deleteExpiredSessions } from "../console/auth/session-service";
 import { InMemoryIpAbuseStore, IpAbuseProtectionService, RedisIpAbuseStore } from "../security/abuse";
-import {
-  InMemoryModelAbuseStore,
-  ModelStrikeService,
-  RedisModelAbuseStore,
-} from "../security/model-abuse";
 import { checkReadiness } from "../persistence/readiness";
 import { ProxyRequestPreparer } from "../transport/request/preparer";
 import { DrizzleNetworkPoolLoader } from "../network/pool/loader";
@@ -46,21 +48,20 @@ import {
   ValidatedNetworkBindingFactory,
 } from "../network/pool/resolver";
 import { NetworkPoolSelector } from "../network/pool/selector";
+import { restorePoolProbeVerdicts, restoreProviderCooldownMarkers } from "../network/pool-cooldown-store";
 import { ScheduledTaskRegistry } from "../workers/scheduler";
 import { quotaRefreshSweep } from "../workers/quota-refresh-sweep";
+import { markProviderApiKeyCredential } from "../console/quota/account-quota-shared";
 import { dailyCheckinEgressForPass } from "../workers/daily-checkin";
 import {
   buddyAdoptTask,
   buddyActivityReportTask,
-  buddyLotteryTask,
-  buddyRedeemTask,
   buddyStreakTask,
-  buddyTravelTask,
-  buddyTrialTask,
   syncBuddyUsage,
 } from "../workers/buddy-growth-tasks";
 import { createAccountSecretResolver } from "../providers/operations/provider-credential-service";
-import { quotaCacheSize } from "../console/quota/cache";
+import { quotaCacheSize } from "../providers/quota/cache";
+import { modelCatalogCacheSize } from "../providers/operations/model-catalog-cache";
 import { preferencesReaderFor } from "../persistence/tenant-preferences";
 import { sweepExpiredCooldowns } from "../providers/operations/account-health-service";
 import { DrizzleTelemetryStore } from "../persistence/stores/telemetry-store";
@@ -70,13 +71,11 @@ import { TelemetryBatchBuffer } from "../observability/telemetry-buffer";
 import { RuntimeMetricsSampler } from "../observability/runtime-metrics";
 import {
   resolveIpRateLimit,
-  resolveModelBanTtlMs,
-  resolveModelStrikeThreshold,
-  resolveModelStrikeWindowMs,
 } from "../config/security";
 import { resolveSsrfPolicy, resolveTrustedProxyBoundary } from "../config/network";
 import type { TrustedProxyBoundary } from "../config/network";
 import { resolveTelemetryRetentionDays } from "../config/telemetry";
+import { resolveConcurrencyTolerance } from "../config/resources";
 import { CONFIG_SPEC, readInt, readList } from "../config/spec";
 import type { ProviderAdapter } from "../providers/provider-contracts";
 import type { ProviderRegistry } from "../providers/provider-registry";
@@ -84,7 +83,6 @@ import type { ByokUpstreamHost } from "../providers/operations/provider-catalog-
 import type { ReadinessCheckResult } from "../persistence/readiness";
 import { log } from "../observability/logger";
 import { refreshProviderClientVersions } from "../providers/operations/client-versions";
-import { recoverMissingDefaultGatewayApiKeys } from "../console/auth/setup-service";
 
 
 export interface ProductionDeps {
@@ -110,13 +108,13 @@ export interface ProductionDeps {
   poolSelector: NetworkPoolSelector;
   telemetryBuffer: TelemetryBatchBuffer;
   usageFlush: UsageFlushBuffer;
+  healthEventFlush: HealthEventFlushBuffer;
   trustedProxyBoundary: TrustedProxyBoundary;
   providerRegistry: ProviderRegistry;
   resolveOAuthRefresher: (providerId: string) => Promise<OAuthTokenRefresher | undefined>;
   oauthRefreshService: OAuthRefreshService;
   admissionService: ApiKeyAdmissionService;
   /** Graduated strikes for repeated invalid-model requests. */
-  modelStrikes: ModelStrikeService;
   /** Memory sampler; in-flight source is bound once the request store exists. */
   runtimeMetricsSampler: RuntimeMetricsSampler;
 }
@@ -131,12 +129,94 @@ const OAUTH_REFRESH_INTER_ITEM_DELAY_MS = 1_500;
  * Client identities are refreshed out of band so provider dispatch never waits
  * on npm/provider version endpoints. Resolver TTLs deduplicate the sources.
  */
-const CLIENT_VERSION_MONITOR_INTERVAL_MS = 15 * 60_000;
+// Matched to the resolver's own 30 min cache TTL: a shorter interval makes
+// every second pass a pure cache read that cannot discover anything new.
+const CLIENT_VERSION_MONITOR_INTERVAL_MS = 30 * 60_000;
 const CLIENT_VERSION_INITIAL_DELAY_MS = 10_000;
+
+/** Bound on the boot-time Redis probe: a start must fail, not hang. */
+const REDIS_PROBE_TIMEOUT_MS = 2_000;
+
+async function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
+  const { promise: timeout, reject } = Promise.withResolvers<never>();
+  const timer = setTimeout(() => reject(new Error("timeout")), ms);
+  try {
+    return await Promise.race([promise, timeout]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/** Bounded Redis reachability probe: fails rather than hangs. */
+async function redisIsReachable(): Promise<boolean> {
+  const client = resolveRedisClient();
+  if (!client) return false;
+  try {
+    const result = await withTimeout(client.ping(), REDIS_PROBE_TIMEOUT_MS);
+    return result === "PONG";
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Refuses to start a multi-process deployment whose shared state is not
+ * actually shared.
+ *
+ * Every process shares one port via `SO_REUSEPORT`, so the kernel balances
+ * across them — and each process keeps its own in-memory admission counters,
+ * quota cache, and cooldown map. Those are only correct when they live in
+ * Redis. Starting anyway does not fail loudly; it enforces every per-key limit
+ * N times over, which then reads as "the limit did not work".
+ *
+ * Redis is checked by PING with a hard bound, not merely for being configured:
+ * a configured-but-unreachable Redis is the failure mode that matters, and an
+ * unbounded connect at boot would hang the start instead of failing it.
+ */
+async function assertMultiProcessPreconditions(
+  topology: ProcessTopology,
+  redisReachable: () => Promise<boolean>,
+): Promise<void> {
+  if (!topology.multiProcess) return;
+  if (process.platform !== "linux") {
+    throw Object.assign(
+      new Error(
+        `CARTETHYIA_PROCESS_COUNT=${topology.count} requires Linux (SO_REUSEPORT); ` +
+          `this process is on ${process.platform}`,
+      ),
+      { code: "multi_process_unsupported_platform" },
+    );
+  }
+  if (resolveDbMode() !== "full") {
+    throw Object.assign(
+      new Error(
+        `CARTETHYIA_PROCESS_COUNT=${topology.count} requires CARTETHYIA_DB_MODE=full (PostgreSQL); ` +
+          "two processes on one SQLite file corrupt it — there is no cross-process lock in the driver",
+      ),
+      { code: "multi_process_requires_postgres" },
+    );
+  }
+  const reachable = await redisReachable();
+  if (!reachable) {
+    throw Object.assign(
+      new Error(
+        `CARTETHYIA_PROCESS_COUNT=${topology.count} requires a REACHABLE Redis: admission counters, ` +
+          "quotas, and cooldowns are per-process without one, so every per-key limit would be " +
+          `enforced ${topology.count} times over`,
+      ),
+      { code: "multi_process_requires_redis" },
+    );
+  }
+}
 
 export async function buildProductionDeps(): Promise<ProductionDeps> {
   const startupStartedAt = performance.now();
   const startupMemoryBefore = process.memoryUsage();
+  // Resolved first and validated before any connection is opened: a
+  // half-configured multi-process deploy that starts anyway looks healthy
+  // until a per-key limit is enforced N times over.
+  const topology = resolveProcessTopology();
+  await assertMultiProcessPreconditions(topology, redisIsReachable);
   const handle = await measureStartupPhase("database-connect", bootDatabase);
   const db = handle.db;
   // One rule, no mode flag: REDIS_URL set → shared client, unset → memory.
@@ -146,9 +226,8 @@ export async function buildProductionDeps(): Promise<ProductionDeps> {
     await ensureMigrated();
     // Pool sizing is an external-server concern; the embedded backend has no
     // connection budget to fit into.
-    if (handle.kind === "pg") await assertPoolFitsServerCapacity(poolMaxFromEnv());
+    if (handle.kind === "pg") await assertPoolFitsServerCapacity(poolMaxFromEnv(), topology.count);
   });
-  await measureStartupPhase("default-gateway-key-recovery", () => recoverMissingDefaultGatewayApiKeys(db));
   await measureStartupPhase("provider-seed", () => seedBundledProviders(db));
   // Boot-only: retire global rows for providers the bundle has dropped, so a
   // retired provider cannot linger as a card the console can no longer delete.
@@ -168,6 +247,9 @@ export async function buildProductionDeps(): Promise<ProductionDeps> {
   await measureStartupPhase("bundled-model-seed", () =>
     seedBundledModels(db, bundledCatalog.modelsByProvider),
   );
+  // The boot seed above is unconditional, so record it: the snapshot builder's
+  // first rebuild would otherwise re-seed an identical catalog.
+  markCatalogSeeded();
   const snapshotService = new InMemoryRouteSnapshotService(
     createDatabaseSnapshotBuilder(db, () => refreshActiveProviderCatalogs(db, registry)),
   );
@@ -175,31 +257,21 @@ export async function buildProductionDeps(): Promise<ProductionDeps> {
     redis ? new RedisAdmissionController(redis) : undefined,
     redis,
   );
-  const readRoutingAccountInflight = async (
-    providerId: string,
-    tenantId: string | null,
-  ): Promise<readonly { accountId: string; inflight: number }[]> => {
-    if (providerId === "" || tenantId === null) return [];
-    const snapshot = await routingEngine.accountInflightSnapshot();
-    const accounts = await new DrizzleProviderCatalogStore(db, {
-      telemetryBuffer,
-      bundledModelCatalog: bundledCatalog,
-      providerRegistry: registry,
-      outboundFetchFor: async () => ({ fetch: networkBindingFactory.fetch(undefined, tenantId) }),
-      snapshotInvalidator: snapshotService,
-    }).listAccounts(tenantId, providerId);
-    const owned = new Set(accounts.map((account) => account.id));
-    const totals = new Map<string, number>();
-    for (const [bucket, count] of snapshot) {
-      const prefix = `${providerId}:`;
-      if (!bucket.startsWith(prefix)) continue;
-      const accountId = bucket.slice(bucket.lastIndexOf(":") + 1);
-      if (!owned.has(accountId)) continue;
-      totals.set(accountId, (totals.get(accountId) ?? 0) + count);
-    }
-    return [...totals].map(([accountId, inflight]) => ({ accountId, inflight }));
-  };
+  // Peer processes' settings mutations arrive here. Subscribed once for the
+  // process: the revision counter is process-global, and the handler only
+  // moves it forward.
+  subscribePeerSettingsRevisions();
   const usageFlush = new UsageFlushBuffer(db);
+  // Auth reads lifetime usage to seed the admission counter. The persisted
+  // value lags by up to one flush interval, so hand it the in-flight deltas
+  // too — otherwise the seed is systematically under what has actually been
+  // spent, worst exactly when the key is busiest.
+  setPendingUsageSource((apiKeyId) => usageFlush.pendingFor(apiKeyId));
+  // Health audit rows are append-only and read by nobody in dispatch, so they
+  // are buffered out of the request. The status write they accompany stays
+  // synchronous — routing reads it.
+  const healthEventFlush = new HealthEventFlushBuffer(db);
+  setHealthEventBuffer(healthEventFlush);
   const admissionStore = redis
     ? new RedisAdmissionCounterStore(redis)
     : new InMemoryAdmissionCounterStore();
@@ -233,6 +305,13 @@ export async function buildProductionDeps(): Promise<ProductionDeps> {
       const children = await store.sumChildrenConsumed(apiKeyId);
       return (row.lifetimeTokensConsumed ?? 0) + children;
     },
+    // Slack above every key's concurrency limit. A tenant preference an
+    // operator sets in the runtime settings modal, falling back to the
+    // deployment default so an unset row does not silently lose the allowance.
+    (tenantId) =>
+      preferencesReaderFor(db)
+        .readPreferences(tenantId)
+        .then((prefs) => prefs?.concurrencyTolerance ?? resolveConcurrencyTolerance()),
   );
   const ipStore = redis
     ? new RedisIpAbuseStore(redis)
@@ -240,22 +319,19 @@ export async function buildProductionDeps(): Promise<ProductionDeps> {
   const ipAbuseProtection = new IpAbuseProtectionService(ipStore, undefined, {
     maxRequestsPerWindow: resolveIpRateLimit(),
   });
-  // Graduated model-abuse strikes: a client that keeps requesting models
-  // outside its access is warned, then banned. Redis-backed when available so
-  // the ban survives a restart and is shared across instances; in-memory
-  // otherwise, where a restart clears it.
-  const modelAbuseStore = redis ? new RedisModelAbuseStore(redis) : new InMemoryModelAbuseStore();
-  const modelStrikes = new ModelStrikeService(modelAbuseStore, {
-    threshold: resolveModelStrikeThreshold(),
-    windowMs: resolveModelStrikeWindowMs(),
-    banTtlMs: resolveModelBanTtlMs(),
-  });
+
   const readiness = () => checkReadiness(db, redis, resolveRedisBackend(redis));
   // One list covers every periodic task: a small deployment can cut the
   // heaviest sweeps (quota refresh, OAuth refresh, client-version polling)
   // without the codebase growing a flag per task.
+  // Leases coordinate the SHARED sweeps across processes. Absent Redis there is
+  // nothing to coordinate with, and the registry's local one-at-a-time rule is
+  // the correct (and only) guard.
   const scheduledTasks = new ScheduledTaskRegistry(
     readList("CARTETHYIA_DISABLED_TASKS", CONFIG_SPEC.CARTETHYIA_DISABLED_TASKS) ?? [],
+    {
+      ...(redis ? { lease: createRedisMaintenanceLeaseStore(redis) } : {}),
+    },
   );
   if (redis) {
     scheduledTasks.register({
@@ -267,6 +343,12 @@ export async function buildProductionDeps(): Promise<ProductionDeps> {
   scheduledTasks.register({
     name: "account-health-sweep",
     intervalMs: 30_000,
+    // Offsets the pass from lease-sweep and runtime-metrics, which share the
+    // same cadence: under the registry's single-flight gate, aligned ticks
+    // make the 30s tasks skip each other when one runs long.
+    initialDelayMs: 5_000,
+    // Recovers cooldowns deployment-wide and invalidates the shared snapshot.
+    shared: true,
     run: async () => {
       const recovered = await sweepExpiredCooldowns(db);
       const poolRecovered = await sweepExpiredPoolCooldowns(db);
@@ -278,16 +360,27 @@ export async function buildProductionDeps(): Promise<ProductionDeps> {
   scheduledTasks.register({
     name: "telemetry-payload-cleanup",
     intervalMs: 15 * 60_000,
+    // Deletes payload frames for every tenant: two passes over the same
+    // batches is duplicated work, not speedup.
+    shared: true,
     run: () => payloadCapture.cleanupExpired(),
   });
   scheduledTasks.register({
     name: "console-session-sweep",
-    intervalMs: 60 * 60_000,
+    // Sessions live 48 h, so an hourly sweep deleted nothing 47 times out of
+    // 48 — each pass a full scan of the session table for rows that cannot yet
+    // be expired. Half the session lifetime is the point where a pass can
+    // actually find work, and still leaves a full grace period after it.
+    intervalMs: 12 * 60 * 60_000,
+    shared: true,
     run: () => deleteExpiredSessions(db),
   });
   scheduledTasks.register({
     name: "telemetry-retention",
     intervalMs: 6 * 60 * 60_000,
+    // Retention deletes rows and files for the whole deployment; a second
+    // concurrent pass would churn the same batches.
+    shared: true,
     run: () =>
       telemetryStore.pruneTelemetry(
         new Date(Date.now() - resolveTelemetryRetentionDays() * 24 * 60 * 60_000),
@@ -295,6 +388,22 @@ export async function buildProductionDeps(): Promise<ProductionDeps> {
   });
   const telemetryBuffer = new TelemetryBatchBuffer(db);
   const poolSelector = new NetworkPoolSelector(redis);
+  // Replay the provider cooldown markers the previous process recorded
+  // (`network_pools.provider_cooldowns`). Without this a restart made dispatch
+  // forget every egress the upstream was still refusing: the flags are
+  // process-local otherwise, so the pool re-entered rotation and took 429s the
+  // first request after boot re-discovered. Expired entries are dropped by the
+  // restore itself. Best-effort: a failed read leaves selection matching what
+  // a fresh deployment would do.
+  try {
+    const restored = await restoreProviderCooldownMarkers(poolSelector, db);
+    const replayed = await restorePoolProbeVerdicts(poolSelector, db);
+    if (restored > 0 || replayed > 0) {
+      log.info("[pool-selector] restored provider cooldown state", { mirrored: restored, probeVerdictsApplied: replayed });
+    }
+  } catch (error) {
+    log.warn("[pool-selector] provider cooldown restore failed", { error: String(error) });
+  }
   const poolAgentResolver = new PoolAgentResolver(
     new DrizzleNetworkPoolLoader(db),
     { ssrfPolicy, db },
@@ -304,6 +413,49 @@ export async function buildProductionDeps(): Promise<ProductionDeps> {
     undefined,
     poolAgentResolver,
   );
+  // The account-inflight reader the console queries. It lives after the deps
+  // it closes over (telemetry buffer, binding factory), so the closure never
+  // touches a TDZ binding; it also reuses one catalog store per tenant instead
+  // of constructing a fresh store object on every console read.
+  let lastInflightTenant = "";
+  let lastInflightStore: DrizzleProviderCatalogStore | undefined;
+  const readRoutingAccountInflight = async (
+    providerId: string,
+    tenantId: string | null,
+  ): Promise<readonly { accountId: string; inflight: number }[]> => {
+    if (providerId === "" || tenantId === null) return [];
+    if (tenantId !== lastInflightTenant || lastInflightStore === undefined) {
+      lastInflightStore = new DrizzleProviderCatalogStore(db, {
+        telemetryBuffer,
+        bundledModelCatalog: bundledCatalog,
+        providerRegistry: registry,
+        outboundFetchFor: async () => ({ fetch: networkBindingFactory.fetch(undefined, tenantId) }),
+        snapshotInvalidator: snapshotService,
+      });
+      lastInflightTenant = tenantId;
+    }
+    const accounts = await lastInflightStore.listAccounts(tenantId, providerId);
+    const owned = new Set(accounts.map((account) => account.id));
+    // Scoped read: only the provider's own candidates for this tenant are
+    // queried, so the console read costs one exact MGET over the accounts it
+    // is about to report on — not a fleet-wide `KEYS` scan whose cost is the
+    // size of every bucket every process ever wrote.
+    const routeSnapshot = await snapshotService.getSnapshot();
+    const ownedCandidates = routeSnapshot.candidates.filter(
+      (candidate) =>
+        candidate.provider_id === providerId &&
+        candidate.provider_account_id !== undefined &&
+        owned.has(candidate.provider_account_id),
+    );
+    const snapshot = await routingEngine.accountInflightSnapshot(ownedCandidates);
+    const totals = new Map<string, number>();
+    for (const [bucket, count] of snapshot) {
+      const accountId = bucket.slice(bucket.lastIndexOf(":") + 1);
+      if (!owned.has(accountId)) continue;
+      totals.set(accountId, (totals.get(accountId) ?? 0) + count);
+    }
+    return [...totals].map(([accountId, inflight]) => ({ accountId, inflight }));
+  };
   // Runtime gauges (memory + bounded-collection sizes) sampled on the shared
   // maintenance cadence. The sampler reads live sizes through closures so the
   // observability layer never holds direct references to routing/pool state.
@@ -311,9 +463,19 @@ export async function buildProductionDeps(): Promise<ProductionDeps> {
     routingRoundRobinEntries: () => routingEngine.roundRobinEntries(),
     ipAbuseKeys: () => (ipStore instanceof InMemoryIpAbuseStore ? ipStore.keyCount() : 0),
     quotaCacheEntries: () => quotaCacheSize(),
+    modelCatalogEntries: () => modelCatalogCacheSize(),
     // Late-bound via bindInFlight once the request state store exists.
     inFlight: () => 0,
+    // The buffer is built below; the closure keeps the sampler from holding a
+    // reference during construction.
+    telemetryBacklog: () => telemetryBuffer?.snapshot(),
   });
+  // One sample NOW, not on the first tick. The headroom guard reads
+  // `memorySnapshot()` on every gateway request and treats `undefined` as
+  // "unknown" — so without this the guard would spend its first interval
+  // (seconds, at the configured cadence) unable to shed at all, which is
+  // exactly the window a cold start is most likely to be short of memory.
+  runtimeMetricsSampler.sample();
   scheduledTasks.register({
     name: "runtime-metrics",
     intervalMs: readInt(
@@ -324,13 +486,17 @@ export async function buildProductionDeps(): Promise<ProductionDeps> {
   });
   scheduledTasks.register({
     name: "pool-agent-sweep",
-    intervalMs: 60_000,
+    // `resolveAgent` already self-sweeps every 30 s, so a 1 min timer adds a
+    // second pass that almost always finds nothing to release. 5 min is well
+    // inside the idle timeout this exists to enforce, and outside the path
+    // that already runs.
+    intervalMs: 5 * 60_000,
     run: () => poolAgentResolver.sweepIdleAgents(),
   });
   const oauthRefreshService = new OAuthRefreshService(db);
-  // Converge accounts an earlier build parked on a dead refresh grant: an
-  // account whose stored access token is still usable becomes a static token
-  // (and returns to rotation) instead of staying disabled for re-auth.
+  // Converge accounts parked on a dead refresh grant: an account whose stored
+  // access token is still usable becomes a static token (and returns to
+  // rotation) instead of staying disabled for re-auth.
   await measureStartupPhase("static-token-reconciliation", () =>
     reconcileStaticTokenAccounts(db),
   );
@@ -340,7 +506,12 @@ export async function buildProductionDeps(): Promise<ProductionDeps> {
   // credential — no upstream call — so it runs often and cheaply.
   scheduledTasks.register({
     name: "account-enrichment-sweep",
-    intervalMs: 30_000,
+    // Converges via `identity_checked_at`: once every stored credential has
+    // been parsed, the listing query returns nothing — a 30 s timer would run
+    // that empty query forever, two million times a year. 10 min is still
+    // instant for the case that matters (a batch import, where the label and
+    // email show up on the next tick) and costs nothing when idle.
+    intervalMs: 10 * 60_000,
     run: () => accountIdentitySweep({ db }),
   });
   scheduledTasks.register({
@@ -395,11 +566,10 @@ export async function buildProductionDeps(): Promise<ProductionDeps> {
   // the same pass (one attempt per account per day, guarded by a day
   // marker), so no second timer duplicates the credential resolution.
   //
-  // Registered in **every** mode, not only when Redis is present. It used to
-  // sit behind `if (redis)`, which quietly cost Lite two things: proactive
-  // quota warming, and the check-in ride-along above that claims the
-  // once-per-day WorkBuddy/CodeBuddy credit grant. The whole sweep chain
-  // already accepts `RedisClient | undefined` and falls back to the
+  // Registered in **every** mode, not only when Redis is present: gating it on
+  // Redis would cost Lite proactive quota warming and the check-in ride-along
+  // above that claims the once-per-day WorkBuddy/CodeBuddy credit grant. The
+  // whole sweep chain accepts `RedisClient | undefined` and falls back to the
   // in-process TTL cache and an in-process day marker, so Redis is an
   // optimization here rather than a precondition — which is exactly what
   // Lite is for.
@@ -416,6 +586,14 @@ export async function buildProductionDeps(): Promise<ProductionDeps> {
         providerRegistry: registry,
         resolveCredential: quotaResolveCredential,
         snapshotInvalidator: snapshotService,
+        // Without this the sweep hands each collector the raw stored secret.
+        // For `cline` that means an `sk_...` key reaching the OAuth branch,
+        // which prepends `workos:` and is refused with "please make sure
+        // you're using the latest version of Cline and re-authenticate" — so
+        // every sweep cools a working account with `quota_fetch_failed` while
+        // the same account refreshes fine from the console, which binds the
+        // same marker through `createQuotaRefreshDeps`.
+        markApiKeyCredential: markProviderApiKeyCredential,
         // Below the 60 s interval: a budget longer than the tick guarantees
         // skip/burst under load instead of steady progress.
         passBudgetMs: 45_000,
@@ -436,9 +614,11 @@ export async function buildProductionDeps(): Promise<ProductionDeps> {
   // an account unhealthy — a growth endpoint that 404s is a display miss, not a
   // dispatch failure.
   //
-  // Hourly, not minute-cadenced: each claim is once per account per day, and a
-  // task that ticks every minute would spend its whole budget re-reading the
-  // day marker.
+  // Daily, not hourly: each claim is once per account per day and is
+  // ledger-guarded, so at an hourly cadence 23 of every 24 passes are a full
+  // scan of active accounts plus a ledger read per account that resolves to
+  // nothing. Once a day is the shortest interval where a pass can still find
+  // work, which is the only reason to run at all.
   const buddyTaskDeps = {
     db,
     resolveCredential: quotaResolveCredential,
@@ -449,39 +629,15 @@ export async function buildProductionDeps(): Promise<ProductionDeps> {
   };
   scheduledTasks.register({
     name: "buddy-streak",
-    intervalMs: 60 * 60_000,
+    intervalMs: 24 * 60 * 60_000,
     initialDelayMs: 5 * 60_000,
     run: () => buddyStreakTask(buddyTaskDeps),
   });
   scheduledTasks.register({
-    name: "buddy-redeem",
-    intervalMs: 60 * 60_000,
-    initialDelayMs: 8 * 60_000,
-    run: () => buddyRedeemTask(buddyTaskDeps),
-  });
-  scheduledTasks.register({
-    name: "buddy-lottery",
-    intervalMs: 60 * 60_000,
-    initialDelayMs: 11 * 60_000,
-    run: () => buddyLotteryTask(buddyTaskDeps),
-  });
-  scheduledTasks.register({
-    name: "buddy-travel",
-    intervalMs: 60 * 60_000,
-    initialDelayMs: 14 * 60_000,
-    run: () => buddyTravelTask(buddyTaskDeps),
-  });
-  scheduledTasks.register({
     name: "buddy-adopt",
-    intervalMs: 60 * 60_000,
+    intervalMs: 24 * 60 * 60_000,
     initialDelayMs: 17 * 60_000,
     run: () => buddyAdoptTask(buddyTaskDeps),
-  });
-  scheduledTasks.register({
-    name: "buddy-trial",
-    intervalMs: 6 * 60 * 60_000,
-    initialDelayMs: 20 * 60_000,
-    run: () => buddyTrialTask(buddyTaskDeps),
   });
   // Growth-activity report: the `/v2/report` batch that lights the login streak
   // and scores the daily growth event. Once a day with its own ledger — it used
@@ -521,12 +677,12 @@ export async function buildProductionDeps(): Promise<ProductionDeps> {
     }),
     networkBindingFactory,
     ipAbuseProtection,
-    modelStrikes,
     readiness,
     scheduledTasks,
     poolAgentResolver,
     telemetryBuffer,
     usageFlush,
+    healthEventFlush,
     poolSelector,
     admissionService,
     trustedProxyBoundary: resolveTrustedProxyBoundary(),

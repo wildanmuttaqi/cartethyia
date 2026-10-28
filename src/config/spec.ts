@@ -90,10 +90,9 @@ export const CONFIG_SPEC = {
   CARTETHYIA_SERVER_MAX_BODY_BYTES: {
     kind: "int",
     // A 500K-token context is roughly 2 MB of text, so 4 MB admits every real
-    // request while halving the worst-case hold. Worst-case retained bytes
-    // across the process is `PROCESS_CONCURRENCY_CAP × this`, so on a 1 GB box
-    // the product should stay within about 40% of the limit; an operator with
-    // larger payloads raises this.
+    // request while halving the worst-case hold. How many may be in flight is
+    // admission's job, so an operator with larger payloads raises this and
+    // sets the ceiling in Settings.
     default: 4 * 1024 * 1024,
     min: 1024,
     max: Number.MAX_SAFE_INTEGER,
@@ -110,6 +109,27 @@ export const CONFIG_SPEC = {
     min: 0,
     max: 600_000,
   },
+  // Optional ceiling on in-flight requests per process. Left unset, the limit
+  // is derived from the memory limit and the body ceiling (see
+  // config/resources.ts): 2 GiB/4 MiB → 64, 512 MiB/4 MiB → 16, 256 MiB/16 MiB
+  // → 2. Set it to admit more than memory alone would allow — which is the
+  // operator's call, and is reported rather than corrected — or less, to keep
+  // a slow upstream from being handed more concurrency than it can serve.
+  // Optional-int, not int-with-a-zero-default: "unset" and "explicitly zero"
+  // must not be the same thing. Zero is not a valid ceiling, so a default of 0
+  // would need a second sentinel to mean "derive".
+  // Slack above each key's concurrency limit. Effective ceiling is
+  // limit + tolerance; only requests past it are refused.
+  CARTETHYIA_CONCURRENCY_TOLERANCE: { kind: "optional-int", min: 0, max: 1024 },
+  // How many gateway processes serve this deployment, and which one this is.
+  // Count > 1 requires Linux, CARTETHYIA_DB_MODE=full, and a REACHABLE Redis —
+  // checked at boot, because a half-configured multi-process deploy starts
+  // fine and then enforces every per-key limit N times over. Lite stays
+  // single-process: two processes on one SQLite file corrupt it.
+  CARTETHYIA_PROCESS_COUNT: { kind: "int", default: 1, min: 1, max: 16 },
+  // Which process this is (0 – count-1). Mandatory when count > 1: a process
+  // that does not know its index cannot own a shard of anything.
+  CARTETHYIA_PROCESS_INDEX: { kind: "int", default: 0, min: 0, max: 15 },
   // Optional secret for the operator drain endpoint (`POST /admin/drain`). When
   // set, a process can be stopped gracefully on platforms where a catchable
   // signal cannot be delivered to it (notably Windows, where `process.kill` of
@@ -117,6 +137,7 @@ export const CONFIG_SPEC = {
   // requires a loopback peer and a timing-safe token match; unset = the route
   // does not exist.
   CARTETHYIA_DRAIN_TOKEN: { kind: "optional-text" },
+  CARTETHYIA_INSTALL_ID_DIR: { kind: "optional-text" },
 
   // Network policy (trusted proxy + SSRF)
   TRUSTED_PROXY_CIDRS: { kind: "list" },
@@ -130,9 +151,12 @@ export const CONFIG_SPEC = {
     min: 1,
     max: Number.MAX_SAFE_INTEGER,
   },
-  // Opt-in forced garbage collection. Off by default: see
-  // `observability/runtime-metrics.ts` — a forced collection is not
-  // reclamation, and the synchronous form stalls concurrent requests.
+  // Opt-in forced garbage collection under memory pressure. Off by default:
+  // see `observability/runtime-metrics.ts` — a forced collection is not
+  // reclamation, and a collection that runs while requests are in flight adds
+  // a latency spike. This gates the pressure path only; idle reclaim runs
+  // unconditionally, because reclaiming when nothing is in flight stalls
+  // nothing.
   CARTETHYIA_FORCED_GC: { kind: "flag" },
   // How often runtime gauges (memory + bounded-collection sizes) are sampled.
   CARTETHYIA_RUNTIME_METRICS_INTERVAL_MS: {
@@ -148,6 +172,15 @@ export const CONFIG_SPEC = {
    */
   CARTETHYIA_DISABLED_TASKS: { kind: "list" },
 
+  /**
+   * How long a day's telemetry is kept, in days.
+   *
+   * Whole raw event files past this age are removed. No summary or compacted
+   * form replaces the individual requests.
+   *
+   * This is the knob that decides how long the request list, per-request
+   * filters, and the detail drawer stay complete.
+   */
   CARTETHYIA_TELEMETRY_RETENTION_DAYS: { kind: "int", default: 30, min: 3, max: 365 },
   CARTETHYIA_TELEMETRY_PAYLOAD_MAX_BYTES: {
     kind: "int",
@@ -157,7 +190,14 @@ export const CONFIG_SPEC = {
   },
 
   // Upstream request timeout + retry backoff
-  CARTETHYIA_UPSTREAM_TIMEOUT_MS: { kind: "int", default: 120_000, min: 5_000, max: 600_000 },
+  //
+  // Strictly under 90s: a client whose own deadline is 90s must never be
+  // waiting on a gateway that is still holding a request open past it, and a
+  // provider that has not answered within 75s is not answering — the request
+  // is queued upstream or the egress is stuck, and the honest move is to fail
+  // over to another account rather than burn the caller's whole budget on one.
+  // 120s outlived the clients that call this, which cap lower.
+  CARTETHYIA_UPSTREAM_TIMEOUT_MS: { kind: "int", default: 75_000, min: 5_000, max: 600_000 },
   CARTETHYIA_STREAM_STALL_TIMEOUT_MS: {
     kind: "int",
     default: 360_000,
@@ -181,9 +221,38 @@ export const CONFIG_SPEC = {
   CARTETHYIA_ACCOUNT_QUOTA_COOLDOWN_MS: { kind: "int", default: 3_600_000, min: 0, max: 86_400_000 },
   CARTETHYIA_ACCOUNT_MODEL_CAPACITY_COOLDOWN_MS: { kind: "int", default: 120_000, min: 0, max: 86_400_000 },
   CARTETHYIA_ACCOUNT_TRANSIENT_COOLDOWN_MS: { kind: "int", default: 30_000, min: 0, max: 86_400_000 },
-  CARTETHYIA_ACCOUNT_UNCLASSIFIED_COOLDOWN_MS: { kind: "int", default: 60_000, min: 0, max: 86_400_000 },
+  /**
+   * An unmapped upstream failure cools the account down for 15 minutes.
+   *
+   * A shorter window puts the account straight back into rotation and re-dials
+   * an upstream that has just answered something this gateway does not
+   * understand — so the same unknown error is retried every minute, and an
+   * account that is actually broken contributes a steady stream of failed
+   * attempts instead of one. Fifteen minutes is long enough for a transient
+   * provider condition to clear on its own and short enough that no operator
+   * action is needed to recover it. It is still a cooldown with a deadline,
+   * never `disabled`, so nothing here can strand an account.
+   */
+  CARTETHYIA_ACCOUNT_UNCLASSIFIED_COOLDOWN_MS: {
+    kind: "int",
+    default: 900_000,
+    min: 0,
+    max: 86_400_000,
+  },
   CARTETHYIA_ACCOUNT_COOLDOWN_ESCALATION_MAX_MS: { kind: "int", default: 3_600_000, min: 0, max: 86_400_000 },
   CARTETHYIA_POOL_COOLDOWN_MS: { kind: "int", default: 120_000, min: 0, max: 86_400_000 },
+  /**
+   * A provider-scoped egress cooldown (a 429 the pool itself earned) when the
+   * upstream named no window. Default 1h: an egress that exhausted a
+   * request-counted allowance stays refused long past minute 15, and a short
+   * default sent the pool back into rotation to be refused again.
+   */
+  CARTETHYIA_POOL_PROVIDER_RATE_LIMIT_COOLDOWN_MS: {
+    kind: "int",
+    default: 3_600_000,
+    min: 0,
+    max: 86_400_000,
+  },
   CARTETHYIA_ACCOUNT_AUTH_REJECTED_COOLDOWN_MS: { kind: "int", default: 300_000, min: 0, max: 86_400_000 },
   CARTETHYIA_ACCOUNT_POLICY_BLOCK_COOLDOWN_MS: { kind: "int", default: 300_000, min: 0, max: 86_400_000 },
   CARTETHYIA_ACCOUNT_DISABLED_RECOVERY_MS: { kind: "int", default: 86_400_000, min: 0, max: 604_800_000 },
@@ -194,12 +263,6 @@ export const CONFIG_SPEC = {
 
   // Security (encryption key, public origin, abuse ceiling)
   IP_RATE_MAX_PER_WINDOW: { kind: "int", default: 240, min: 1, max: Number.MAX_SAFE_INTEGER },
-  // Invalid-model attempts inside the sliding window that ban the client
-  // address, how long an attempt stays countable, and how long the ban lasts.
-  // A valid request does not reset the window.
-  CARTETHYIA_MODEL_STRIKE_THRESHOLD: { kind: "int", default: 10, min: 1, max: 100 },
-  CARTETHYIA_MODEL_STRIKE_WINDOW_MS: { kind: "int", default: 1_800_000, min: 1_000, max: 86_400_000 },
-  CARTETHYIA_MODEL_BAN_TTL_MS: { kind: "int", default: 21_600_000, min: 1_000, max: 604_800_000 },
   CARTETHYIA_ENCRYPTION_KEY: {
     kind: "required",
     error:
@@ -214,6 +277,15 @@ export const CONFIG_SPEC = {
   // Provider OAuth hosts
   CARTETHYIA_KIMI_OAUTH_HOST: { kind: "text", default: DEFAULT_KIMI_OAUTH_HOST },
   /**
+   * Loopback port the browser-OAuth callback listener binds.
+   *
+   * Configurable because the default is a fixed number: a busy port would strand
+   * the operator, since the login could not start and there would be no way to
+   * move it. Codex's authorization server still expects 59653, so changing this
+   * only helps the providers whose redirect URI is not allowlisted upstream.
+   */
+  CARTETHYIA_OAUTH_CALLBACK_PORT: { kind: "int", default: 59_653, min: 1_024, max: 65_535 },
+  /**
    * Kimi Code quota/billing base. The `/usages` path joins on this, so the
    * default includes the `/v1` segment the bundled provider metadata implies.
    */
@@ -225,6 +297,17 @@ export const CONFIG_SPEC = {
    * an operator on one has no other way to point the login at it.
    */
   CARTETHYIA_GITHUB_ENTERPRISE_DOMAIN: { kind: "text", default: "" },
+  /**
+   * Free-tier OpenCode ids the listing still advertises but upstream refuses.
+   * Replaces the bundled list outright; the single token `none` trusts the
+   * listing completely.
+   *
+   * The bundled ids were measured, not declared — upstream can start serving
+   * a refused id or start refusing a served one at any time, and either way
+   * the correct answer stopped being the one compiled in. This is the escape
+   * hatch that needs no deploy.
+   */
+  CARTETHYIA_OPENCODE_UNAVAILABLE_FREE: { kind: "list" },
 } as const satisfies Readonly<Record<string, ConfigEntry>>;
 
 // ─── Spec readers ───────────────────────────────────────────────────────────

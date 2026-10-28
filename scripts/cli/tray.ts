@@ -1,213 +1,216 @@
-import { spawn, type ChildProcess } from "node:child_process";
-import { createInterface } from "node:readline";
-import SysTray from "systray2";
 import { resolvePackagePath } from "../../src/config/package-paths";
+import { resolvePort } from "../../src/config/runtime";
+import { ensureDrainToken, attachGateway, stopAttachedGateway, type RunningGateway } from "./instance";
+import { startGateway } from "./gateway";
+import { stopGateway } from "./gateway";
+import { readInstalledVersion } from "./version";
+import { reportTrayStartup } from "./startup-signal";
+import { createTray } from "./tray/index";
+import { openUrl } from "./background";
+import { exportBackup, resetConsoleAccount } from "./admin";
+import { acquireController, inheritedControllerHandoff } from "./controller";
+import { restoreControllerAfterFailedHandoff } from "./controller";
 
 /**
- * One tray row. `action` rows report their id on click; separators are drawn
- * but never fire.
- */
-export type TrayItem =
-  | { readonly kind: "action"; readonly id: string; readonly title: string; readonly enabled?: boolean }
-  | { readonly kind: "separator" };
-
-export interface TrayOptions {
-  readonly iconPath: string;
-  readonly tooltip: string;
-  readonly items: readonly TrayItem[];
-  readonly onSelect: (id: string) => void;
-  readonly onExit: () => void;
-}
-
-export interface Tray {
-  /** Resolves once the icon is on screen and clicks can arrive. */
-  ready(): Promise<void>;
-  /** Replaces the title and enabled state of an existing row. */
-  update(id: string, title: string, enabled?: boolean): void;
-  setTooltip(text: string): void;
-  /** Removes the icon. Idempotent. */
-  close(): Promise<void>;
-}
-
-/**
- * Windows tray: a PowerShell NotifyIcon driven over JSON lines.
+ * Runs the gateway with a tray icon. The tray is platform-specific (`tray/`):
+ * on Windows it is a PowerShell NotifyIcon, because a Node tray library leaves
+ * an empty console tab open for the tray's whole lifetime, and that window is
+ * owned by Windows Terminal — not by this process, so it cannot be found and
+ * hidden from inside.
  *
- * `systray2` on Windows leaves the spawning process attached to a console, so
- * Windows Terminal keeps an empty tab open for the tray's whole lifetime — the
- * window cannot be hidden from inside the process because it is owned by the
- * terminal, and `MainWindowHandle` reads 0 so it cannot be found and closed
- * either. A PowerShell NotifyIcon started with `-WindowStyle Hidden` owns no
- * console at all, which is the only arrangement that shows an icon and no
- * window.
+ * The gateway it starts is detached, which is what makes the health poll below
+ * necessary — see {@link TRAY_HEALTH_POLL_MS}.
  */
-class WindowsTray implements Tray {
-  readonly #process: ChildProcess;
-  readonly #onSelect: (id: string) => void;
-  readonly #onExit: () => void;
-  readonly #index = new Map<string, number>();
-  #ready: Promise<void>;
-  #closed = false;
 
-  constructor(options: TrayOptions) {
-    this.#onSelect = options.onSelect;
-    this.#onExit = options.onExit;
+/**
+ * How often the tray asks whether the gateway is still answering.
+ *
+ * 10 s: often enough that an operator who stops the gateway by hand sees the
+ * icon go away, and far below the cost of a request. A detached gateway can no
+ * longer be waited on, so this poll is the only signal left.
+ */
+const TRAY_HEALTH_POLL_MS = 10_000;
 
-    this.#process = spawn(
-      "powershell.exe",
-      [
-        "-NoProfile",
-        "-NonInteractive",
-        "-ExecutionPolicy",
-        "Bypass",
-        "-WindowStyle",
-        "Hidden",
-        "-InputFormat",
-        "Text",
-        "-OutputFormat",
-        "Text",
-        "-File",
-        resolvePackagePath("scripts", "cli", "tray.ps1"),
-        "-IconPath",
-        options.iconPath,
-        "-Tooltip",
-        options.tooltip,
-      ],
-      { windowsHide: true, stdio: ["pipe", "pipe", "pipe"] },
-    );
+/**
+ * How long the gateway must be unreachable before the tray closes.
+ *
+ * A count of consecutive misses was the wrong shape: a gateway that is
+ * answering, but slowly, misses every probe exactly like a gateway that is
+ * gone. Under load — a large prompt, a synchronous GC — `/health` cannot
+ * answer inside the probe timeout, so three polls in a row missed and the tray
+ * closed itself while the gateway was still serving. `carte --tray` looked
+ * fine only because it starts idle and never carries that load.
+ *
+ * Bounded by wall-clock instead: a gateway that is truly gone stops being
+ * reachable immediately and stays that way, so it still closes the tray
+ * promptly, while a gateway that is merely busy keeps answering often enough
+ * to reset the clock. The window is long enough to span a request that runs
+ * to the deadline.
+ */
+const TRAY_HEALTH_UNREACHABLE_BEFORE_CLOSE_MS = 120_000;
 
-    const { promise, resolve, reject } = Promise.withResolvers<void>();
-    this.#ready = promise;
+/**
+ * How long one health probe waits before counting as a miss.
+ *
+ * Short probes are the other half of the same bug: `/health` is served by the
+ * same process that is busy streaming a response, so a 2 s budget failed on a
+ * busy gateway that was perfectly healthy. This is far longer than a healthy
+ * answer takes and far shorter than the poll interval, so it cannot overlap
+ * the next probe.
+ */
+const TRAY_HEALTH_PROBE_TIMEOUT_MS = 15_000;
 
-    const lines = createInterface({ input: this.#process.stdout! });
-    lines.on("line", (line) => {
-      let event: unknown;
-      try {
-        event = JSON.parse(line);
-      } catch {
+export async function startTray(): Promise<void> {
+  const handoff = inheritedControllerHandoff();
+  const controller = acquireController("tray", handoff);
+  const releaseController = (): void => controller.release();
+  const failedHandoff = (): void => {
+    if (handoff) restoreControllerAfterFailedHandoff(handoff);
+  };
+  process.once("exit", failedHandoff);
+  process.once("exit", releaseController);
+  try {
+    await runTray();
+  } finally {
+    process.removeListener("exit", failedHandoff);
+    controller.release();
+    process.removeListener("exit", releaseController);
+  }
+}
+
+async function runTray(): Promise<void> {
+  const port = resolvePort();
+  const drainToken = ensureDrainToken();
+  const dashboardUrl = `http://127.0.0.1:${port}/console`;
+  const releasesUrl = "https://github.com/risunCodex/Cartethyia/releases";
+  const currentVersion = await readInstalledVersion();
+
+  let gateway: Bun.Subprocess | null = null;
+  let adoptedGateway: RunningGateway | null = null;
+  let closing = false;
+  let resetArmed = false;
+  let closePromise: Promise<void> | undefined;
+
+  const tray = createTray({
+    iconPath: resolvePackagePath(
+      "scripts",
+      "cli",
+      "tray",
+      "assets",
+      process.platform === "win32" ? "cartethyia.ico" : "cartethyia.png",
+    ),
+    tooltip: `Cartethyia ${currentVersion}`,
+    items: [
+      // Version row is informational; clicking it opens the releases page so
+      // the operator can decide for themselves. No background check: the tray
+      // used to poll the registry on open and the result was a cue the user
+      // did not ask for.
+      { kind: "action", id: "version", title: `Cartethyia ${currentVersion}`, enabled: true },
+      { kind: "separator" },
+      { kind: "action", id: "console", title: `Open Console \u00b7 ${dashboardUrl}` },
+      { kind: "action", id: "reset", title: "Reset console password" },
+      { kind: "action", id: "backup", title: "Backup" },
+      { kind: "separator" },
+      { kind: "action", id: "exit", title: "Exit" },
+    ],
+    onSelect: (id: string) => void handleSelect(id),
+    onExit: () => void close(1),
+  });
+
+  const close = (exitCode = 0): Promise<void> => {
+    if (closePromise) return closePromise;
+    closing = true;
+    closePromise = (async () => {
+      const current: Bun.Subprocess | null = gateway;
+      gateway = null;
+      if (current) await stopGateway(current, port, drainToken);
+      else if (adoptedGateway !== null) await stopAttachedGateway(adoptedGateway, drainToken);
+      await tray.close();
+      process.exitCode = exitCode;
+    })();
+    return closePromise;
+  };
+
+  async function handleSelect(id: string): Promise<void> {
+    if (closing) return;
+    if (id === "exit") return void (await close());
+    if (id === "console") return void (await openUrl(dashboardUrl));
+    if (id === "version") return void (await openUrl(releasesUrl));
+    if (id === "backup") {
+      const result = await exportBackup(port, drainToken);
+      if ("error" in result) {
+        console.error(result.error);
+      } else {
+        console.log(
+          `Backup written to ${result.path} (${(result.bytes / 1024).toFixed(1)} KiB). Telemetry is not included.`,
+        );
+      }
+      return;
+    }
+    if (id === "reset") {
+      // A tray click cannot ask for the typed confirmation the menu uses, so
+      // the first click arms the action and the second one runs it.
+      if (!resetArmed) {
+        resetArmed = true;
+        tray.update("reset", "Reset console password \u00b7 click again to delete", true);
         return;
       }
-      if (event === null || typeof event !== "object" || !("type" in event)) return;
-      if (event.type === "ready") {
-        resolve();
-        return;
-      }
-      if (event.type === "click" && "index" in event && typeof event.index === "number") {
-        for (const [id, index] of this.#index) {
-          if (index === event.index) {
-            this.#onSelect(id);
-            return;
-          }
-        }
-      }
-    });
+      resetArmed = false;
+      tray.update("reset", "Reset console password", true);
+      await resetConsoleAccount(port, drainToken);
+      return;
+    }
+  }
 
-    this.#process.once("error", reject);
-    this.#process.once("exit", () => {
-      if (!this.#closed) this.#onExit();
-      reject(new Error("the tray process exited before it was ready"));
-    });
+  process.once("SIGINT", () => void close());
+  process.once("SIGTERM", () => void close());
 
-    // Rows are added after "started": the script creates its NotifyIcon first
-    // and would drop commands that arrive before it is listening.
-    let index = 0;
-    for (const item of options.items) {
-      if (item.kind === "separator") {
-        this.#send({ action: "add-item", index, title: "-", enabled: false });
-        index += 1;
+  try {
+    await tray.ready();
+    // Detached, unlike every other caller: the gateway must outlive this
+    // process. Attached, it dies with the tray — and the tray dies with the
+    // terminal that launched it, so closing that terminal took the gateway
+    // down too and "Hide to tray" left nothing serving. `stopGateway` drains
+    // over HTTP before it ever reaches for `kill()`, so detaching costs the
+    // exit path nothing: the tray can still stop the gateway on Exit.
+    adoptedGateway = await attachGateway(port, drainToken);
+    if (adoptedGateway === null) gateway = await startGateway(port, drainToken, { detached: true });
+    // The launcher that spawned this tray is blocked on a signal file: it
+    // cannot read our stdio, because the tray is detached. Without this write
+    // it waits out its 60 s deadline and reports a failure for a tray that is
+    // running fine.
+    reportTrayStartup({ status: "ready", url: dashboardUrl });
+    console.log(`Cartethyia is running at ${dashboardUrl}`);
+
+    // The timestamp of the last probe the gateway actually answered, not a
+    // miss counter: a busy gateway answers sometimes, and that must reset the
+    // clock rather than being averaged away with its own silences.
+    let lastSeenAliveAt = Date.now();
+    // A detached child's `exited` never settles on Windows, so the old
+    // `await current.exited` would have parked here forever and the tray would
+    // never notice the gateway going away. Poll its health endpoint instead:
+    // that answers for a process we no longer own, which is the whole point of
+    // detaching it. The probe is the same one startup used, so a gateway that
+    // is up reads as up regardless of who spawned it.
+    while (!closing) {
+      await Bun.sleep(TRAY_HEALTH_POLL_MS);
+      if (closing || gateway === null && adoptedGateway === null) continue;
+      const alive = await fetch(`http://127.0.0.1:${port}/health`, {
+        signal: AbortSignal.timeout(TRAY_HEALTH_PROBE_TIMEOUT_MS),
+      }).then((response) => response.ok).catch(() => false);
+      if (alive) {
+        lastSeenAliveAt = Date.now();
         continue;
       }
-      this.#index.set(item.id, index);
-      this.#send({ action: "add-item", index, title: item.title, enabled: item.enabled ?? true });
-      index += 1;
+      // Only a gateway that has been unreachable for the whole window is
+      // treated as gone. One slow answer inside it is enough to start over.
+      if (Date.now() - lastSeenAliveAt < TRAY_HEALTH_UNREACHABLE_BEFORE_CLOSE_MS) continue;
+      gateway = null;
+      console.error("Cartethyia stopped answering; the tray is closing.");
+      await close(1);
     }
-    this.#send({ action: "ready" });
+  } catch (error) {
+    await close(1);
+    throw error;
   }
-
-  #send(command: Record<string, unknown>): void {
-    if (this.#closed || !this.#process.stdin?.writable) return;
-    this.#process.stdin.write(`${JSON.stringify(command)}\n`, "utf8");
-  }
-
-  ready(): Promise<void> {
-    return this.#ready;
-  }
-
-  update(id: string, title: string, enabled = true): void {
-    const index = this.#index.get(id);
-    if (index === undefined) return;
-    this.#send({ action: "update-item", index, title, enabled });
-  }
-
-  setTooltip(text: string): void {
-    this.#send({ action: "set-tooltip", text });
-  }
-
-  async close(): Promise<void> {
-    if (this.#closed) return;
-    this.#closed = true;
-    this.#send({ action: "kill" });
-    await new Promise<void>((resolve) => {
-      const timer = setTimeout(() => {
-        this.#process.kill();
-        resolve();
-      }, 1_500);
-      this.#process.once("exit", () => {
-        clearTimeout(timer);
-        resolve();
-      });
-    });
-  }
-}
-
-/**
- * macOS and Linux tray: `systray2` runs its own helper, and neither platform
- * attaches a console window to it, so the bundled tray is used as-is.
- */
-class UnixTray implements Tray {
-  readonly #tray: SysTray;
-
-  constructor(options: TrayOptions) {
-    this.#tray = new SysTray({
-      menu: {
-        icon: options.iconPath,
-        title: "Cartethyia",
-        tooltip: options.tooltip,
-        items: options.items.map((item) =>
-          item.kind === "separator"
-            ? SysTray.separator
-            : { title: item.title, tooltip: item.title, enabled: item.enabled ?? true },
-        ),
-      },
-      copyDir: true,
-    });
-  }
-
-  ready(): Promise<void> {
-    return this.#tray.ready().then(() => undefined);
-  }
-
-  update(id: string, title: string, enabled = true): void {
-    void id;
-    void this.#tray.sendAction({ type: "update-item", item: { title, tooltip: title, enabled } });
-  }
-
-  setTooltip(text: string): void {
-    // systray2 has no tooltip-only action; the tooltip travels with the title,
-    // which `update()` already sends.
-    void text;
-  }
-
-  async close(): Promise<void> {
-    if (this.#tray.killed) return;
-    try {
-      this.#tray.kill();
-    } catch {
-      // The helper may already be gone.
-    }
-  }
-}
-
-/** Creates the tray for this platform. */
-export function createTray(options: TrayOptions): Tray {
-  return process.platform === "win32" ? new WindowsTray(options) : new UnixTray(options);
 }

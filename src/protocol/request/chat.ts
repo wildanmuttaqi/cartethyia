@@ -3,18 +3,18 @@
  */
 import type { CanonicalRequest, ResponseFormat } from "../canonical-model";
 import { isRecord } from "../codecs";
-import { markLatestBreakpoint } from "../../transport/translation/cache-controls";
-import { isWebSearchTool } from "../../transport/translation/search";
-import { pickWireSupportedControls } from "../../transport/translation/capabilities";
-import { normalizeWireMaxTokens } from "../../transport/translation/normalize";
-import { resolveWireMaxTokens } from "../../transport/translation/quirks";
+import { markLatestBreakpoint } from "../../protocol/translation/cache-controls";
+import { isWebSearchTool } from "../../protocol/translation/search";
+import { pickWireSupportedControls } from "../../protocol/translation/capabilities";
+import { normalizeWireMaxTokens } from "../../protocol/translation/normalize";
+import { resolveWireMaxTokens } from "../../protocol/translation/quirks";
 import {
   clampReasoningEffort,
   resolveSupportedReasoningEfforts,
-} from "../../transport/translation/thinking";
+} from "../../protocol/translation/thinking";
 import { isClaudeBillingHeaderText, resolveImageSource } from "../codecs";
 import { resolvePromptCacheKey } from "../../providers/operations/session-resolution";
-import { reasoningEffortFromIntent } from "../../providers/provider-reasoning";
+import { reasoningEffortFromIntent } from "../../protocol/reasoning";
 import { parseChatResponseToEvents, decodeChatSseStream } from "../response/chat";
 
 /**
@@ -353,7 +353,24 @@ export function canonicalToChatPayload(
           // `display: "omitted"`, and dropping it stripped the replay the
           // provider demands on the next request. `reasoning_content` is an
           // assistant-only field, so it is emitted here and nowhere else.
-          if (m.role === "assistant" && hasReasoning) {
+          //
+          // Load-bearing requires *content* in the replay: a non-empty summary
+          // or a non-empty serialised payload. Pushing `{content:"",
+          // reasoning_content:""}` is the opposite of load-bearing — the
+          // upstream reads it as "thinking mode with the reasoning stripped"
+          // and rejects the whole request (`WorkBuddy/CodeBuddy 11151 "history
+          // not found"`). The canonical form that reaches this branch with no
+          // trace is an input `reasoning` item whose `summary` was absent and
+          // whose `payload` was `null` — a signature-less thinking block
+          // emitted under `display: "omitted"` and already stripped by an
+          // earlier hop. There is nothing to replay, so the turn is dropped
+          // instead of being forwarded as an invalid stub.
+          // This non-empty echo is load-bearing for non-buddy
+          // OpenAI-compatible providers. Buddy providers deliberately drop
+          // the resulting bare stub later in `dropEmptyBuddyMessages`
+          // (`providers/integrations/buddy/buddy-chat-shared.ts`) because
+          // their upstream rejects that shape with 11151.
+          if (m.role === "assistant" && hasReasoning && reasoningContent.length > 0) {
             messages.push({
               role: "assistant",
               content: "",
@@ -361,6 +378,9 @@ export function canonicalToChatPayload(
             });
             continue;
           }
+          // No trace to carry: skip the turn entirely rather than emit an
+          // empty assistant message the upstream will reject.
+          if (m.role === "assistant" && hasReasoning) continue;
           if (m.role !== "assistant" && hasReasoning && reasoningContent.length > 0) {
             const last = messages[messages.length - 1];
             if (last !== undefined && last["role"] === "tool") {

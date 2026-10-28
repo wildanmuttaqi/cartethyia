@@ -4,6 +4,7 @@ import { fetchOpenAICompatibleModels } from "../../discovery/openai-model-discov
 import { providerBaseUrl } from "../../provider-metadata";
 import type { DiscoveryInput } from "../../discovery/discovery-types";
 import { defineModel } from "../../provider-model-definition";
+import { openrouterFreeRoster } from "../../discovery/openrouter-free-roster";
 
 const OPENROUTER_PROVIDER_ID = "openrouter" as const;
 
@@ -23,6 +24,14 @@ const OPENROUTER_REQUIRED_HEADERS: Readonly<Record<string, string>> = {
  * served by the native System One route, never by the chat surface.
  */
 export const OPENROUTER_MODELS: readonly ModelDefinition[] = [
+  // No committed chat rows. OpenRouter adds and pulls models within days, so a
+  // hand-kept list of ids drifts out of truth and discovery is the authority;
+  // the free roster below stays as the offline floor. `openrouter/auto` was the
+  // last committed chat row and went with the rest of the static catalog — it
+  // publishes no limits of its own anyway, since a router's pricing is -1.
+  // Not a chat row: it answers `{answers}` to a `{state, questions}` body, and
+  // is served by the native System One route. Kept because deleting it removes
+  // that route, which is a capability, not a stale catalog entry.
   defineModel({
     id: "typesafe/jev-1.13",
     providerId: "openrouter",
@@ -56,171 +65,10 @@ export const OPENROUTER_MODELS: readonly ModelDefinition[] = [
  * what the model list groups on so the free roster is labelled as such rather
  * than mixed in with the billed catalog.
  */
-export const OPENROUTER_FREE_MODELS: readonly ModelDefinition[] = [
-  defineModel({
-    id: "cohere/north-mini-code:free",
-    providerId: OPENROUTER_PROVIDER_ID,
-    reasoning: true,
-    toolCall: true,
-    free: true,
-    freeTier: true,
-  }),
-  defineModel({
-    id: "dots-studio/dots-3-note-preview:free",
-    providerId: OPENROUTER_PROVIDER_ID,
-    reasoning: true,
-    toolCall: true,
-    free: true,
-    freeTier: true,
-  }),
-  defineModel({
-    id: "google/gemma-4-26b-a4b-it:free",
-    providerId: OPENROUTER_PROVIDER_ID,
-    reasoning: true,
-    toolCall: true,
-    free: true,
-    freeTier: true,
-  }),
-  defineModel({
-    id: "google/gemma-4-31b-it:free",
-    providerId: OPENROUTER_PROVIDER_ID,
-    reasoning: true,
-    toolCall: true,
-    free: true,
-    freeTier: true,
-  }),
-  defineModel({
-    id: "inclusionai/ling-3.0-flash-fin:free",
-    providerId: OPENROUTER_PROVIDER_ID,
-    reasoning: true,
-    toolCall: true,
-    free: true,
-    freeTier: true,
-  }),
-  defineModel({
-    id: "inclusionai/ling-3.0-flash-sante:free",
-    providerId: OPENROUTER_PROVIDER_ID,
-    reasoning: true,
-    toolCall: true,
-    free: true,
-    freeTier: true,
-  }),
-  defineModel({
-    id: "liquid/lfm-2.5-2.6b:free",
-    providerId: OPENROUTER_PROVIDER_ID,
-    reasoning: true,
-    toolCall: true,
-    free: true,
-    freeTier: true,
-  }),
-  defineModel({
-    id: "nex-agi/nex-n2.5-mini:free",
-    providerId: OPENROUTER_PROVIDER_ID,
-    reasoning: true,
-    toolCall: true,
-    free: true,
-    freeTier: true,
-  }),
-  defineModel({
-    id: "nex-agi/nex-n2.5-pro:free",
-    providerId: OPENROUTER_PROVIDER_ID,
-    reasoning: true,
-    toolCall: true,
-    free: true,
-    freeTier: true,
-  }),
-  defineModel({
-    id: "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free",
-    providerId: OPENROUTER_PROVIDER_ID,
-    audio: true,
-    reasoning: true,
-    toolCall: true,
-    free: true,
-    freeTier: true,
-  }),
-  defineModel({
-    id: "nvidia/nemotron-3-super-120b-a12b:free",
-    providerId: OPENROUTER_PROVIDER_ID,
-    reasoning: true,
-    toolCall: true,
-    free: true,
-    freeTier: true,
-  }),
-  defineModel({
-    id: "nvidia/nemotron-3-ultra-550b-a55b:free",
-    providerId: OPENROUTER_PROVIDER_ID,
-    reasoning: true,
-    toolCall: true,
-    free: true,
-    freeTier: true,
-  }),
-  defineModel({
-    id: "nvidia/nemotron-3.5-content-safety:free",
-    providerId: OPENROUTER_PROVIDER_ID,
-    reasoning: true,
-    // A content-safety classifier, not a chat model: it is published on the
-    // same free tier and serves no tool calls.
-    toolCall: false,
-    free: true,
-    freeTier: true,
-  }),
-  defineModel({
-    id: "nvidia/nemotron-3.5-lightning:free",
-    providerId: OPENROUTER_PROVIDER_ID,
-    reasoning: true,
-    toolCall: true,
-    free: true,
-    freeTier: true,
-  }),
-  defineModel({
-    id: "poolside/laguna-s-2.1:free",
-    providerId: OPENROUTER_PROVIDER_ID,
-    reasoning: true,
-    toolCall: true,
-    free: true,
-    freeTier: true,
-  }),
-  defineModel({
-    id: "poolside/laguna-xs-2.1:free",
-    providerId: OPENROUTER_PROVIDER_ID,
-    reasoning: true,
-    toolCall: true,
-    free: true,
-    freeTier: true,
-  }),
-  defineModel({
-    id: "qwen/qwen3.8-27b:free",
-    providerId: OPENROUTER_PROVIDER_ID,
-    reasoning: true,
-    toolCall: true,
-    free: true,
-    freeTier: true,
-  }),
-  defineModel({
-    id: "thinkingmachines/inkling-small:free",
-    providerId: OPENROUTER_PROVIDER_ID,
-    reasoning: true,
-    toolCall: true,
-    free: true,
-    freeTier: true,
-  }),
-  defineModel({
-    id: "thinkingmachines/inkling:free",
-    providerId: OPENROUTER_PROVIDER_ID,
-    reasoning: true,
-    toolCall: true,
-    free: true,
-    freeTier: true,
-  }),
-  defineModel({
-    id: "z-ai/glm-5.2:free",
-    providerId: OPENROUTER_PROVIDER_ID,
-    reasoning: true,
-    toolCall: true,
-    free: true,
-    freeTier: true,
-  }),
-];
+export const OPENROUTER_FREE_MODELS: readonly ModelDefinition[] = openrouterFreeRoster({
+  providerId: OPENROUTER_PROVIDER_ID,
+  endpoint: "/chat/completions",
+});
 
 
 /**

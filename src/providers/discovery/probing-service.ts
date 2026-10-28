@@ -1,4 +1,12 @@
-import { captureProviderExchange, type ProviderExchangeCapture } from "../../transport/dispatch/attempt-finalize";
+import {
+  captureProviderExchange,
+  providerRequestMetadataOnly,
+  type ProviderExchangeCapture,
+} from "../../transport/dispatch/attempt-finalize";
+import {
+  captureDepthMaxBytes,
+  providerCaptureMaxBytes,
+} from "../../transport/dispatch/capture-policy";
 import { globalOrOwnedBy } from "../../persistence/tenant-scope";
 /**
  * Provider probing and model-discovery orchestration.
@@ -63,6 +71,7 @@ import { computeTokensPerSec } from "../../observability/token-speed";
 import { TelemetryPayloadCapture } from "../../observability/payload-capture";
 import { providerBaseUrl } from "../provider-metadata";
 import { isBundledProviderId, parseProviderId, type ProviderDispatchTarget as AdapterDispatchTarget, type ValidatedOutboundFetch } from "../provider-contracts";
+import type { ValidatedOutboundHttp2Bidi } from "../provider-contracts";
 import type { ModelDefinition } from "../provider-model-definition";
 import type { ProviderRegistry } from "../provider-registry";
 
@@ -73,6 +82,13 @@ const PROBE_ACCOUNT_CONCURRENCY = 10;
 
 export interface ProbeOutboundBinding {
   readonly fetch: ValidatedOutboundFetch;
+  /**
+   * Validated bidirectional HTTP/2 egress for the same pool/tenant. A provider
+   * whose only transport is a bidi stream (Cursor's Connect-RPC Run) has no
+   * `fetch` path to fall back to, so a probe without this binding reports a
+   * healthy account as broken.
+   */
+  readonly http2Bidi?: ValidatedOutboundHttp2Bidi;
   readonly networkPoolId?: string;
   readonly release?: () => void;
 }
@@ -176,7 +192,7 @@ export class ProviderProbingService {
     const providerWireRow = await this.loadProviderWireRow(providerId);
     const requiresAccount = providerWireRow?.requiresAccount ?? true;
 
-    const { wireFamily, serviceKind, endpointPath, sourceSurface, capabilityProfile } = await resolveProbeTarget({
+    const { wireFamily, serviceKind, endpointPath, sourceSurface, capabilityProfile, outputLimit } = await resolveProbeTarget({
       db: this.db,
       bundledModelCatalog: this.bundledModelCatalog,
       defaultEndpoints: this.defaultEndpoints,
@@ -213,7 +229,7 @@ export class ProviderProbingService {
       };
     }
 
-    const { probeReasoning, payloadCaptureEnabled } = await loadProbePreferences({
+    const { probeReasoning, payloadCapture } = await loadProbePreferences({
       db: this.db,
       tenantId,
       wireFamily,
@@ -237,6 +253,9 @@ export class ProviderProbingService {
       // over capabilities the route actually has (`prompt_caching`, `tools`,
       // `reasoning`), reporting a healthy provider as broken.
       capabilities: capabilityProfile,
+      // The model row's own output ceiling, so a probe with a max-output
+      // ceiling (OpenCode free) shapes with the model's limit, not a guess.
+      ...(outputLimit == null ? {} : { output_limit: outputLimit }),
     };
 
     const probeSignal = AbortSignal.timeout(30_000);
@@ -265,8 +284,19 @@ export class ProviderProbingService {
       };
       // The same wrapper a real dispatch uses, so the probe reads the model the
       // upstream named from the raw bytes rather than from a synthesized event.
+      // Body capture follows the tenant's mode: `metadata` tees the request
+      // line and stage presence without slicing bodies (the same
+      // `captureBody=false` path a live metadata-mode dispatch uses), `full`
+      // tees bodies at the tenant's own depth cap. `none` still wraps — the
+      // reported-model read is dispatch metadata, not payload retention, and
+      // runs regardless of capture mode.
       const probeFetch = createProbeFetch(
-        captureProviderExchange(outbound.fetch, probeCapture, false),
+        captureProviderExchange(
+          outbound.fetch,
+          probeCapture,
+          payloadCapture.mode === "full",
+          providerCaptureMaxBytes(payloadCapture.depth),
+        ),
       );
       try {
         if (serviceKind === "websearch") {
@@ -364,6 +394,11 @@ export class ProviderProbingService {
             deadline: startedAt + 30_000,
             abort_signal: probeSignal,
             outbound_fetch: probeFetch,
+            // A bidi-only provider (Cursor's Connect-RPC Run) has no `fetch`
+            // transport at all: without the HTTP/2 binding the probe fails with
+            // "requires validated HTTP/2 egress" while live dispatch — which
+            // always supplies it — succeeds.
+            ...(outbound.http2Bidi === undefined ? {} : { outbound_http2: outbound.http2Bidi }),
           })) {
             if (ttfbMs === undefined) ttfbMs = Date.now() - startedAt;
             events.push(event);
@@ -422,6 +457,11 @@ export class ProviderProbingService {
       invalidator: this.snapshotInvalidator,
       accountId,
       dispatchError,
+      // Passed so a refusal delivered as a terminal event — not as a thrown
+      // error — still reaches the health machine. Without it, Cursor's
+      // `resource_exhausted` left `dispatchError` undefined and the probe
+      // recovered an exhausted account.
+      ...(events === undefined ? {} : { events }),
       modelId,
       upstreamStatusCode,
     });
@@ -482,17 +522,54 @@ export class ProviderProbingService {
       ...(usage ? { usage } : {}),
       ...(tokensPerSec !== undefined ? { tokensPerSec } : {}),
     });
-    if (this.telemetryBuffer && payloadCaptureEnabled) {
-      await this.payloadCapture
-        .capture({
-          tenantId,
-          requestId,
-          requestBody: capturedRequest,
-          responseBody: events,
-          scope: "tenant",
-          tenantOptIn: true,
-        })
-        .catch(() => undefined);
+    if (this.telemetryBuffer && payloadCapture.enabled) {
+      if (payloadCapture.mode === "metadata") {
+        // Stage presence only: the provider request line (method, URL,
+        // headers, body_present/body_bytes) is exactly what `metadata` mode
+        // keeps for a live request. No bodies anywhere.
+        const providerRequest = providerRequestMetadataOnly(probeCapture?.request ?? null);
+        if (providerRequest !== null) {
+          await this.payloadCapture
+            .capture({
+              tenantId,
+              requestId,
+              requestBody: null,
+              responseBody: null,
+              providerRequestBody: providerRequest,
+              retentionMs: payloadCapture.retentionMs,
+              scope: "tenant",
+              tenantOptIn: true,
+            })
+            .catch(() => undefined);
+        }
+      } else {
+        // All four surfaces, so the row's stage markers mean the same thing
+        // here as they do on a live request: which hop actually produced bytes.
+        // Depth and retention are the tenant's own, resolved through the same
+        // preference path a dispatched request uses.
+        const providerRequest = probeCapture?.request ?? null;
+        const providerResponse = await probeCapture?.response.catch(() => null) ?? null;
+        await this.payloadCapture
+          .capture({
+            tenantId,
+            requestId,
+            requestBody: capturedRequest,
+            // `events` is what the *client* receives, so it belongs in the
+            // client surface. Passing it as `responseBody` lit the client bit
+            // on probes whose event list was empty, over a body that was never
+            // captured. The legacy alias is explicitly absent here; `null`
+            // leaves bit 8 to be decided by the real client body alone.
+            responseBody: null,
+            ...(events === undefined ? {} : { clientResponseBody: events }),
+            ...(providerRequest === null ? {} : { providerRequestBody: providerRequest }),
+            ...(providerResponse === null ? {} : { providerResponseBody: providerResponse }),
+            maxBytes: captureDepthMaxBytes(payloadCapture.depth),
+            retentionMs: payloadCapture.retentionMs,
+            scope: "tenant",
+            tenantOptIn: true,
+          })
+          .catch(() => undefined);
+      }
     }
 
     const sample = extractSample(events);
@@ -814,6 +891,12 @@ export class ProviderProbingService {
         reasoning: knownDefinition?.reasoning ?? discDef?.reasoning ?? false,
         toolCall: knownDefinition?.toolCall ?? discDef?.toolCall ?? false,
         cost: modelsDevCatalog.costFor(providerId, modelId),
+        // Discovery builds its rows from the same static catalog, so a fetched
+        // row carries the same answer a seeded one does. Null when neither
+        // source marked it, which reads as "unknown" rather than "free".
+        proOnly: (discDef?.proOnly ?? knownDefinition?.proOnly ?? null),
+        // Same shape for the tier the provider states itself (Qoder `is_free`).
+        freeTier: (discDef?.freeTier ?? knownDefinition?.freeTier ?? null),
       };
       rows.push({
         providerId,
@@ -851,6 +934,8 @@ export class ProviderProbingService {
             reasoning: sql`excluded.reasoning`,
             toolCall: sql`excluded.tool_call`,
             cost: sql`excluded.cost`,
+            proOnly: sql`excluded.pro_only`,
+            freeTier: sql`excluded.free_tier`,
             // The proposed row's own source, not a constant: a free-tier
             // discovery and an ordinary one write the same upsert, and pinning
             // this to `discovered` would relabel every free-tier row on the
@@ -934,35 +1019,73 @@ export class ProviderProbingService {
   /**
    * Batched provider-wide probe: the first request runs sequentially (it warms
    * OAuth token caches and connection pools for the provider), the rest run
-   * with `Promise.allSettled` bounded to `PROBE_CONCURRENCY`. Each request
+   * through a sliding worker pool bounded to `PROBE_CONCURRENCY`. Each request
    * carries its model route and service kind so native services never fall
    * through to an LLM probe.
+   *
+   * Sliding window beats barrel-batching here: the historical pattern waited
+   * for the slowest probe in each group of `N` before starting the next group,
+   * so one slow route stalled nine others. With the worker loop, a worker
+   * picks up the next request as soon as its current one settles, which keeps
+   * the full window of `PROBE_CONCURRENCY` in flight across the whole batch.
    */
   async probeAllModels(
     tenantId: string,
     providerId: string,
     requests: readonly ProbeModelRequest[],
   ): Promise<ProbeAllModelsResult> {
-    const results: Array<ProbeAllModelsResult["results"][number]> = [];
     const [firstRequest, ...restRequests] = requests;
-    if (firstRequest === undefined) return { providerId, results };
+    if (firstRequest === undefined) return { providerId, results: [] };
 
-    const runOne = async (probeRequest: ProbeModelRequest): Promise<void> => {
+    // Position the warm-up at index 0 and the rest at their original indices
+    // so a caller inspecting `results` sees them in the same order they were
+    // requested. Pre-sized `Array` means workers assign by index rather than
+    // racing to `push`.
+    const results: ProbeAllModelsResult["results"][number][] = new Array(requests.length);
+
+    const runOne = async (probeRequest: ProbeModelRequest, slot: number): Promise<void> => {
       const outcome = await this.probeModel(tenantId, providerId, probeRequest);
-      results.push({
+      results[slot] = {
         modelId: probeRequest.modelId,
         ok: outcome.ok,
         latencyMs: outcome.latencyMs,
         ...(outcome.error ? { error: outcome.error } : {}),
-      });
+      };
     };
 
-    await runOne(firstRequest);
-    for (let offset = 0; offset < restRequests.length; offset += PROBE_CONCURRENCY) {
-      const batch = restRequests.slice(offset, offset + PROBE_CONCURRENCY);
-      await Promise.allSettled(batch.map((request) => runOne(request)));
-    }
-    return { providerId, results };
+    // Warm-up stays sequential: it primes OAuth token caches and connection
+    // pools so the parallel workers do not each pay the first-call tax.
+    await runOne(firstRequest, 0);
+
+    let cursor = 0;
+    const worker = async (): Promise<void> => {
+      while (true) {
+        const index = cursor++;
+        if (index >= restRequests.length) return;
+        const request = restRequests[index]!;
+        // Swallow per-probe errors to the array shape: `probeModel` is
+        // supposed to return an `outcome` object even on failure, but a
+        // throw here (unexpected shape, aborted socket) must not fail the
+        // whole batch — the operator still needs to see which models passed.
+        try {
+          await runOne(request, index + 1);
+        } catch (error) {
+          results[index + 1] = {
+            modelId: request.modelId,
+            ok: false,
+            latencyMs: 0,
+            error: error instanceof Error ? error.message : String(error),
+          };
+        }
+      }
+    };
+
+    const workerCount = Math.min(PROBE_CONCURRENCY, restRequests.length);
+    await Promise.all(Array.from({ length: workerCount }, () => worker()));
+
+    // Drop any gaps left by a `requests.length` of 1 (no rest) or an array
+    // that was somehow sparser than planned — defensive, not expected.
+    return { providerId, results: results.filter((entry) => entry !== undefined) };
   }
   async probeAllAccounts(
     tenantId: string,
@@ -978,24 +1101,58 @@ export class ProviderProbingService {
           globalOrOwnedBy(providerAccounts.tenantId, tenantId),
         ),
       );
-    const results: ProbeAllAccountsResult["results"][number][] = [];
-    for (let offset = 0; offset < accounts.length; offset += PROBE_ACCOUNT_CONCURRENCY) {
-      const batch = accounts.slice(offset, offset + PROBE_ACCOUNT_CONCURRENCY);
-      const batchResults = await Promise.all(
-        batch.map(async (account) => {
-          const result = await this.probeModel(tenantId, providerId, {
-            ...request,
-            accountId: account.id,
-          });
-          // No health write here: this used to regex the model's own answer text
-          // for "202" and degrade the account on a match. A probe that genuinely
-          // fails already reports through `recordAccountFailure`, which classifies
-          // the real status; matching answer text is not a health signal.
-          return { ...result, accountId: account.id };
-        }),
-      );
-      results.push(...batchResults);
-    }
+    // Sliding worker pool: workers claim the next account as soon as their
+    // current probe settles, so one slow account cannot stall the rest of the
+    // window the way `Promise.all` on fixed-size batches did. Order of
+    // completion is irrelevant to the caller (each result carries its own
+    // `accountId`), but we still assign by slot to keep the output stable
+    // for golden-file tests and operator audit replay.
+    //
+    // Fault tolerance: the old `Promise.all` meant a single thrown probe
+    // aborted the entire batch and the operator lost the status of every
+    // other account they clicked "test all" on. Catching per-account turns a
+    // thrown probe into a failed result for that account only — matching the
+    // dashboard's existing per-account expectation.
+    const results: ProbeAllAccountsResult["results"][number][] = new Array(accounts.length);
+    if (accounts.length === 0) return { providerId, modelId: request.modelId, results: [] };
+
+    const runOne = async (account: { id: string }, slot: number): Promise<void> => {
+      try {
+        const result = await this.probeModel(tenantId, providerId, {
+          ...request,
+          accountId: account.id,
+        });
+        // No health write here: a probe that genuinely fails already reports
+        // through `recordAccountFailure`, which classifies the real status;
+        // matching answer text is not a health signal.
+        results[slot] = { ...result, accountId: account.id };
+      } catch (error) {
+        results[slot] = {
+          ok: false,
+          latencyMs: 0,
+          accountId: account.id,
+          error: error instanceof Error ? error.message : String(error),
+        } as ProbeAllAccountsResult["results"][number];
+      }
+    };
+
+    // As in probeAllModels, the first probe primes OAuth token caches and
+    // connection pools before concurrent workers start. Ten simultaneous cold
+    // refreshes could otherwise trip provider rate limits and mark healthy
+    // accounts as broken during a "test all" run.
+    await runOne(accounts[0]!, 0);
+    const restAccounts = accounts.slice(1);
+    let cursor = 0;
+    const worker = async (): Promise<void> => {
+      while (true) {
+        const index = cursor++;
+        if (index >= restAccounts.length) return;
+        await runOne(restAccounts[index]!, index + 1);
+      }
+    };
+    const workerCount = Math.min(PROBE_ACCOUNT_CONCURRENCY, restAccounts.length);
+    await Promise.all(Array.from({ length: workerCount }, () => worker()));
+
     return { providerId, modelId: request.modelId, results };
   }
 }

@@ -10,7 +10,12 @@ import { mergeResponsesUsage } from "./responses";
 import { usageFromProvider, readReasoningText } from "../../providers/provider-usage";
 import { createToolEmitLedger } from "../tool-identity";
 import { MimoThinkSplitter, stripThinkingTags } from "../../providers/integrations/xiaomi-mimo/think-stream";
-import { parseDsmlToolCalls } from "./dsml";
+import { DsmlToolCallParser, parseDsmlToolCalls } from "./dsml";
+import {
+  OmpToolCallMarkupParser,
+  parseOmpToolCallMarkup,
+  type OmpTextToolCall,
+} from "./omp-tool-call-markup";
 
 
 export function mapChatStopReason(
@@ -43,14 +48,23 @@ export function parseChatResponseToEvents(
   const choices = (json["choices"] as Array<Record<string, unknown>>) ?? [];
   const first = choices[0] as Record<string, unknown> | undefined;
   const message = first?.["message"] as Record<string, unknown> | undefined;
+  const declaredToolNames = declaredToolNamesForRequest(request);
+  const callableToolNames = callableToolNamesForRequest(request);
+  let recoveredToolCalls = 0;
   if (message) {
     const reasoningRaw = readReasoningText(message);
+    const reasoningMarkup =
+      typeof reasoningRaw === "string" && (request.tools?.length ?? 0) > 0
+        ? parseOmpToolCallMarkup(reasoningRaw, declaredToolNames)
+        : undefined;
     // hy4-preview-f (and other buddy reasoning models) sometimes wraps its own
     // reasoning in `<think>…</think>` inside `reasoning_content`, which then
     // reaches the client as literal tag bytes. The field itself is the stream
     // for reasoning here, so the tags cannot carry structure — strip them.
     const reasoning =
-      typeof reasoningRaw === "string" ? stripThinkingTags(reasoningRaw) : reasoningRaw;
+      typeof reasoningRaw === "string"
+        ? stripThinkingTags(reasoningMarkup?.text ?? reasoningRaw)
+        : reasoningRaw;
     if (typeof reasoning === "string" && reasoning.length > 0) {
       events.push({
         type: "content_delta",
@@ -62,8 +76,16 @@ export function parseChatResponseToEvents(
       });
     }
     const content = message["content"] as string | null;
-    const recovered = typeof content === "string" ? parseDsmlToolCalls(content) : undefined;
-    const visible = recovered === undefined ? content : recovered.text;
+    const recoveredMarkup =
+      typeof content === "string" && (request.tools?.length ?? 0) > 0
+        ? parseOmpToolCallMarkup(content, declaredToolNames)
+        : undefined;
+    const contentWithoutMarkup = recoveredMarkup?.text ?? content;
+    const recovered =
+      typeof contentWithoutMarkup === "string"
+        ? parseDsmlToolCalls(contentWithoutMarkup, declaredToolNames)
+        : undefined;
+    const visible = recovered === undefined ? contentWithoutMarkup : recovered.text;
     if (typeof visible === "string" && visible.includes("<think")) {
       const think = new MimoThinkSplitter();
       const split = think.push(visible);
@@ -104,9 +126,46 @@ export function parseChatResponseToEvents(
       });
     }
     const structuredCalls = message["tool_calls"];
-    const toolCalls = Array.isArray(structuredCalls) && structuredCalls.length > 0
+    const hasStructuredCalls =
+      Array.isArray(structuredCalls) &&
+      structuredCalls.some((candidate) => {
+        if (typeof candidate !== "object" || candidate === null) return false;
+        const record = candidate as Record<string, unknown>;
+        const fn =
+          typeof record["function"] === "object" && record["function"] !== null
+            ? (record["function"] as Record<string, unknown>)
+            : undefined;
+        const callId = typeof record["id"] === "string" && record["id"].length > 0;
+        const name =
+          typeof fn?.["name"] === "string" && fn["name"].length > 0
+            ? fn["name"]
+            : typeof record["name"] === "string"
+              ? record["name"]
+              : undefined;
+        return callId && name !== undefined && name.length > 0;
+      });
+    // A request that declared no tools carries no allowlist to enforce, so a
+    // recovered block is honoured as-is exactly as before; a request that did
+    // declare them must never execute a name it did not offer.
+    const recoveredCalls =
+      declaredToolNames.size > 0
+        ? (recovered?.calls ?? []).filter((call) => callableToolNames.has(call.name))
+        : (recovered?.calls ?? []);
+    const toolCalls = hasStructuredCalls
       ? structuredCalls
-      : recovered?.calls ?? [];
+      : recoveredMarkup?.calls.some((call) => callableToolNames.has(call.name))
+        ? recoveredMarkup.calls
+            .filter((call) => callableToolNames.has(call.name))
+            .map((call) => ({
+              id: call.id,
+              function: { name: call.name, arguments: call.arguments },
+            }))
+        : recoveredCalls;
+    if (!hasStructuredCalls && recoveredMarkup !== undefined) {
+      recoveredToolCalls = recoveredMarkup.calls.filter((call) =>
+        callableToolNames.has(call.name),
+      ).length;
+    }
     for (const tc of toolCalls) {
       if (typeof tc !== "object" || tc === null) continue;
       const record = tc as Record<string, unknown>;
@@ -166,7 +225,7 @@ export function parseChatResponseToEvents(
       sequenceNumber: events.length + 1,
       responseId: id,
       state: "complete",
-      stopReason: chatJsonStopReason,
+      stopReason: recoveredToolCalls > 0 ? "tool_use" : chatJsonStopReason,
       providerStopReason: chatJsonProviderStopReason,
       usage: usageRecord,
     }),
@@ -194,9 +253,23 @@ export async function* decodeChatSseStream(
   const lastToolNameByIndex = new Map<number, string>();
   let lastSeenToolId: string | undefined;
   let lastSeenToolName: string | undefined;
+  let structuredToolCallEmitted = false;
+  const recoveredMarkupCalls: OmpTextToolCall[] = [];
   // Single emission ledger: one entry per logical call.
   const ledger = createToolEmitLedger();
   const think = new MimoThinkSplitter();
+  // Separate splitter for the reasoning channel: `reasoning_content` is its own
+  // stream, and interleaving it into the answer splitter would let a tag in one
+  // channel swallow the other's text.
+  const reasoningThink = new MimoThinkSplitter();
+  const declaredToolNames = declaredToolNamesForRequest(request);
+  const callableToolNames = callableToolNamesForRequest(request);
+  const contentMarkup =
+    (request.tools?.length ?? 0) > 0 ? new OmpToolCallMarkupParser(declaredToolNames) : undefined;
+  const reasoningMarkup =
+    (request.tools?.length ?? 0) > 0 ? new OmpToolCallMarkupParser(declaredToolNames) : undefined;
+  const dsmlMarkup =
+    (request.tools?.length ?? 0) > 0 ? new DsmlToolCallParser(declaredToolNames) : undefined;
   yield {
     type: "response_start",
     sequence_number: seq++,
@@ -240,8 +313,10 @@ export async function* decodeChatSseStream(
         // text/thinking blocks.
         if (typeof delta?.["content"] === "string" && delta["content"].length > 0) {
           const raw = delta["content"] as string;
-          const recovered = parseDsmlToolCalls(raw);
-          const visible = recovered?.text ?? raw;
+          const markup = contentMarkup?.push(raw);
+          if (markup !== undefined) recoveredMarkupCalls.push(...markup.calls);
+          const recovered = dsmlMarkup?.push(markup?.text ?? raw);
+          const visible = recovered?.text ?? markup?.text ?? raw;
           const split = think.push(visible);
           if (split.reasoning.length > 0) {
             yield {
@@ -270,12 +345,25 @@ export async function* decodeChatSseStream(
           }
         }
         const reasoningRaw = delta ? readReasoningText(delta) : undefined;
+        const reasoningMarkupResult =
+          typeof reasoningRaw === "string" ? reasoningMarkup?.push(reasoningRaw) : undefined;
         // Strip stray `<think>` tags the upstream double-wrapped inside its own
-        // reasoning stream (buddy's hy4-preview-f leaks them per-delta). Done
-        // per delta rather than once at the end because an open-ended tag that
-        // spans multiple deltas is a splitter job, not this one.
+        // reasoning stream (buddy's hy4-preview-f leaks them per-delta). This
+        // is the splitter's job, not `stripThinkingTags`'s: a stateless strip
+        // cannot see a tag split across two deltas, so `"<thi"` was emitted
+        // verbatim and only the following `</think>` removed.
+        const reasoningSplit =
+          typeof reasoningRaw === "string"
+            ? reasoningThink.push(reasoningMarkupResult?.text ?? reasoningRaw)
+            : undefined;
+        // Both sides are reasoning. The splitter routes text outside a
+        // `<think>` span to its `.text` side, but this field is the reasoning
+        // stream in its entirety: untagged prose here is still thought, not
+        // answer. Taking only `.reasoning` dropped every un-tagged delta.
         const reasoningText =
-          typeof reasoningRaw === "string" ? stripThinkingTags(reasoningRaw) : reasoningRaw;
+          reasoningSplit === undefined
+            ? undefined
+            : `${reasoningSplit.reasoning}${reasoningSplit.text}`;
         if (typeof reasoningText === "string" && reasoningText.length > 0) {
           yield {
             type: "content_delta",
@@ -353,6 +441,7 @@ export async function* decodeChatSseStream(
             ledger.isDuplicateDefinition(id, fragName, args);
           if (!duplicate) {
             if (establishedNew) ledger.claimFirstEmission(id, fragName, args);
+            structuredToolCallEmitted = true;
             yield {
               type: "tool_call_delta",
               sequence_number: seq++,
@@ -390,6 +479,72 @@ export async function* decodeChatSseStream(
       );
     }
   }
+  const contentMarkupTail = contentMarkup?.flush();
+  if (contentMarkupTail !== undefined) {
+    recoveredMarkupCalls.push(...contentMarkupTail.calls);
+    if (contentMarkupTail.text.length > 0) {
+      const split = think.push(contentMarkupTail.text);
+      if (split.reasoning.length > 0) {
+        yield {
+          type: "content_delta",
+          sequence_number: seq++,
+          content: { kind: "reasoning", payload: null, summary: split.reasoning },
+        } as CanonicalEvent;
+      }
+      if (split.text.length > 0) {
+        yield {
+          type: "content_delta",
+          sequence_number: seq++,
+          content: { kind: "text", text: split.text },
+        } as CanonicalEvent;
+      }
+    }
+  }
+  const dsmlMarkupTail = dsmlMarkup?.flush();
+  if (dsmlMarkupTail !== undefined) {
+    if (dsmlMarkupTail.text.length > 0) {
+      const split = think.push(dsmlMarkupTail.text);
+      if (split.reasoning.length > 0) {
+        yield {
+          type: "content_delta",
+          sequence_number: seq++,
+          content: { kind: "reasoning", payload: null, summary: split.reasoning },
+        } as CanonicalEvent;
+      }
+      if (split.text.length > 0) {
+        yield {
+          type: "content_delta",
+          sequence_number: seq++,
+          content: { kind: "text", text: split.text },
+        } as CanonicalEvent;
+      }
+    }
+    for (const call of dsmlMarkupTail.calls) recoveredMarkupCalls.push(call);
+  }
+  const reasoningMarkupTail = reasoningMarkup?.flush();
+  if (reasoningMarkupTail?.text) {
+    const split = reasoningThink.push(reasoningMarkupTail.text);
+    // Both sides are reasoning: see the per-delta branch above.
+    const reasoningText = `${split.reasoning}${split.text}`;
+    if (reasoningText.length > 0) {
+      yield {
+        type: "content_delta",
+        sequence_number: seq++,
+        content: { kind: "reasoning", payload: null, summary: reasoningText },
+      } as CanonicalEvent;
+    }
+  }
+  // Release anything the reasoning splitter held for a tag that never
+  // completed, before `think.flush()` and the terminal.
+  const reasoningRest = reasoningThink.flush();
+  const reasoningTail = `${reasoningRest.reasoning}${reasoningRest.text}`;
+  if (reasoningTail.length > 0) {
+    yield {
+      type: "content_delta",
+      sequence_number: seq++,
+      content: { kind: "reasoning", payload: null, summary: reasoningTail },
+    } as CanonicalEvent;
+  }
   const rest = think.flush();
   if (rest.reasoning.length > 0) {
     yield {
@@ -404,6 +559,20 @@ export async function* decodeChatSseStream(
       sequence_number: seq++,
       content: { kind: "text", text: rest.text },
     } as CanonicalEvent;
+  }
+  let recoveredMarkupToolCallsEmitted = 0;
+  if (!structuredToolCallEmitted) {
+    for (const call of recoveredMarkupCalls) {
+      if (!callableToolNames.has(call.name)) continue;
+      yield {
+        type: "tool_call_delta",
+        sequence_number: seq++,
+        call_id: call.id,
+        name: call.name,
+        arguments_delta: call.arguments,
+      } as CanonicalEvent;
+      recoveredMarkupToolCallsEmitted += 1;
+    }
   }
   const chatStopReason = mapChatStopReason(finishReason);
   const chatProviderStopReason =
@@ -423,8 +592,28 @@ export async function* decodeChatSseStream(
     // `stop`. `chatFinishReason(undefined)` falls back to `stop`, so the client
     // saw a completed turn while telemetry recorded a 502 upstream transport
     // failure — the failure this terminal already carries was invisible to it.
-    stopReason: truncated && signal?.aborted !== true ? "error" : chatStopReason,
+    stopReason:
+      truncated && signal?.aborted !== true
+        ? "error"
+        : !structuredToolCallEmitted && recoveredMarkupToolCallsEmitted > 0
+          ? "tool_use"
+          : chatStopReason,
     providerStopReason: chatProviderStopReason,
     usage: usageFromProvider(rawUsage),
   });
+}
+
+function declaredToolNamesForRequest(request: CanonicalRequest): ReadonlySet<string> {
+  return new Set((request.tools ?? []).map((tool) => tool.name));
+}
+
+function callableToolNamesForRequest(request: CanonicalRequest): ReadonlySet<string> {
+  const declared = declaredToolNamesForRequest(request);
+  const choice = request.tool_choice;
+  if (choice === "none") return new Set();
+  if (choice === undefined || typeof choice === "string") return declared;
+  if (choice.type === "tool" || choice.type === "custom") {
+    return declared.has(choice.name) ? new Set([choice.name]) : new Set();
+  }
+  return new Set(choice.names.filter((name) => declared.has(name)));
 }

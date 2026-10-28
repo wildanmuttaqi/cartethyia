@@ -169,10 +169,11 @@ interface HistogramSeries {
 class Histogram implements HistogramMetric {
   private readonly series = new Map<string, HistogramSeries>();
   /**
-   * The label names this histogram emits, fixed by the first LABELLED
-   * observation. A Prometheus metric family must expose one consistent label set,
-   * so a later observation carrying different keys is normalized against this set
-   * rather than creating a second, incompatible series.
+   * The label names this histogram emits. Declared at registration when the
+   * caller passes them to `histogram()`, otherwise fixed by the first LABELLED
+   * observation. A Prometheus metric family must expose one consistent label
+   * set, so a later observation carrying different keys is normalized against
+   * this set rather than creating a second, incompatible series.
    */
   private labelNames: readonly string[] = [];
 
@@ -180,12 +181,18 @@ class Histogram implements HistogramMetric {
     readonly name: string,
     readonly help: string,
     readonly buckets: readonly number[],
-  ) {}
+    labelNames: readonly string[] = [],
+  ) {
+    // A declared set is stable across runs and workers, so the exposition is
+    // deterministic even before the first observation arrives. Sorting keeps
+    // the order fixed either way.
+    this.labelNames = [...labelNames].sort();
+  }
 
   observe(value: number, labels?: MetricLabels): void {
+    // Fall back to inferring the set from the first labelled observation when
+    // the metric was registered without declaring one.
     if (this.labelNames.length === 0 && labels !== undefined) {
-      // Sorting makes the exposition order deterministic, so two runs of the same
-      // code produce byte-identical output.
       this.labelNames = Object.keys(labels).sort();
     }
     const normalized = normalizeLabels(labels, this.labelNames);
@@ -260,6 +267,16 @@ export class PrometheusRegistry {
   readonly cartethyia_redis_up: GaugeMetric;
   readonly proxy_requests_total: CounterMetric;
   readonly proxy_admission_total: CounterMetric;
+  /**
+   * Refusals from the per-IP abuse layer, by reason.
+   *
+   * These are the only 429s this process produces before dispatch, and they
+   * were invisible: a client-facing 429 could come from here, from admission,
+   * or from the upstream, and nothing recorded which. `ip-rate-limited` is the
+   * sliding window and `ip-banned` the escalation — different remedies, so
+   * they must not share a number.
+   */
+  readonly cartethyia_ip_abuse_refusals_total: CounterMetric;
   readonly proxy_in_flight: GaugeMetric;
   readonly proxy_request_latency_ms: HistogramMetric;
   readonly cartethyia_telemetry_buffered: GaugeMetric;
@@ -271,10 +288,21 @@ export class PrometheusRegistry {
   readonly cartethyia_routing_roundrobin_entries: GaugeMetric;
   readonly cartethyia_ip_abuse_keys: GaugeMetric;
   readonly cartethyia_quota_cache_entries: GaugeMetric;
-  readonly cartethyia_proxy_dial_dns_fallback_total: CounterMetric;
+  readonly cartethyia_model_catalog_entries: GaugeMetric;
+  readonly cartethyia_process_in_flight: GaugeMetric;
+  readonly cartethyia_telemetry_backlog_items: GaugeMetric;
+  readonly cartethyia_telemetry_backlog_bytes: GaugeMetric;
+  readonly cartethyia_proxy_dial_proxy_resolved_total: CounterMetric;
   readonly proxy_provider_adapter_load_ms: HistogramMetric;
   readonly pool_cooldown_record_failed: CounterMetric;
   readonly quota_cache_invalidate_failed: CounterMetric;
+  /** Payload frames dropped because the writer backlog was at its bound. */
+  readonly cartethyia_payload_backlog_dropped_total: CounterMetric;
+  /**
+   * Telemetry backfill conflicts: same (tenant, request) identity with
+   * different content. Reported, never overwritten.
+   */
+  readonly cartethyia_telemetry_raw_conflicts_total: CounterMetric;
 
   private readonly all: RenderableMetric[] = [];
 
@@ -300,6 +328,11 @@ export class PrometheusRegistry {
     this.proxy_admission_total = this.counter(
       "proxy_admission_total",
       "Admission decisions by reason",
+      ["reason"],
+    );
+    this.cartethyia_ip_abuse_refusals_total = this.counter(
+      "cartethyia_ip_abuse_refusals_total",
+      "Requests refused by the per-IP abuse limit, by reason",
       ["reason"],
     );
     this.proxy_in_flight = this.gauge(
@@ -335,6 +368,18 @@ export class PrometheusRegistry {
       "cartethyia_memory_limit_bytes",
       "Container/cgroup memory limit in bytes (0 when unknown)",
     );
+    this.cartethyia_process_in_flight = this.gauge(
+      "cartethyia_process_in_flight",
+      "Gateway requests currently admitted into this process",
+    );
+    this.cartethyia_telemetry_backlog_items = this.gauge(
+      "cartethyia_telemetry_backlog_items",
+      "Telemetry events queued for the next drain",
+    );
+    this.cartethyia_telemetry_backlog_bytes = this.gauge(
+      "cartethyia_telemetry_backlog_bytes",
+      "Estimated bytes queued for the next telemetry drain",
+    );
     this.cartethyia_routing_roundrobin_entries = this.gauge(
       "cartethyia_routing_roundrobin_entries",
       "Round-robin routing state entries by scope",
@@ -348,9 +393,13 @@ export class PrometheusRegistry {
       "cartethyia_quota_cache_entries",
       "Entries in the in-process provider quota cache",
     );
-    this.cartethyia_proxy_dial_dns_fallback_total = this.counter(
-      "cartethyia_proxy_dial_dns_fallback_total",
-      "Pool/relay-bound dials whose local DNS resolution failed and were downgraded to proxy-resolved egress",
+    this.cartethyia_model_catalog_entries = this.gauge(
+      "cartethyia_model_catalog_entries",
+      "Entries in the per-provider model catalog cache (at the cap means eviction churn)",
+    );
+    this.cartethyia_proxy_dial_proxy_resolved_total = this.counter(
+      "cartethyia_proxy_dial_proxy_resolved_total",
+      "Pool/relay-bound dials whose target is resolved by the proxy or relay rather than by the local resolver, so local DNS for the target is advisory only",
     );
     this.proxy_provider_adapter_load_ms = this.histogram(
       "proxy_provider_adapter_load_ms",
@@ -364,6 +413,14 @@ export class PrometheusRegistry {
     this.quota_cache_invalidate_failed = this.counter(
       "quota_cache_invalidate_failed",
       "Quota cache invalidations that failed",
+    );
+    this.cartethyia_payload_backlog_dropped_total = this.counter(
+      "cartethyia_payload_backlog_dropped_total",
+      "Payload captures dropped because the payload writer backlog was full",
+    );
+    this.cartethyia_telemetry_raw_conflicts_total = this.counter(
+      "cartethyia_telemetry_raw_conflicts_total",
+      "Telemetry backfill conflicts (same tenant/request identity, different content)",
     );
   }
 
@@ -379,8 +436,23 @@ export class PrometheusRegistry {
     return metric;
   }
 
-  histogram(name: string, help: string, buckets: readonly number[]): HistogramMetric {
-    const metric = new Histogram(name, help, buckets);
+  /**
+   * Registers a histogram.
+   *
+   * `labelNames` declares the label set up front. It is optional because a
+   * histogram observed without labels still has to render, but passing it is
+   * the correct call: a declared set is stable across runs and workers, so the
+   * exposition is deterministic even before the first observation, and an
+   * observation carrying undeclared keys cannot create a second, incompatible
+   * series.
+   */
+  histogram(
+    name: string,
+    help: string,
+    buckets: readonly number[],
+    labelNames: readonly string[] = [],
+  ): HistogramMetric {
+    const metric = new Histogram(name, help, buckets, labelNames);
     this.all.push(metric);
     return metric;
   }

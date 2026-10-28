@@ -7,7 +7,7 @@ import { DashboardShell } from "./apps/console/shell";
 import ErrorBoundary from "./components/ErrorBoundary";
 import { lazyWithRetry } from "./lib/lazy-retry";
 import { consoleRequest, fetchSessionUser, setSessionTransitionListener } from "./data/api";
-import { queryClient } from "./data/query-client";
+import { clearPersistedCache, queryClient } from "./data/query-client";
 import { queryKeys } from "./data/query-keys";
 import type { SessionUser } from "./data/contracts";
 
@@ -57,8 +57,11 @@ function SessionTransitionBridge(): ReactNode {
   useEffect(() => {
     setSessionTransitionListener((kind) => {
       // The session is unusable: drop every cached tenant view so the next
-      // sign-in never renders the previous session's data.
+      // sign-in never renders the previous session's data. `clear()` empties
+      // memory only; the persisted snapshot is dropped with it, or a reload
+      // would rehydrate the previous tenant's catalog from disk.
       queryClient.clear();
+      clearPersistedCache();
       if (kind === "banned") {
         navigate("/banned", { replace: true });
         return;
@@ -164,24 +167,26 @@ function ProtectedRoutes(): ReactNode {
     );
   return (
     <DashboardShell user={state.user}>
-      <ErrorBoundary resetKey={location.pathname}>
-        <Routes>
-          <Route path="/" element={<Overview />} />
-          <Route path="/usage" element={<Usage />} />
-          <Route path="/providers" element={<Providers />} />
-          <Route path="/providers/:providerId" element={<ProviderDetail />} />
-          <Route path="/combos" element={<Combos />} />
-          <Route path="/quota" element={<Quota />} />
-          <Route path="/proxy" element={<Proxy />} />
-          <Route path="/console-log" element={<ConsoleLogPage />} />
-          <Route path="/customization" element={<Customization />} />
-          <Route path="/model-lab" element={<Studio />} />
-          <Route path="/cli-tools" element={<CliTools />} />
-          <Route path="/cli-tools/:toolId" element={<CliToolDetail />} />
-          <Route path="/settings" element={<Settings />} />
-          <Route path="*" element={<Navigate to="/" replace />} />
-        </Routes>
-      </ErrorBoundary>
+      {/* No second boundary here. `RouteErrorBoundary` already wraps this whole
+          tree, and nesting one inside it caught the same throw twice — React
+          re-throws an error the nearest boundary did not commit, so the operator
+          saw the error surface rendered inside itself. */}
+      <Routes>
+        <Route path="/" element={<Overview />} />
+        <Route path="/usage" element={<Usage />} />
+        <Route path="/providers" element={<Providers />} />
+        <Route path="/providers/:providerId" element={<ProviderDetail />} />
+        <Route path="/combos" element={<Combos />} />
+        <Route path="/quota" element={<Quota />} />
+        <Route path="/proxy" element={<Proxy />} />
+        <Route path="/console-log" element={<ConsoleLogPage />} />
+        <Route path="/customization" element={<Customization />} />
+        <Route path="/model-lab" element={<Studio />} />
+        <Route path="/cli-tools" element={<CliTools />} />
+        <Route path="/cli-tools/:toolId" element={<CliToolDetail />} />
+        <Route path="/settings" element={<Settings />} />
+        <Route path="*" element={<Navigate to="/" replace />} />
+      </Routes>
     </DashboardShell>
   );
 }

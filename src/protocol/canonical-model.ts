@@ -33,7 +33,16 @@ export type WireFamily = (typeof WIRE_FAMILIES)[number];
  * the console's Elysia body schema and its validator both project this list, so
  * a new kind cannot reach one and miss the other.
  */
-export const SERVICE_KINDS = ["llm", "systemone", "websearch", "imageGeneration", "videoGeneration"] as const;
+export const SERVICE_KINDS = [
+  "llm",
+  "systemone",
+  "websearch",
+  "imageGeneration",
+  "videoGeneration",
+  "embedding",
+  "audioTranscription",
+  "audioSpeech",
+] as const;
 
 /** Provider service kind selected by a model's catalog row. */
 export type ServiceKind = (typeof SERVICE_KINDS)[number];
@@ -43,7 +52,7 @@ export type ServiceKind = (typeof SERVICE_KINDS)[number];
  * their membership set from it, and the probe route's accepted subset is
  * declared separately because it is deliberately narrower.
  */
-export const REASONING_EFFORTS = ["none", "minimal", "low", "medium", "high", "xhigh", "max"] as const;
+export const REASONING_EFFORTS = ["none", "instant", "minimal", "low", "medium", "high", "xhigh", "max"] as const;
 
 /** One canonical reasoning effort. */
 export type ReasoningEffort = (typeof REASONING_EFFORTS)[number];
@@ -299,6 +308,13 @@ export type ContentPart =
       /** Responses reasoning summary block index, preserved across surfaces. */
       summary_index?: number;
       signature?: string;
+      /**
+       * Responses item id the `encrypted_content` was issued for. The upstream
+       * binds encrypted reasoning to its item and rejects a replay whose item
+       * id does not match, so the id travels with the payload it belongs to
+       * rather than being re-derived at request time.
+       */
+      item_id?: string;
       encrypted_content?: string;
     }
   | { kind: "extension"; name: string; payload: unknown };
@@ -354,6 +370,19 @@ export interface CanonicalTerminalEvent {
   readonly response_id?: string;
   /** Event timestamp in milliseconds since epoch (optional for profiling). */
   readonly timestamp?: number;
+  /**
+   * Set by an adapter whose turn is not finished: the stream ended because the
+   * model asked for a tool the client must answer, and the provider's
+   * authoritative usage arrives with the *later* request that continues the
+   * same upstream turn.
+   *
+   * The settle path reads this to skip charging estimated tokens for the
+   * interim response — otherwise one logical turn bills an input/output
+   * estimate on the tool-call response and the real usage on the continuation,
+   * which double-counts the turn. Only a provider that genuinely spans client
+   * requests with one upstream turn sets it.
+   */
+  readonly usage_deferred?: true;
 }
 
 /** An ordered canonical stream event; sequence numbers must increase monotonically. */
@@ -574,9 +603,10 @@ export function hasEncryptedReasoning(parts: readonly ContentPart[]): boolean {
  * Single-pass summary of a request's content parts.
  *
  * `deriveRequiredCapabilities` + `assessTranslation` run on every candidate
- * preflight and previously each flattened the whole request (`allParts`) and
- * then scanned the copy up to ~6 times. This walks the messages once, builds
- * no intermediate array, and answers every predicate the pipeline needs.
+ * preflight, and flattening the whole request (`allParts`) in each and then
+ * scanning the copy up to ~6 times is the cost this avoids. It walks the
+ * messages once, builds no intermediate array, and answers every predicate the
+ * pipeline needs.
  * Results are memoized per request object in a `WeakMap`, so the preflight +
  * translate passes over one request share a single summary and entries are
  * collected with the request itself — no manual invalidation, no leak.

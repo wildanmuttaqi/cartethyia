@@ -1,4 +1,4 @@
-import { Activity, RotateCcw } from "lucide-react";
+import { Activity, RotateCcw, Trash2 } from "lucide-react";
 import { useEffect, useState, type ReactNode } from "react";
 import type { CredentialKind, CredentialMode } from "../data/contracts";
 import { ConfirmDialog } from "./ConfirmDialog";
@@ -8,7 +8,7 @@ import { Dialog } from "./ui/dialog";
 import { DataTable } from "./ui/layout";
 import { Inline } from "./ui/inline";
 import { EmptyState, ErrorState, LoadingState } from "./ui/state";
-import { useAccountHealthEvents, useRecoverAccount, useUpdateProviderAccount } from "../hooks/providers";
+import { useAccountHealthEvents, usePurgeAccountHealthEvents, useRecoverAccount, useUpdateProviderAccount } from "../hooks/providers";
 import { toast } from "../lib/toast";
 /**
  * The account health & error log dialog shared by the Quota page and provider detail.
@@ -28,6 +28,8 @@ export interface AccountHealthSummary {
   readonly staticToken?: boolean;
   readonly credentialKind?: CredentialKind;
   readonly credentialMode?: CredentialMode;
+  /** Who issued a static JWT, when the token's `iss` claim was readable. */
+  readonly jwtIssuer?: string | undefined;
 }
 
 /** Recovery is offered for the one transient state the backend can recover. */
@@ -65,7 +67,15 @@ export function HealthEventsModal({
   readonly summary: AccountHealthSummary;
   readonly onClose: () => void;
 }): ReactNode {
-  const { providerId, accountId, title, status, errorCategory, errorMessage } = summary;
+  const {
+    providerId,
+    accountId,
+    title,
+    status,
+    errorCategory,
+    errorMessage,
+    jwtIssuer,
+  } = summary;
   const query = useAccountHealthEvents(providerId, accountId);
   const recover = useRecoverAccount();
   const events = query.data ?? [];
@@ -76,7 +86,9 @@ export function HealthEventsModal({
     summary.staticToken === true;
   const [staticMode, setStaticMode] = useState(summary.staticToken === true);
   const [staticConfirm, setStaticConfirm] = useState<boolean | null>(null);
+  const [purgeConfirm, setPurgeConfirm] = useState(false);
   useEffect(() => setStaticMode(summary.staticToken === true), [summary.staticToken]);
+  const purge = usePurgeAccountHealthEvents();
 
   return (
     <Dialog open={true} onClose={onClose} title={`Health & Error Log — ${title}`} size="lg">
@@ -120,6 +132,19 @@ export function HealthEventsModal({
               <div className="text-badge text-text-tertiary">
                 {staticMode ? "Static mode: no refresh request will be sent." : "OAuth refresh is enabled for this account."}
               </div>
+              {/* The issuer is the only record of where a static token came
+                  from — the secret is unreadable after registration — so it is
+                  shown next to the mode rather than left for the operator to
+                  guess from the label. */}
+              {jwtIssuer ? (
+                <div className="text-badge text-text-tertiary mt-1 wrap-anywhere">
+                  {/* Expiry is omitted on purpose — the account card already
+                      shows it, and repeating it here pushes the issuer, the
+                      one thing this row adds, off the line. */}
+                  Static · no refresh · issuer{" "}
+                  <span className="font-mono text-text-secondary">{jwtIssuer}</span>
+                </div>
+              ) : null}
             </div>
             <Button
               size="sm"
@@ -132,17 +157,31 @@ export function HealthEventsModal({
           </div>
         ) : null}
         <div className="min-w-0">
-          <h4
-            className="text-caption font-semibold text-text-secondary mb-4"
-          >
-            Transition Events & Audit ({events.length})
-          </h4>
+          <div className="flex items-center justify-between gap-5 mb-4">
+            <h4
+              className="text-caption font-semibold text-text-secondary"
+            >
+              Transition Events & Audit ({events.length})
+            </h4>
+            <Button
+              size="sm"
+              variant="secondary"
+              icon={<Trash2 size={12} />}
+              disabled={events.length === 0 || purge.isPending}
+              onClick={() => setPurgeConfirm(true)}
+              title="Deletes this account's recorded transitions and audit entries."
+            >
+              Purge log
+            </Button>
+          </div>
+          {/* `compact` throughout: these render in a dialog body rather than a
+              route, so they must not reserve the route-level centering floor. */}
           {query.isPending ? (
-            <LoadingState label="Loading health events..." />
+            <LoadingState compact label="Loading health events..." />
           ) : query.isError ? (
-            <ErrorState message="Failed to load health events" onRetry={() => void query.refetch()} />
+            <ErrorState compact message="Failed to load health events" onRetry={() => void query.refetch()} />
           ) : events.length === 0 ? (
-            <EmptyState title="No health events recorded" message={summary.emptyMessage} icon={<Activity size={20} />} />
+            <EmptyState compact title="No health events recorded" message={summary.emptyMessage} icon={<Activity size={20} />} />
           ) : (
             <div className="rounded-inset border border-inner-border">
               <DataTable
@@ -156,9 +195,21 @@ export function HealthEventsModal({
                       {new Date(ev.createdAt).toLocaleString()}
                     </td>
                     <td className="whitespace-nowrap">
-                      <span className="text-badge text-text-secondary">
-                        {ev.fromStatus ?? "new"} →{" "}
-                      </span>
+                      {/*
+                        * A same-status row is a recorded failure that did not
+                        * move the account — a provider-scoped rate limit, for
+                        * instance: nothing was cooled, so the account stays
+                        * active. Rendering it as "ACTIVE → ACTIVE" looked like
+                        * a broken transition; naming it as an event beside the
+                        * unchanged status is what it actually is.
+                        */}
+                      {ev.fromStatus !== null && ev.fromStatus !== ev.toStatus ? (
+                        <span className="text-badge text-text-secondary">
+                          {ev.fromStatus} →{" "}
+                        </span>
+                      ) : (
+                        <span className="text-badge text-text-tertiary">logged · </span>
+                      )}
                       <Badge tone={statusTone(ev.toStatus)}>{ev.toStatus}</Badge>
                     </td>
                     <td className="font-mono tabular-nums text-badge text-text-secondary wrap-anywhere">
@@ -199,6 +250,20 @@ export function HealthEventsModal({
           title={staticModeCopy(staticConfirm === true, title).title}
           message={staticModeCopy(staticConfirm === true, title).message}
           confirmLabel={staticModeCopy(staticConfirm === true, title).confirmLabel}
+          cancelLabel="Cancel"
+        />
+        <ConfirmDialog
+          open={purgeConfirm}
+          onClose={() => setPurgeConfirm(false)}
+          onConfirm={() => {
+            purge.mutate(
+              { providerId, accountId, title },
+              { onSuccess: () => setPurgeConfirm(false) },
+            );
+          }}
+          title={`Purge the health & error log for ${title}?`}
+          message="Deletes every transition and audit entry recorded for this account. Its status, credentials, and counters are untouched. This cannot be undone."
+          confirmLabel="Purge log"
           cancelLabel="Cancel"
         />
         <Inline justify="flex-end" gap="0px">

@@ -15,6 +15,7 @@ import {
   type PoolStrategySetting,
 } from "./contracts";
 import { createNetworkPoolOperations } from "./operations";
+import { parseProxyFile } from "./import-parse";
 
 const poolKindSchema = literalUnion(POOL_KINDS);
 const createPoolBody = t.Object({
@@ -43,6 +44,18 @@ const testBatchBody = t.Object({
   targets: t.Array(createPoolBody, { minItems: 1, maxItems: MAX_BATCH_PROBE_TARGETS }),
 });
 const updatePoolBody = t.Partial(createPoolBody);
+/**
+ * A pasted proxy list. `content` is the file's text; the shapes accepted are
+ * documented on {@link parseProxyFile}. `maxInflight` and `weight` apply to
+ * every imported row, because a file carries no per-row tuning.
+ */
+const importPoolsBody = t.Object({
+  content: t.String({ minLength: 1 }),
+  maxInflight: t.Optional(t.Number()),
+  weight: t.Optional(t.Number()),
+  family: t.Optional(t.Union([t.String(), t.Null()])),
+  labelPrefix: t.Optional(t.String()),
+});
 export function createNetworkPoolRoutes(config: NetworkPoolConfig): Elysia {
   const factory = createNetworkPoolOperations(config);
   return new Elysia({ prefix: "/network/pools" })
@@ -60,6 +73,10 @@ export function createNetworkPoolRoutes(config: NetworkPoolConfig): Elysia {
         body as CreateNetworkPoolRequest,
       );
 })
+    .post("/import", { body: importPoolsBody }, async ({ request, body, set }) => {
+      set.status = 200;
+      return await factory.importPools(config.accessResolver(request), body);
+    })
     .patch("/:poolId", { body: updatePoolBody }, async ({ request, params, body }) => {
       return await factory.updatePool(
         config.accessResolver(request),
@@ -70,6 +87,36 @@ export function createNetworkPoolRoutes(config: NetworkPoolConfig): Elysia {
     .delete("/:poolId", async ({ request, params }) => {
       return await factory.deletePool(config.accessResolver(request), params.poolId);
 })
+    .post(
+      "/bulk/create",
+      { body: t.Object({ targets: t.Array(createPoolBody, { minItems: 1, maxItems: MAX_BATCH_PROBE_TARGETS }) }) },
+      async ({ request, body, set }) => {
+        set.status = 200;
+        return await factory.createPoolBatch(
+          config.accessResolver(request),
+          body.targets as CreateNetworkPoolRequest[],
+        );
+      },
+    )
+    .post(
+      "/bulk/delete",
+      { body: t.Object({ ids: t.Array(t.String(), { minItems: 1 }) }) },
+      async ({ request, body }) => {
+        return await factory.deletePoolBatch(config.accessResolver(request), body.ids);
+      },
+    )
+    .post(
+      "/bulk/status",
+      {
+        body: t.Object({
+          ids: t.Array(t.String(), { minItems: 1 }),
+          status: literalUnion(POOL_STATUSES),
+        }),
+      },
+      async ({ request, body }) => {
+        return await factory.setPoolStatusBatch(config.accessResolver(request), body.ids, body.status);
+      },
+    )
     .get("/:poolId/health-events", async ({ request, params }) => {
       return await factory.listPoolHealthEvents(config.accessResolver(request), params.poolId);
 })

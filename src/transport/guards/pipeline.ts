@@ -10,7 +10,6 @@ import type { CanonicalAdapter, ShutdownDrainSource } from "../contracts";
 import { createApiKeyAuthenticationMiddleware } from "./auth-guard";
 import { createDependencyReadinessMiddleware } from "./readiness-guard";
 import { createIpAbuseProtectionMiddleware } from "./abuse-guard";
-import { createProcessConcurrencyMiddleware } from "./concurrency-guard";
 import { createHeadroomGuard } from "./headroom-guard";
 import {
   createErrorNormalizationMiddleware,
@@ -27,8 +26,13 @@ import type { TrustedProxyBoundary } from "../../config/network";
 import type { CartethyiaDatabase } from "../../persistence/db-handle";
 import type { RedisClient } from "../../persistence/redis";
 import type { TelemetryBatchBuffer } from "../../observability/telemetry-buffer";
-import type { ModelStrikeService } from "../../security/model-abuse";
-import { TelemetryPayloadCapture, payloadCaptureKeepsBodies } from "../../observability/payload-capture";
+import type { RuntimeMemorySnapshot } from "../../observability/runtime-metrics";
+import {
+  TelemetryPayloadCapture,
+  payloadCaptureKeepsBodies,
+  payloadRetentionMs,
+  resolvePayloadCapture,
+} from "../../observability/payload-capture";
 
 /** Shared state/context carried by every ordered transport stage. */
 export interface TransportPipelineContext {
@@ -45,7 +49,6 @@ export interface TransportPipelineContext {
   readonly requestDeadlineMs?: number;
   readonly verifiedHttps?: boolean;
   /** Graduated strikes for repeated invalid-model requests. */
-  readonly modelStrikes?: ModelStrikeService;
   readonly shutdownCoordinator?: ShutdownDrainSource;
   readonly telemetry?: TelemetryBatchBuffer;
   /**
@@ -53,6 +56,20 @@ export interface TransportPipelineContext {
    * decision is local, and Redis is only written for fleet visibility.
    */
   readonly redis?: RedisClient | undefined;
+  /**
+   * The sampled memory state the headroom guard sheds against.
+   *
+   * Supplied by the runtime sampler. When absent the guard cannot compare RSS
+   * against a limit and does not shed — so this must be wired in production,
+   * and the sampler must be initialized at boot even before its first tick.
+   */
+  readonly memorySnapshot?: () => RuntimeMemorySnapshot | undefined;
+  /**
+   * Whether invoke is switched off for a tenant. Optional: without it the
+   * gateway never refuses on the kill switch, which is the pre-change
+   * behaviour rather than a failure.
+   */
+  readonly isInvokeDisabled?: (tenantId: string) => Promise<boolean | undefined>;
 }
 
 /**
@@ -76,9 +93,9 @@ export interface TransportPipeline {
  */
 export function createTransportPipeline(context: TransportPipelineContext): TransportPipeline {
   const stages: Elysia[] = [
-    createProcessConcurrencyMiddleware(),
     createHeadroomGuard({
       store: context.stateStore,
+      ...(context.memorySnapshot === undefined ? {} : { memorySnapshot: context.memorySnapshot }),
       ...(context.redis === undefined ? {} : { redis: context.redis }),
     }),
     createDependencyReadinessMiddleware({
@@ -97,7 +114,9 @@ export function createTransportPipeline(context: TransportPipelineContext): Tran
     createApiKeyAuthenticationMiddleware({
       db: context.db,
       stateStore: context.stateStore,
-      ...(context.modelStrikes ? { modelStrikes: context.modelStrikes } : {}),
+      ...(context.isInvokeDisabled
+        ? { isInvokeDisabled: context.isInvokeDisabled }
+        : {}),
     }),
     createCanonicalRequestMiddleware({
       stateStore: context.stateStore,
@@ -108,7 +127,6 @@ export function createTransportPipeline(context: TransportPipelineContext): Tran
     createProxyRoutePreparationMiddleware({
       stateStore: context.stateStore,
       preparer: context.preparer,
-      ...(context.modelStrikes ? { modelStrikes: context.modelStrikes } : {}),
     }),
   ];
   const mountRoot = (app: Elysia<any, any, any, any, any, any, any, any>): void => {
@@ -167,8 +185,20 @@ export function createTransportPipeline(context: TransportPipelineContext): Tran
         stateStore: context.stateStore,
         telemetryBuffer: context.telemetry,
         // One capture for the process, shared with every request state so an
-        // early rejection can record its payload from the finalize hook.
-        payloadCapture: new TelemetryPayloadCapture(context.db),
+        // early rejection can record its payload from the finalize hook. It
+        // resolves the tenant's retention itself because an early rejection has
+        // no preference memo on its state — nothing resolved one before the
+        // request was refused.
+        payloadCapture: new TelemetryPayloadCapture(context.db, (tenantId) =>
+          resolvePayloadCapture(context.db, tenantId).then(
+            (resolved) => (resolved.ok ? resolved.retentionMs : payloadRetentionMs()),
+          ),
+        ),
+        // The early-rejection capture resolves the tenant's capture mode
+        // through the same preference path dispatched requests use, instead of
+        // capturing bodies under the deployment default regardless of the
+        // tenant's none/metadata choice.
+        db: context.db,
       });
     } else {
       registerRequestCleanup(rootApp, { stateStore: context.stateStore });

@@ -49,7 +49,7 @@ import { createUpstreamDeadlineLifecycle, abortGatewayError } from "../../operat
 import { mapUpstreamHttpError } from "../../../transport/failure-policy";
 import { buildClaudeMessagesRequest, filterClaudeCustomHeaders } from "../shared/claude-messages";
 import { sendClaudeMessagesRequest } from "../../../protocol/upstream/send-claude-messages";
-import { applyParamQuirks } from "../../../transport/translation/quirks";
+import { applyParamQuirks } from "../../../protocol/translation/quirks";
 import { createApiKeyAdapter } from "../../configured-provider";
 import type { ApiKeyProviderSpec } from "../../configured-provider";
 import { decodeFactoryDroidCredential } from "../../../security/credential-codec";
@@ -496,7 +496,14 @@ class FactoryDroidAdapter implements ProviderAdapter {
       response = await outboundFetch(url, {
         method: "POST",
         headers,
-        body: JSON.stringify(buildGeminiPayload(request)),
+        body: JSON.stringify(
+          buildGeminiPayload(
+            request,
+            ...(context.image_clamp_max_bytes === undefined
+              ? []
+              : [{ maxBytesOverride: context.image_clamp_max_bytes }]),
+          ),
+        ),
         signal: lifecycle.signal,
       });
     } catch (error: unknown) {

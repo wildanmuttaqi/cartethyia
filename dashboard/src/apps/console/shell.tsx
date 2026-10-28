@@ -2,6 +2,7 @@ import {
   Activity,
   Bell,
   Clock,
+  ChevronDown,
   Cpu,
   FlaskConical,
   Globe,
@@ -24,6 +25,7 @@ import {
   type LucideIcon,
 } from "lucide-react";
 import { Palette } from "lucide-react";
+import { HeaderExtras } from "../../components/HeaderExtras";
 import { useEffect, useLayoutEffect, useRef, useState, type ReactNode } from "react";
 import { createPortal } from "react-dom";
 import { NavLink, useLocation, useNavigate } from "react-router-dom";
@@ -32,20 +34,24 @@ import { BackgroundLayer } from "../../features/customization/BackgroundLayer";
 import { applyCustomization, readCustomizationSettings } from "../../features/customization/settings";
 import { consoleRequest } from "../../data/api";
 import { ConfirmDialog } from "../../components/ConfirmDialog";
-import { queryClient } from "../../data/query-client";
+import { UpdateDialog, readDismissedUpdate, dismissUpdate } from "../../components/UpdateDialog";
+import { clearPersistedCache, queryClient } from "../../data/query-client";
 import { prefetchRouteIntent } from "../../data/route-prefetch";
-import { useSystemHealth, useLatestRelease } from "../../hooks/system";
+import { useSystemHealth, useLatestRelease, useNotifications } from "../../hooks/system";
 import { useProviders } from "../../hooks/providers";
 import { DASHBOARD_RELEASE_LABEL, DASHBOARD_VERSION } from "../../lib/version";
-import { GITHUB_RELEASES_URL, GITHUB_REPO_URL } from "../../lib/links";
+import { formatUptime } from "../../lib/format/numbers";
+import { GITHUB_RELEASES_URL } from "../../lib/links";
 import { isNewerRelease, type SystemHealthResponse } from "../../data/contracts";
 import type { SessionUser } from "../../data/contracts";
 
 interface NavItemDef {
   readonly label: string;
-  readonly path: string;
+  readonly path?: string;
   readonly icon: LucideIcon;
   readonly badge?: string;
+  readonly disabled?: boolean;
+  readonly children?: readonly NavItemDef[];
 }
 
 interface NavGroupDef {
@@ -70,6 +76,16 @@ export const navigationGroups: readonly NavGroupDef[] = [
       { label: "Quota Management", path: "/quota", icon: ShieldAlert },
       { label: "Proxy & Requests", path: "/proxy", icon: Network },
       { label: "CLI Tools", path: "/cli-tools", icon: Terminal },
+    ],
+  },
+  {
+    label: "Tools",
+    items: [
+      {
+        label: "Tools",
+        icon: Globe,
+        children: [],
+      },
     ],
   },
   {
@@ -203,21 +219,6 @@ const UTC_CLOCK_FORMATTER = new Intl.DateTimeFormat(undefined, {
   timeZone: "UTC",
 });
 
-function formatUptime(seconds: number): string {
-  if (!Number.isFinite(seconds) || seconds < 0) return "Unavailable";
-  const totalSeconds = Math.floor(seconds);
-  if (totalSeconds < 60) return `${totalSeconds}s`;
-
-  const totalMinutes = Math.floor(totalSeconds / 60);
-  const minutes = totalMinutes % 60;
-  const totalHours = Math.floor(totalMinutes / 60);
-  const hours = totalHours % 24;
-  const days = Math.floor(totalHours / 24);
-  if (days > 0) return `${days}d ${hours}h ${minutes}m`;
-  if (totalHours > 0) return `${totalHours}h ${minutes}m`;
-  return `${totalMinutes}m`;
-}
-
 function formatProcessRss(bytes: number): string {
   if (!Number.isFinite(bytes) || bytes < 0) return "Unavailable";
   const unit = bytes >= 1024 ** 3
@@ -253,11 +254,19 @@ function MetricTile({
   );
 }
 
-function NotificationsPopover({ health }: { health?: SystemHealthResponse }) {
+function NotificationsPopover({
+  health,
+  onOpenUpdate,
+}: {
+  health?: SystemHealthResponse;
+  /** Opens the update dialog. A release alert is answered there, not on GitHub. */
+  onOpenUpdate: () => void;
+}) {
   const [open, setOpen] = useState(false);
   const [now, setNow] = useState(() => new Date());
   const triggerRef = useRef<HTMLButtonElement>(null);
   const contentRef = useRef<HTMLDivElement>(null);
+  const notifications = useNotifications();
 
   useEffect(() => {
     if (!open) return;
@@ -290,6 +299,26 @@ function NotificationsPopover({ health }: { health?: SystemHealthResponse }) {
     };
   }, [open]);
 
+  // One line per real dependency, not per mood: which backing services exist
+  // comes straight from the health payload. Lite mode has no external Postgres
+  // or Redis at all, so a healthy lite instance must not claim they connect.
+  const databaseLine = !health
+    ? undefined
+    : health.database_in_process
+      ? health.database_healthy
+        ? "SQLite in-process, connected."
+        : "SQLite in-process is not answering."
+      : health.database_healthy
+        ? "Postgres connected."
+        : "Postgres unreachable.";
+  const redisLine = !health
+    ? undefined
+    : !health.redis_configured
+      ? "Redis not configured."
+      : health.redis_healthy
+        ? "Redis connected."
+        : "Redis unreachable.";
+  const dependenciesLine = [databaseLine, redisLine].filter(Boolean).join(" · ");
   const healthTitle = !health
     ? "System health unavailable"
     : health.status === "healthy"
@@ -300,10 +329,8 @@ function NotificationsPopover({ health }: { health?: SystemHealthResponse }) {
   const healthDescription = !health
     ? "Live gateway metrics are not available."
     : health.status === "healthy"
-      ? "Postgres & Redis admission connected."
-      : health.status === "degraded"
-        ? "Check connection logs."
-        : "Gateway is reporting an unhealthy status.";
+      ? dependenciesLine || "Gateway reported healthy."
+      : [dependenciesLine, "Check connection logs."].filter(Boolean).join(" — ");
   const memoryDetail = health
     ? [
         Number.isFinite(health.memory_percent)
@@ -312,10 +339,19 @@ function NotificationsPopover({ health }: { health?: SystemHealthResponse }) {
         health.database_in_process ? "In-process DB included" : undefined,
       ].filter(Boolean).join(" · ") || undefined
     : undefined;
+  // Load average has no equivalent on Windows, so an unavailable reading is
+  // the honest result there rather than a measured 0%.
+  // Narrowed once: `cpu_percent` is `number | null`, and every consumer needs
+  // the same check. `Number.isFinite` proves it is a number at runtime but does
+  // not narrow the type, so this is the one `!== null` that does.
+  const cpuPercent = health?.cpu_percent ?? undefined;
+  const cpuMeasured = cpuPercent !== undefined && Number.isFinite(cpuPercent);
   const cpuDetail = health
-    ? Number.isFinite(health.cpu_cores) && health.cpu_cores > 0
-      ? `1-min load · ${health.cpu_cores} cores`
-      : "Normalized 1-min load"
+    ? cpuMeasured
+      ? Number.isFinite(health.cpu_cores) && health.cpu_cores > 0
+        ? `1-min load · ${health.cpu_cores} cores`
+        : "Normalized 1-min load"
+      : "Not reported on this platform"
     : undefined;
 
   return (
@@ -330,6 +366,12 @@ function NotificationsPopover({ health }: { health?: SystemHealthResponse }) {
         onClick={() => setOpen((v) => !v)}
       >
         <Bell size={17} />
+        {notifications.length > 0 ? (
+          <span
+            aria-label={`${notifications.length} notifications`}
+            className="absolute right-1.5 top-1.5 size-2 rounded-full bg-accent"
+          />
+        ) : null}
       </button>
       {open
         ? createPortal(
@@ -368,6 +410,57 @@ function NotificationsPopover({ health }: { health?: SystemHealthResponse }) {
                 </button>
               </div>
               <div className="scroll-region min-h-0 flex-1 flex flex-col gap-3">
+                {notifications.length > 0 ? (
+                  <section aria-label="Notifications" className="flex flex-col gap-2">
+                    {notifications.map((notification) => (
+                      <article
+                        key={notification.id}
+                        className={`flex items-start gap-3 rounded-card border p-4 ${
+                          notification.level === "warning"
+                            ? "border-orange-soft bg-orange-soft"
+                            : "border-accent/25 bg-accent-soft"
+                        }`}
+                      >
+                        <span className="min-w-0 flex-1">
+                          <span className="block text-caption font-semibold text-text-primary">
+                            {notification.title}
+                          </span>
+                          <span className="mt-1 block text-badge text-text-secondary">
+                            {notification.message}
+                          </span>
+                        </span>
+                        {notification.href ? (
+                          // A release alert opens the update dialog rather than
+                          // the release page: the page shows what changed, not
+                          // how to install, and the console is the thing that
+                          // can answer that. Other kinds keep their link.
+                          notification.kind === "update-available" ? (
+                            <button
+                              type="button"
+                              className="shrink-0 text-badge font-semibold text-accent"
+                              onClick={onOpenUpdate}
+                            >
+                              Update
+                            </button>
+                          ) : (
+                            <a
+                              className="shrink-0 text-badge font-semibold text-accent"
+                              href={notification.href}
+                              target="_blank"
+                              rel="noreferrer"
+                            >
+                              Open
+                            </a>
+                          )
+                        ) : null}
+                      </article>
+                    ))}
+                  </section>
+                ) : (
+                  <div className="rounded-card border border-inner-border bg-surface-2 p-4 text-badge text-text-secondary">
+                    No active memory or update alerts.
+                  </div>
+                )}
                 <div className="flex items-start gap-3 rounded-card border border-inner-border bg-surface-2 p-4">
                   <span className="mt-0.5 grid w-12 h-12 shrink-0 place-items-center rounded-control bg-surface-1 text-text-secondary">
                     <Server size={16} aria-hidden="true" />
@@ -398,8 +491,8 @@ function NotificationsPopover({ health }: { health?: SystemHealthResponse }) {
                   <MetricTile
                     icon={Cpu}
                     label="CPU load"
-                    value={health && Number.isFinite(health.cpu_percent)
-                      ? `${health.cpu_percent.toFixed(1)}%`
+                    value={cpuMeasured && cpuPercent !== undefined
+                      ? `${cpuPercent.toFixed(1)}%`
                       : "Unavailable"}
                     detail={cpuDetail}
                     title="One-minute load average normalized by the number of CPU cores."
@@ -462,6 +555,7 @@ function SidebarNavList({
 }) {
   const containerRef = useRef<HTMLDivElement>(null);
   const [indicator, setIndicator] = useState({ top: 0, height: 0, opacity: 0 });
+  const [expandedItems, setExpandedItems] = useState<ReadonlySet<string>>(() => new Set());
 
   useLayoutEffect(() => {
     const container = containerRef.current;
@@ -492,19 +586,83 @@ function SidebarNavList({
         aria-hidden="true"
       />
       {items.map((item) => {
+        if (item.children !== undefined) {
+          const expanded = expandedItems.has(item.path ?? item.label);
+          return (
+            <div key={item.path ?? item.label}>
+              <button
+                type="button"
+                className="nav-link-item w-full"
+                aria-expanded={expanded}
+                onClick={() =>
+                  setExpandedItems((current) => {
+                    const next = new Set(current);
+                    const key = item.path ?? item.label;
+                    if (next.has(key)) next.delete(key);
+                    else next.add(key);
+                    return next;
+                  })
+                }
+              >
+                <item.icon size={17} className="nav-link-icon" />
+                <span>{item.label}</span>
+                <ChevronDown
+                  size={14}
+                  className={`ml-auto shrink-0 transition-transform ${expanded ? "rotate-180" : ""}`}
+                  aria-hidden="true"
+                />
+              </button>
+              {expanded ? (
+                <div className="ml-6 border-l border-inner-border pl-2">
+                  {item.children.map((child) => (
+                    <button
+                      key={child.path ?? child.label}
+                      type="button"
+                      className="nav-link-item w-full"
+                      disabled={child.disabled === true}
+                      title={child.label}
+                    >
+                      <child.icon size={15} className="nav-link-icon" />
+                      <span>{child.label}</span>
+                      {child.badge ? <span className="nav-link-badge">{child.badge}</span> : null}
+                    </button>
+                  ))}
+                </div>
+              ) : null}
+            </div>
+          );
+        }
+        if (item.disabled) {
+          return (
+            <button
+              key={item.path ?? item.label}
+              type="button"
+              className="nav-link-item w-full cursor-not-allowed opacity-55"
+              disabled
+              aria-label={`${item.label} — unavailable`}
+              title="Coming soon"
+            >
+              <item.icon size={17} className="nav-link-icon" />
+              <span>{item.label}</span>
+              <span className="nav-link-badge">Soon</span>
+            </button>
+          );
+        }
+        if (item.path === undefined) return null;
+        const path = item.path;
         const isActive =
-          item.path === "/"
+          path === "/"
             ? pathname === "/"
-            : pathname === item.path || pathname.startsWith(`${item.path}/`);
+            : pathname === path || pathname.startsWith(`${path}/`);
         return (
           <NavLink
-            key={item.path}
-            to={item.path}
-            end={item.path === "/"}
+            key={path}
+            to={path}
+            end={path === "/"}
             data-active={isActive ? "true" : undefined}
             className={`nav-link-item ${isActive ? "active" : ""}`}
-            onMouseEnter={() => onIntent(item.path)}
-            onFocus={() => onIntent(item.path)}
+            onMouseEnter={() => onIntent(path)}
+            onFocus={() => onIntent(path)}
           >
             <item.icon size={17} className="nav-link-icon" />
             <span>{item.label}</span>
@@ -528,6 +686,35 @@ export function DashboardShell({
   const [drawerOpen, setDrawerOpen] = useState(false);
   const [loggingOut, setLoggingOut] = useState(false);
   const [logoutOpen, setLogoutOpen] = useState(false);
+  const [updateOpen, setUpdateOpen] = useState(false);
+  const [updating, setUpdating] = useState(false);
+  const handleUpdateNow = async (): Promise<void> => {
+    setUpdating(true);
+    try {
+      await consoleRequest<void>("/updates/apply", { method: "POST" });
+    } catch {
+      setUpdating(false);
+      return;
+    }
+    // block refresh
+    const beforeUnload = (e: BeforeUnloadEvent): void => { e.preventDefault(); };
+    window.addEventListener("beforeunload", beforeUnload);
+    // poll until version changes
+    const target = latestTag;
+    const poll = window.setInterval(async () => {
+      try {
+        const res = await fetch("/console/api/updates/release");
+        const data = (await res.json()) as { tag_name?: string };
+        if (target !== undefined && data.tag_name !== target) {
+          window.clearInterval(poll);
+          window.removeEventListener("beforeunload", beforeUnload);
+          window.location.reload();
+        }
+      } catch {
+        // server restarting; keep polling
+      }
+    }, 3000);
+  };
   const healthQuery = useSafeSystemHealth();
   const releaseQuery = useLatestRelease();
   // The running version is the gateway's, not the bundled dashboard's: the
@@ -537,6 +724,21 @@ export function DashboardShell({
   const latestTag = releaseQuery.data?.tag_name?.replace(/^v/, "");
   const updateAvailable = isNewerRelease(localVersion, latestTag);
   const providersQuery = useProviders();
+  // Prompts once per release, not once per load: the point of showing it at all
+  // is that an operator running an old version may never think to look. But a
+  // dialog that returns on every navigation punishes the person who has already
+  // decided not to upgrade, so dismissing records the version and the prompt
+  // stays away until a newer one is published.
+  const promptedRef = useRef<string | null>(null);
+  useEffect(() => {
+    if (!updateAvailable || latestTag === undefined) return;
+    if (readDismissedUpdate() === latestTag) return;
+    // The release query can settle more than once; without this the dialog
+    // would reopen after the operator closed it, within the same page life.
+    if (promptedRef.current === latestTag) return;
+    promptedRef.current = latestTag;
+    setUpdateOpen(true);
+  }, [updateAvailable, latestTag]);
 
   const prefetchIntent = (path: string): void => {
     void prefetchRouteIntent(queryClient, path);
@@ -566,8 +768,10 @@ export function DashboardShell({
       await consoleRequest<void>("/auth/logout", { method: "POST" });
     } finally {
       // Drop every cached tenant view before leaving so the next login
-      // never renders the previous tenant's data.
+      // never renders the previous tenant's data — from memory and from the
+      // persisted snapshot, which `clear()` does not touch.
       queryClient.clear();
+      clearPersistedCache();
       navigate("/login", { replace: true });
     }
   };
@@ -586,6 +790,7 @@ export function DashboardShell({
   return (
     <>
       <div className="app-bg" aria-hidden="true" />
+      <BackgroundLayer />
       <div className="app-shell-frame">
       <div
         className="app-shell-root"
@@ -615,22 +820,26 @@ export function DashboardShell({
                 <span>Cartethyia</span>
               </div>
               <div className="brand-version-badge">
-                <a href={GITHUB_REPO_URL} target="_blank" rel="noreferrer" className="brand-version-link">{DASHBOARD_RELEASE_LABEL}</a>
+                <a href={GITHUB_RELEASES_URL} target="_blank" rel="noreferrer" className="brand-version-link">{DASHBOARD_RELEASE_LABEL}</a>
                 {updateAvailable ? (
-                  <a
-                    href={releaseQuery.data?.html_url ?? GITHUB_RELEASES_URL}
-                    target="_blank"
-                    rel="noreferrer"
+                  // A button, not a link to GitHub: the badge says an update
+                  // exists and the dialog tells the operator how to install it.
+                  // Sending them to a release page instead left them to work
+                  // out the npm command themselves, on a page that does not
+                  // mention it.
+                  <button
+                    type="button"
+                    onClick={() => setUpdateOpen(true)}
                     className="brand-update-badge"
                     title={
                       latestTag === undefined
-                        ? "A newer Cartethyia release is available on GitHub"
-                        : `Update available on GitHub: v${latestTag}`
+                        ? "A newer Cartethyia release is available"
+                        : `Update available: v${latestTag} — how to install it`
                     }
                   >
                     <Rocket size={9} className="shrink-0" aria-hidden="true" />
-                    update
-                  </a>
+                    {latestTag === undefined ? "update" : `Update v${latestTag}`}
+                  </button>
                 ) : null}
               </div>
             </div>
@@ -673,7 +882,6 @@ export function DashboardShell({
 
         {/* Main Column */}
         <div className="app-main-column">
-          <BackgroundLayer />
           {/* Topbar Header */}
           <header className="glass app-topbar">
             <button
@@ -693,8 +901,12 @@ export function DashboardShell({
             </div>
 
             <div className="topbar-actions">
+              <HeaderExtras />
               <ThemeToggle />
-              <NotificationsPopover health={healthQuery.data} />
+              <NotificationsPopover
+                health={healthQuery.data}
+                onOpenUpdate={() => setUpdateOpen(true)}
+              />
             </div>
           </header>
 
@@ -714,6 +926,20 @@ export function DashboardShell({
         message="You will need to sign in again to open the console."
         confirmLabel="Sign out"
         danger
+      />
+      <UpdateDialog
+        open={updateOpen}
+        onClose={() => setUpdateOpen(false)}
+        currentVersion={localVersion}
+        {...(latestTag === undefined ? {} : { latestVersion: latestTag })}
+        {...(releaseQuery.data?.html_url === undefined
+          ? {}
+          : { releaseUrl: releaseQuery.data.html_url })}
+        {...(latestTag === undefined
+          ? {}
+          : { onDismissVersion: () => dismissUpdate(latestTag) })}
+        onUpdateNow={handleUpdateNow}
+        updating={updating}
       />
     </>
   );

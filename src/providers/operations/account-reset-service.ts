@@ -608,7 +608,7 @@ function describeResetCode(code: string): string {
 /**
  * Writes the outcome to `health_events` and, on success, restores the account to
  * `active` so it rejoins dispatch rotation immediately rather than waiting out a
- * cooldown that no longer reflects reality.
+ * cooldown that the reset has already cleared.
  */
 async function recordResetActivity(
   db: CartethyiaDatabase,
@@ -642,6 +642,7 @@ async function recordResetActivity(
       })
       .where(eq(providerAccounts.id, accountId));
     await db.insert(healthEvents).values({
+      id: randomUUID(),
       entityKind: "account",
       accountId,
       fromStatus: currentStatus,
@@ -655,6 +656,7 @@ async function recordResetActivity(
   }
 
   await db.insert(healthEvents).values({
+    id: randomUUID(),
     entityKind: "account",
     accountId,
     fromStatus: currentStatus,

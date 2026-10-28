@@ -1,6 +1,14 @@
 import { getOpenCodeVersion } from "../../operations/client-versions";
 import { createHash, randomBytes } from "node:crypto";
 
+/**
+ * The OpenCode fallback client identity, used only while version discovery has
+ * not resolved yet. The live feed (`opencode/latest/<version>/cli`) wins once
+ * it is available; upstream accepts a range of releases, so the fallback does
+ * not need chasing.
+ */
+export const OPENCODE_CLIENT_VERSION = "2.1.1";
+
 let lastTimestamp = 0;
 let sequenceCounter = 0;
 const SESSION_ID_ALPHABET = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
@@ -23,11 +31,11 @@ const SESSION_COUNTER_MAX = 63;
  * `ses_` + 12-char hex (bitwise inverted millisecond timestamp * 4096 + seq) + 14-char base62.
  *
  * The counter is capped rather than left to grow. Sixty-four dispatches inside
- * one millisecond used to emit ids the gate refuses, so a burst — exactly what
- * a proxy pool produces — 403'd on its own headers while every other field was
+ * one millisecond emit ids the gate refuses, so a burst — exactly what a proxy
+ * pool produces — would 403 on its own headers while every other field was
  * correct. On overflow the timestamp advances by one millisecond instead: the
  * id stays inside the window, and the only cost is that ids minted in the same
- * real millisecond no longer sort as the client's would.
+ * real millisecond do not sort as the client's would.
  */
 export function generateOpenCodeSessionId(now = Date.now()): string {
   if (now !== lastTimestamp) {
@@ -118,11 +126,19 @@ function createTraceHeaders(): Record<string, string> {
   };
 }
 
-/** Build the observed OpenCode CLI identity headers for an upstream dispatch. */
+/**
+ * Build the observed OpenCode CLI identity headers for an upstream dispatch.
+ *
+ * The v2 lane splits root and child session ids exactly like the reference
+ * gateway: `x-opencode-session` / `x-session-affinity` / `x-session-id` carry
+ * the root session, while `x-opencode-session-id` carries the child (the
+ * client's own session id when it sent one, else the root).
+ */
 export function buildOpenCodeHeaders(
   version = getOpenCodeVersion(),
   affinity?: string,
   projectId?: string,
+  childSessionId?: string,
 ): Record<string, string> {
   let sessionId: string;
   if (isOpenCodeSessionId(affinity)) {
@@ -132,6 +148,7 @@ export function buildOpenCodeHeaders(
   } else {
     sessionId = generateOpenCodeSessionId();
   }
+  const childId = isOpenCodeSessionId(childSessionId) ? childSessionId : sessionId;
   return {
     // The gate accepts both "cli" and "desktop" (measured 2026-10-17), so this
     // is not a refusal either way. It is "cli" because that is what the client
@@ -140,7 +157,7 @@ export function buildOpenCodeHeaders(
     // client identity this adapter does not have, for no measured benefit.
     "x-opencode-client": "cli",
     "x-opencode-session": sessionId,
-    "x-opencode-session-id": sessionId,
+    "x-opencode-session-id": childId,
     "x-session-affinity": sessionId,
     "x-session-id": sessionId,
     // No `x-opencode-request`: the current client no longer sends it, and

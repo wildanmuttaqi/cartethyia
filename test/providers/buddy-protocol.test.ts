@@ -1,11 +1,23 @@
 import { describe, expect, test } from "bun:test";
-import { buddyPrePayloadCommon, buildBuddyPromptCacheKey } from "../../src/providers/integrations/buddy/buddy-chat-shared";
+import {
+  applyBuddySystemPrompt,
+  buddyPrePayloadCommon,
+  buildBuddyPromptCacheKey,
+  dropEmptyBuddyMessages,
+  scrubBuddyChannelIdentityText,
+} from "../../src/providers/integrations/buddy/buddy-chat-shared";
+import { CODEBUDDY_SYSTEM_PROMPT } from "../../src/providers/integrations/buddy/codebuddy/provider";
+import {
+  workbuddyPrePayload,
+  WORKBUDDY_SYSTEM_PROMPT,
+} from "../../src/providers/integrations/buddy/workbuddy/provider";
 import { codeBuddyCnPrePayload } from "../../src/providers/integrations/buddy/codebuddy/cn-provider";
 import { readBuddyDeviceToken, workbuddyHeaders } from "../../src/providers/integrations/buddy/workbuddy/shared";
 import { fetchTencentBillingQuota } from "../../src/providers/integrations/buddy/buddy-quota-shared";
 import { fetchWorkBuddyCnQuota } from "../../src/providers/integrations/buddy/workbuddy/quota";
 import { parseDsmlToolCalls } from "../../src/protocol/response/dsml";
 import { parseChatResponseToEvents } from "../../src/protocol/response/chat";
+import { decodeChatSseStream } from "../../src/protocol/response/chat";
 import type { CanonicalRequest } from "../../src/protocol/canonical-model";
 import type { ProviderDispatchContext, ProviderDispatchTarget } from "../../src/providers/provider-contracts";
 
@@ -82,7 +94,10 @@ describe("Buddy upstream protocol alignment", () => {
       max_tokens: 200_000,
     };
     buddyPrePayloadCommon(payload, request, "intl");
-    expect(payload["max_tokens"]).toBe(131_072);
+    // 48,000 is what /v3/config publishes for glm-5.2. The catalog carried
+    // 131,072, which no endpoint reports; the clamp is only as correct as the
+    // limit it clamps to, so this pins the live number.
+    expect(payload["max_tokens"]).toBe(48_000);
   });
 
   test("an effort the ladder serves as asked leaves max_tokens alone", () => {
@@ -152,7 +167,11 @@ describe("Buddy upstream protocol alignment", () => {
     };
     codeBuddyCnPrePayload(payload, request, candidate);
     expect(payload["reasoning_effort"]).toBe("xhigh");
-    expect(payload["max_tokens"]).toBe(192_000);
+    // The floor is half the model's catalog output limit. deepseek-v4-pro's CN
+    // output was recorded as 384,000 (making the floor 192,000); /v3/config
+    // publishes 128,000, so the correct floor is 64,000. A clamp is only as
+    // right as the limit it reads, which is what this pins.
+    expect(payload["max_tokens"]).toBe(64_000);
   });
 
   test("`auto` stays `auto` on the international roster", () => {
@@ -296,10 +315,13 @@ describe("Buddy upstream protocol alignment", () => {
     expect(cnHeaders["origin"]).toBe("https://www.workbuddy.cn");
     expect(cnHeaders["referer"]).toBe("https://www.workbuddy.cn/");
     expect(cnHeaders["x-domain"]).toBe("www.workbuddy.cn");
-    expect(cnHeaders["user-agent"]).toMatch(
-      /^WorkBuddy\/5\.7\.7\.40774747 WorkBuddy AI\/5\.7\.7\.40774747 CLI\/\S+$/,
-    );
-    expect(cnHeaders["user-agent"]).toContain("5.7.7.40774747");
+    // The WorkBuddy profile: brand, then the wire token `workbuddy-ai` (NOT
+    // the display brand "WorkBuddy AI" — the gateway 403s on the branded
+    // spelling), then the CLI suffix. Versions come from the monitor rather
+    // than a pinned build.
+    expect(cnHeaders["user-agent"]).toMatch(/^WorkBuddy\/\S+ workbuddy-ai\/\S+ CLI\/\S+$/);
+    // CN and international differ only in host identity, so the profile is the same.
+    expect(intlHeaders["user-agent"]).toMatch(/^WorkBuddy\/\S+ workbuddy-ai\/\S+ CLI\/\S+$/);
     expect(cnHeaders["x-product"]).toBe(intlHeaders["x-product"]);
   });
 
@@ -313,6 +335,50 @@ describe("Buddy upstream protocol alignment", () => {
       choices: [{ message: { role: "assistant", content: text }, finish_reason: "stop" }],
     }, request);
     expect(events.some((event) => event.type === "tool_call_delta" && event.name === "run_shell")).toBe(true);
+  });
+
+  test("recovers declared calls from donor DSML variants without exposing markup", async () => {
+    const singlePipe = "|";
+    const block = `<${singlePipe}DSML${singlePipe} function_calls><${singlePipe}DSML${singlePipe} invoke name="run_shell"><${singlePipe}DSML${singlePipe} parameter name="command" string="true">ls -la</${singlePipe}DSML${singlePipe} parameter></${singlePipe}DSML${singlePipe} invoke></${singlePipe}DSML${singlePipe} function_calls>`;
+    const callRequest = {
+      ...request,
+      tools: [{ name: "run_shell", description: "", schema: { type: "object", properties: {} } }],
+    } as unknown as CanonicalRequest;
+    const events = parseChatResponseToEvents({
+      choices: [{ message: { role: "assistant", content: block }, finish_reason: "stop" }],
+    }, callRequest);
+    expect(events.some((event) => event.type === "tool_call_delta" && event.name === "run_shell")).toBe(true);
+    expect(events.some((event) => event.type === "content_delta" && event.content.kind === "text" && event.content.text.includes("DSML"))).toBe(false);
+
+    const streamBody = new ReadableStream<Uint8Array>({
+      start(controller) {
+        const chunks = [block.slice(0, 18), block.slice(18, 59), block.slice(59)];
+        for (const content of chunks) {
+          controller.enqueue(new TextEncoder().encode(`data: ${JSON.stringify({ choices: [{ delta: { content }, finish_reason: null }] })}\n\n`));
+        }
+        controller.enqueue(new TextEncoder().encode(`data: ${JSON.stringify({ choices: [{ delta: {}, finish_reason: "stop" }] })}\n\n`));
+        controller.enqueue(new TextEncoder().encode("data: [DONE]\n\n"));
+        controller.close();
+      },
+    });
+    const streamEvents = [];
+    for await (const event of decodeChatSseStream(streamBody, callRequest)) streamEvents.push(event);
+    expect(streamEvents.some((event) => event.type === "tool_call_delta" && event.name === "run_shell")).toBe(true);
+    expect(streamEvents.some((event) => event.type === "content_delta" && event.content.kind === "text" && event.content.text.includes("DSML"))).toBe(false);
+  });
+
+  test("does not execute undeclared DSML tool names", () => {
+    const pipe = "｜｜";
+    const text = `<${pipe}DSML${pipe} calls><${pipe}DSML${pipe} invoke name="unlisted_tool"><${pipe}DSML${pipe} parameter name="x">1</${pipe}DSML${pipe} parameter></${pipe}DSML${pipe} invoke></${pipe}DSML${pipe} calls>`;
+    const callRequest = {
+      ...request,
+      tools: [{ name: "run_shell", description: "", schema: { type: "object", properties: {} } }],
+    } as unknown as CanonicalRequest;
+    const events = parseChatResponseToEvents({
+      choices: [{ message: { role: "assistant", content: text }, finish_reason: "stop" }],
+    }, callRequest);
+    expect(events.some((event) => event.type === "tool_call_delta")).toBe(false);
+    expect(events.some((event) => event.type === "content_delta" && event.content.kind === "text" && event.content.text === text)).toBe(true);
   });
 
   test("drops a replayed tool call whose function name is empty, and its orphan result", () => {
@@ -427,9 +493,13 @@ describe("Buddy upstream protocol alignment", () => {
     const result = await fetchWorkBuddyCnQuota("token", fetcher);
 
     expect(result.source).toBe("workbuddycn");
-    expect(capturedUrl).toBe("https://www.workbuddy.cn/v2/billing/meter/get-user-resource");
+    // The reference bills the CN realm on `www.codebuddy.cn`; `X-Domain` stays
+    // the domain recorded at login, so changing the host must not move it.
+    expect(capturedUrl).toBe("https://www.codebuddy.cn/v2/billing/meter/get-user-resource");
     expect(capturedHeaders?.get("x-domain")).toBe("www.workbuddy.cn");
-    expect(capturedHeaders?.get("user-agent")).toContain("WorkBuddy/5.8.3.41334564");
+    // WorkBuddy profile shape; the version comes from the monitor, not a pin.
+    // The second token is the wire spelling `workbuddy-ai`.
+    expect(capturedHeaders?.get("user-agent")).toMatch(/^WorkBuddy\/\S+ workbuddy-ai\/\S+ CLI\/\S+$/);
   });
 
   test("classifies refill and bonus packages into the same spendable credit pool", async () => {
@@ -468,5 +538,196 @@ describe("Buddy upstream protocol alignment", () => {
     });
 
     expect(result.windows.map((entry) => entry.accounting)).toEqual(["pooled", "pooled"]);
+  });
+});
+
+describe("Buddy empty-reasoning drop (upstream 11151 'history not found')", () => {
+  // Reproduction: a client switches from one thinking model to another
+  // (Claude Opus 4.7 1M → Kimi K3.1 Pro observed), and the second request
+  // carries a canonical `reasoning` input item with no `.summary` and a
+  // `null` `.payload` — a signature-less thinking block that was already
+  // stripped on an earlier hop. The chat encoder produced
+  // `{role:"assistant", content:"", reasoning_content:""}`; the previous
+  // `dropEmptyBuddyMessages` guard treated `reasoning_content` of ANY
+  // string length as load-bearing and kept the stub. WorkBuddy / Kimi then
+  // rejected the whole request with code 11151 ("history not found").
+
+  test("drops an assistant turn whose reasoning_content is the empty string", () => {
+    const messages: Array<Record<string, unknown>> = [
+      { role: "user", content: "hi" },
+      // The exact shape the chat encoder emits for a reasoning-only canonical
+      // turn with no summary and a non-string payload. Empty `content`, empty
+      // `reasoning_content`, no tool_calls, no tool_call_id.
+      { role: "assistant", content: "", reasoning_content: "" },
+      { role: "user", content: "next turn" },
+    ];
+    dropEmptyBuddyMessages(messages);
+    expect(messages.map((m) => m["role"])).toEqual(["user", "user"]);
+  });
+
+  test("also drops a bare assistant stub carrying only an unverifiable placeholder trace", () => {
+    // The OMP client's observed sentinel: when the client switches thinking
+    // models mid-conversation, every historical reasoning item in the
+    // Responses `input` is replaced with
+    // `{summary: [], content: [{type: "reasoning_text",
+    // text: "reasoning unavailable"}]}`. The chat encoder dutifully forwards
+    // that text as `reasoning_content: "reasoning unavailable"`, but no model
+    // in the receiving install issued that signature — so forwarding it to
+    // WorkBuddy/Kimi gets rejected with the same 11151 as the empty case.
+    // A `content: ""` assistant turn with no `tool_calls` and no
+    // `tool_call_id` is unverifiable regardless of `reasoning_content` value
+    // and must be dropped.
+    const messages: Array<Record<string, unknown>> = [
+      { role: "user", content: "hi" },
+      { role: "assistant", content: "", reasoning_content: "reasoning unavailable" },
+      { role: "user", content: "next turn" },
+    ];
+    dropEmptyBuddyMessages(messages);
+    expect(messages.map((m) => m["role"])).toEqual(["user", "user"]);
+  });
+
+  test("keeps an assistant tool_calls turn even with empty reasoning_content", () => {
+    // Tool-call turns are kept by the `tool_calls.length > 0` guard, not by
+    // reasoning_content. An `omitted`-display thinking block that still
+    // carried a signature-less reasoning side channel on a tool_calls turn
+    // must still ride through: the chat encoder deliberately emits the
+    // empty string there because the upstream demands the FIELD back on a
+    // thinking turn, even when its text is empty.
+    const messages: Array<Record<string, unknown>> = [
+      {
+        role: "assistant",
+        content: null,
+        tool_calls: [{ id: "c1", function: { name: "read", arguments: "{}" } }],
+        reasoning_content: "",
+      },
+      { role: "tool", tool_call_id: "c1", content: "ok" },
+    ];
+    dropEmptyBuddyMessages(messages);
+    expect(messages).toHaveLength(2);
+    expect(messages[0]?.["role"]).toBe("assistant");
+  });
+
+  test("full WorkBuddy envelope still drops the stub after applyBuddySystemPrompt runs", () => {
+    // The real pipeline the production bug followed: the WorkBuddy
+    // pre-payload hook calls `applyBuddySystemPrompt`, which installs the
+    // fixed system prompt, rebuilds user content shapes, then runs
+    // `finalizeBuddyMessages` → `dropEmptyBuddyMessages`. The stub must be
+    // gone before the request leaves the gateway.
+    const messages: Array<Record<string, unknown>> = [
+      { role: "user", content: "halo" },
+      // Assistant tool-call turn (real) — must survive.
+      {
+        role: "assistant",
+        content: null,
+        tool_calls: [{ id: "c1", function: { name: "read", arguments: "{\"path\":\"x\"}" } }],
+      },
+      { role: "tool", tool_call_id: "c1", content: "file contents" },
+      // The problem child: reasoning-only turn with no payload text.
+      { role: "assistant", content: "", reasoning_content: "" },
+      { role: "user", content: "berikutnya" },
+    ];
+    applyBuddySystemPrompt(messages, "You are a pragmatic and direct software engineering assistant.");
+    // The system prompt is prepended, the tool-call turn is kept, and the
+    // empty assistant stub is dropped. No message with content === "" and
+    // reasoning_content === "" survives.
+    const roles = messages.map((m) => m["role"]);
+    expect(roles[0]).toBe("system");
+    expect(roles).toContain("assistant");
+    expect(roles).toContain("tool");
+    for (const m of messages) {
+      const content = m["content"];
+      const reasoning = m["reasoning_content"];
+      const hasToolCalls = Array.isArray(m["tool_calls"]) && (m["tool_calls"] as unknown[]).length > 0;
+      const hasToolCallId = typeof m["tool_call_id"] === "string" && (m["tool_call_id"] as string).length > 0;
+      const emptyContent =
+        content === null ||
+        content === undefined ||
+        (typeof content === "string" && content.length === 0) ||
+        (Array.isArray(content) && content.length === 0);
+      const emptyReasoning = reasoning === undefined || (typeof reasoning === "string" && reasoning.length === 0);
+      if (emptyContent && emptyReasoning) {
+        expect(hasToolCalls || hasToolCallId).toBe(true);
+      }
+    }
+  });
+});
+
+describe("Buddy client-identity hardening", () => {
+  const wbCandidate = {
+    provider_id: "workbuddy",
+    model_id: "m",
+    wire_family: "openai-chat",
+    endpoint_path: "/v2/chat/completions",
+    capabilities: {},
+  } as unknown as ProviderDispatchTarget;
+  const wbRequest = { model: "m", messages: [] } as unknown as CanonicalRequest;
+  const wbContext = {
+    credential: { account_id: "acct123456", auth_state: {} },
+  } as unknown as ProviderDispatchContext;
+
+  test("the intl variants install the official client identity prompt", () => {
+    // Fidelity with the real client: the leading system turn is the official
+    // CodeBuddy CLI / WorkBuddy prompt, not a neutral stand-in, so a proxied
+    // request matches what the official client emits.
+    expect(CODEBUDDY_SYSTEM_PROMPT.startsWith("You are CodeBuddy Code.")).toBe(true);
+    expect(WORKBUDDY_SYSTEM_PROMPT.startsWith("You are WorkBuddy, a powerful AI assistant.")).toBe(true);
+    // Both end on the shared instruction the upstream keys on.
+    expect(CODEBUDDY_SYSTEM_PROMPT).toContain("<user_query>");
+    expect(WORKBUDDY_SYSTEM_PROMPT).toContain("<user_query>");
+  });
+
+  test("a replayed DeepSeek Harness history is rewritten to the WorkBuddy identity", () => {
+    const payload: Record<string, unknown> = {
+      model: "m",
+      messages: [
+        { role: "system", content: "You are DeepSeek Harness" },
+        { role: "user", content: "hi" },
+        { role: "assistant", content: "You are DeepSeek Harness. Understood." },
+        { role: "assistant", reasoning_content: "You are a coding agent powered by the deepseek-v4 model" },
+      ],
+    };
+    workbuddyPrePayload(payload, wbRequest, wbCandidate, wbContext);
+    const messages = payload["messages"] as Array<Record<string, unknown>>;
+    // The caller's DSH system turn is dropped and the official prompt installed.
+    expect(messages[0]?.["role"]).toBe("system");
+    expect(messages[0]?.["content"]).toBe(WORKBUDDY_SYSTEM_PROMPT);
+    // Assistant identity and the coding-persona reasoning are scrubbed; the
+    // named model survives in the rewrite.
+    const assistantText = messages
+      .filter((m) => m["role"] === "assistant")
+      .map((m) => `${typeof m["content"] === "string" ? m["content"] : ""}${typeof m["reasoning_content"] === "string" ? m["reasoning_content"] : ""}`)
+      .join(" ");
+    expect(assistantText).toContain("You are WorkBuddy, a powerful AI assistant");
+    expect(assistantText).not.toContain("DeepSeek Harness");
+    expect(assistantText).toContain("deepseek-v4");
+  });
+
+  test("the DSH identity scrub tolerates zero-width-space splitting", () => {
+    // Upstream can interleave U+200B between characters; the match must still
+    // fire so a normalized-away identity cannot slip through.
+    const scrubbed = scrubBuddyChannelIdentityText("You\u200bare DeepSeek\u200b Harness");
+    expect(scrubbed).toBe("You are WorkBuddy, a powerful AI assistant");
+    const gui = scrubBuddyChannelIdentityText("Open the DeepSeek Harness Web GUI");
+    expect(gui).toBe("Open the WorkBuddy Web GUI");
+  });
+
+  test("the scrub leaves unrelated text untouched", () => {
+    const plain = "Let us harness the power of deepseek models by reading docs.";
+    expect(scrubBuddyChannelIdentityText(plain)).toBe(plain);
+  });
+
+  test("CodeBuddy CN keeps its own neutral prompt", () => {
+    // Regression guard: CN neutralizes agent identities rather than adopting the
+    // intl CodeBuddy Code prompt, so the CN path must not pick up the official
+    // identity from the shared constant.
+    const payload: Record<string, unknown> = {
+      model: "m",
+      messages: [{ role: "user", content: "hi" }],
+    };
+    codeBuddyCnPrePayload(payload, wbRequest, wbCandidate, wbContext);
+    const messages = payload["messages"] as Array<Record<string, unknown>>;
+    expect(messages[0]?.["role"]).toBe("system");
+    expect(messages[0]?.["content"]).toBe("You are a helpful AI assistant that helps with software engineering tasks.");
+    expect(messages[0]?.["content"]).not.toContain("CodeBuddy Code");
   });
 });

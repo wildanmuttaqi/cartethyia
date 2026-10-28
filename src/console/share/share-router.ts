@@ -23,7 +23,6 @@ import type { ShareFamilyStats, ShareStatsPort } from "./share-stats";
 import { consoleSseResponse, createConsoleSseStream } from "../observability/sse";
 import { GatewayError, publicGatewayErrorBody } from "../../protocol/gateway-error";
 import {
-  hashShareToken,
   type ShareLinkPolicy,
   type ShareLinkRefusal,
   type ShareLinkStore,
@@ -33,11 +32,14 @@ import {
 const MIN_TOKEN_LENGTH = 20;
 
 /**
- * Cadence of the share stats SSE snapshot. Short enough to read as live;
- * the rollup itself is a handful of indexed aggregates, so re-reading on this
- * interval is cheap next to the per-request telemetry insert it summarizes.
+ * Cadence of the share stats SSE snapshot.
+ *
+ * Raised with `SHARE_STATS_CACHE_TTL_SECONDS` (10 s). At 2 s the tick was
+ * shorter than the rollup's own cache TTL, so every push re-parsed the whole
+ * retained telemetry window — the interval was the thing making this read
+ * expensive, not the number of viewers. Short enough to still read as live.
  */
-const SHARE_STATS_STREAM_INTERVAL_MS = 2_000;
+const SHARE_STATS_STREAM_INTERVAL_MS = 10_000;
 
 /**
  * Context and capabilities for one allowed model, sourced from the public
@@ -221,7 +223,7 @@ async function resolveFamilyStats(
   stats: ShareStatsPort,
   token: string,
 ): Promise<ShareFamilyStats | null> {
-  const resolved = await shareStore.resolveShareLink(hashShareToken(token));
+  const resolved = await shareStore.resolveShareLink(token);
   if (resolved === null) return null;
   const templateId = resolved.key.id;
   const tenantId = resolved.key.tenantId;
@@ -264,8 +266,7 @@ export function createShareRouter(options: ShareRouterOptions): Elysia {
       if (typeof params.token !== "string") return notFound();
       const token = params.token;
       if (token.length < MIN_TOKEN_LENGTH) return notFound();
-      const tokenHash = hashShareToken(token);
-      const outcome = await shareStore.resolveShareLinkOutcome(tokenHash);
+      const outcome = await shareStore.resolveShareLinkOutcome(token);
       if (!outcome.ok) return notFound(outcome.refusal);
       const resolved = outcome.resolution;
       const row = resolved.key;
@@ -273,7 +274,7 @@ export function createShareRouter(options: ShareRouterOptions): Elysia {
       const clientIpKey = clientIp === null ? undefined : canonicalClientIpKey(clientIp);
       const models = await modelsForShare(db, row);
       const modelInfo = await modelInfoForShare(db, row, models);
-      void shareStore.touchView(tokenHash).catch(() => undefined);
+      void shareStore.touchView(token).catch(() => undefined);
       const policy = {
         name: row.name,
         keyPrefix: row.keyPrefix,
@@ -327,7 +328,7 @@ export function createShareRouter(options: ShareRouterOptions): Elysia {
       if (typeof params.token !== "string") return notFound();
       const token = params.token;
       if (token.length < MIN_TOKEN_LENGTH) return notFound();
-      const resolved = await shareStore.resolveShareLink(hashShareToken(token));
+      const resolved = await shareStore.resolveShareLink(token);
       const image = resolved?.key.sharePopupImage;
       const mime = resolved?.key.sharePopupImageMime;
       if (!image || !mime) return notFound();
@@ -352,8 +353,7 @@ export function createShareRouter(options: ShareRouterOptions): Elysia {
       if (clientIpKey === undefined)
         return json({ error: { code: "client_ip_invalid", message: "Client IP could not be normalized" } }, 400);
 
-      const tokenHash = hashShareToken(token);
-      const outcome = await shareStore.resolveShareLinkOutcome(tokenHash);
+      const outcome = await shareStore.resolveShareLinkOutcome(token);
       // A handoff link reveals an existing key; it never mints one.
       if (!outcome.ok) return notFound(outcome.refusal);
       const resolved = outcome.resolution;
@@ -371,7 +371,7 @@ export function createShareRouter(options: ShareRouterOptions): Elysia {
       }
       const template = resolved.key;
       const generated = generateApiKeySecret(resolveShareKeyPrefix(template.keyPrefix ?? undefined));
-      const issued = await shareStore.issueSharedApiKey(tokenHash, {
+      const issued = await shareStore.issueSharedApiKey(token, {
         keyHash: generated.hash,
         keyPrefix: generated.prefix,
         clientIp,

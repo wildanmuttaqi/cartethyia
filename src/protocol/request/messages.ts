@@ -2,15 +2,15 @@
  * Canonical → Claude Messages request builder.
  */
 import { allParts, type CanonicalRequest, type ContentPart } from "../canonical-model";
-import { buildAnthropicThinkingPayload } from "../../providers/provider-reasoning";
-import { anthropicCacheControl } from "../../transport/translation/cache-controls";
+import { buildAnthropicThinkingPayload } from "../../protocol/reasoning";
+import { anthropicCacheControl } from "../../protocol/translation/cache-controls";
 import {
   THINKING_STRIPPED_SAMPLING_CONTROLS,
   ensureMaxTokensForThinking,
   isThinkingEnabled,
-} from "../../transport/translation/capabilities";
-import { normalizeWireMaxTokens } from "../../transport/translation/normalize";
-import { resolveWireMaxTokens, WIRE_TOKEN_BOUNDS } from "../../transport/translation/quirks";
+} from "../../protocol/translation/capabilities";
+import { normalizeWireMaxTokens } from "../../protocol/translation/normalize";
+import { resolveWireMaxTokens, WIRE_TOKEN_BOUNDS } from "../../protocol/translation/quirks";
 import {
   isClaudeBillingHeaderText,
   normalizeAnthropicToolCallId,
@@ -28,7 +28,7 @@ import {
 } from "../codecs";
 import { log } from "../../observability/logger";
 import { base64DecodedByteLength, clampImage } from "../image-clamp";
-import { clampReasoningEffort, claudeUsesAdaptiveThinking, LEVEL_TO_BUDGET, resolveSupportedReasoningEfforts } from "../../transport/translation/thinking";
+import { clampReasoningEffort, claudeUsesAdaptiveThinking, LEVEL_TO_BUDGET, resolveSupportedReasoningEfforts } from "../../protocol/translation/thinking";
 import { claudeResponseToEvents, parseClaudeSseStream } from "../response/messages";
 
 /**
@@ -121,6 +121,7 @@ function applyImageClamp(
   block: ClaudeWireObject,
   imageCount: number,
   payload: unknown,
+  maxBytesOverride?: number,
 ): ClaudeWireObject {
   const source = block["source"];
   const data = isRecord(source) ? source["data"] : undefined;
@@ -131,6 +132,7 @@ function applyImageClamp(
     ...(width === undefined ? {} : { width }),
     ...(height === undefined ? {} : { height }),
     imageCount,
+    ...(maxBytesOverride === undefined ? {} : { maxBytesOverride }),
   });
   if (decision.action === "pass") return block;
   log.warn(
@@ -155,12 +157,11 @@ function applyImageClamp(
  * the upstream rejects anything else. A canonical image part is an opaque
  * origin payload, so it can arrive in a vocabulary that is *not* Anthropic's:
  * a Responses part carries `type: "input_image"` with a top-level `image_url`
- * string, and a Chat part carries a nested `image_url` object. Both used to be
- * forwarded with their own `type` intact (or with no `source` at all), so a
- * Responses- or Chat-origin image sent to a Claude model produced
- * `source.type: "input_image"` — an invalid block the provider refused.
+ * string, and a Chat part carries a nested `image_url` object. Forwarding either
+ * with its own `type` intact (or with no `source` at all) sends a Claude model
+ * `source.type: "input_image"` — an invalid block the provider refuses.
  *
- * Every shape now collapses to a valid source, preferring the cheapest
+ * Every shape collapses to a valid source, preferring the cheapest
  * transport: a Files API reference, then a URL, then base64 bytes (a `data:`
  * URL is split rather than embedded, because Anthropic has no data-URL field).
  */
@@ -281,6 +282,7 @@ function partToClaudeBlock(
     idMap: Map<string, string>;
     isOAuth: boolean;
     imageCount: number;
+    maxBytesOverride?: number;
   },
 ): ClaudeWireObject | undefined {
   switch (part.kind) {
@@ -291,6 +293,7 @@ function partToClaudeBlock(
         normalizeImageBlock(part.payload),
         ctx?.imageCount ?? 1,
         part.payload,
+        ctx?.maxBytesOverride,
       );
     case "file":
       return {
@@ -553,14 +556,22 @@ export function claudeFallbacksChain(
 
 export function canonicalToClaudeMessagesPayload(
   request: CanonicalRequest,
-  options: { isOAuth?: boolean } = {},
+  options: { isOAuth?: boolean; maxBytesOverride?: number } = {},
 ): ClaudeWireObject {
   const seen = new Map<string, number>();
   const idMap = new Map<string, string>();
   // The clamp's per-image ceiling depends on how many images the whole request
   // carries, so it is counted once over every part rather than per message.
   const imageCount = allParts(request).filter((part) => part.kind === "image").length;
-  const ctx = { seen, idMap, isOAuth: options.isOAuth ?? false, imageCount };
+  const ctx = {
+    seen,
+    idMap,
+    isOAuth: options.isOAuth ?? false,
+    imageCount,
+    ...(options.maxBytesOverride === undefined
+      ? {}
+      : { maxBytesOverride: options.maxBytesOverride }),
+  };
   const messages: ClaudeWireObject[] = [];
   // Anthropic accepts system content only at the top level. Chat `developer`
   // turns and Responses `instructions` have no `developer` role upstream, and

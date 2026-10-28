@@ -65,9 +65,8 @@ export function statusTone(status: number): "ok" | "warn" | "err" {
 /**
  * Applies the level and search filters to the live tail.
  *
- * Extracted from the panel so the predicate is directly testable: the level
- * check was previously computed but never consulted, which made the level
- * buttons inert.
+ * Extracted from the panel so the predicate is directly testable and the level
+ * buttons cannot go inert: the level check must be both computed and consulted.
  */
 export function filterLogLines(
   lines: readonly ConsoleLogEntry[],
@@ -78,7 +77,7 @@ export function filterLogLines(
   return lines.filter((line) => {
     if (level !== "all" && line.level !== level) return false;
     if (!normalized) return true;
-    const haystack = `${line.msg} ${line.endpoint ?? ""} ${line.model ?? ""} ${line.routedModel ?? ""} ${line.providerId ?? ""} ${line.errorCode ?? ""} ${line.userAgent ?? ""} ${line.clientIp ?? ""} ${line.accountLabel ?? ""}`.toLowerCase();
+    const haystack = `${line.msg} ${line.endpoint ?? ""} ${line.model ?? ""} ${line.routedModel ?? ""} ${line.providerId ?? ""} ${line.errorCode ?? ""} ${line.userAgent ?? ""} ${line.clientIp ?? ""} ${line.accountLabel ?? ""} ${line.networkPoolId ?? ""}`.toLowerCase();
     return haystack.includes(normalized);
   });
 }
@@ -256,6 +255,17 @@ function RequestFields({ line }: { readonly line: ConsoleLogEntry }): ReactNode 
         <>
           {"  "}
           <span className="text-purple" data-log-field="account" title={line.accountId ?? undefined}>{line.accountLabel}</span>
+        </>
+      ) : null}
+      {line.networkPoolId ? (
+        <>
+          {"  "}
+          {/* The egress that served (or was flagged by) this request, so a
+              429 line names the pool that earned it — the same id the Proxy
+              page lists cooldowns under. */}
+          <span className="text-text-tertiary" data-log-field="pool" title={`pool ${line.networkPoolId}`}>
+            {line.networkPoolId.slice(0, 8)}
+          </span>
         </>
       ) : null}
       {line.clientIp ? (
@@ -510,15 +520,19 @@ function AuditPanel({ tabAction }: { tabAction: ReactNode }): ReactNode {
       </CardBody>
       <CardBody className="p-0 flex-1 min-h-0 flex flex-col">
         <div className="flex-1 min-h-0 flex flex-col overflow-y-auto p-0 bg-transparent text-inherit">
+          {/* `compact`: these render inside a scroll region rather than on a
+              route, so they must not reserve the route-level centering floor. */}
           {query.isPending && entries.length === 0 ? (
-            <LoadingState label="Loading audit trail…" />
+            <LoadingState compact label="Loading audit trail…" />
           ) : query.isError && entries.length === 0 ? (
             <ErrorState
+              compact
               message={getErrorMessage(query.error, "Unable to load audit trail.")}
               onRetry={() => void query.refetch()}
             />
           ) : entries.length === 0 ? (
             <EmptyState
+              compact
               title="No audit entries yet"
               message="Privileged mutations (provider changes, key rotations, backups, bans) will appear here."
               icon={<ShieldCheck size={20} />}

@@ -10,7 +10,13 @@
  */
 import { GatewayError } from "../../protocol/gateway-error";
 import type { ResolvedCredential } from "../../providers/provider-contracts";
-import { classifyTerminalOutcome, fallbackRetryDelayMs, isRetryableFailure, sleep } from "../failure-policy";
+import {
+  classifyTerminalOutcome,
+  fallbackRetryDelayMs,
+  isRetryableFailure,
+  MIN_RETRY_BUDGET_MS,
+  sleep,
+} from "../failure-policy";
 import { resolveRouteMaxAttempts } from "../../config/timeouts";
 import type { OAuthTokenRefresher } from "../../providers/authentication/oauth-refresh-service";
 import type { OAuthRefreshService } from "../../providers/authentication/oauth-refresh-service";
@@ -21,12 +27,19 @@ import type { RouteCandidate, Reservation, RouteSnapshotService } from "../routi
 import type { CartethyiaDatabase } from "../../persistence/db-handle";
 import { acquireAttemptLeases, releaseAttemptLeases } from "./leases";
 import type { AttemptLeaseSource, AttemptLeases } from "./leases";
+import type { AttemptLeaseOwnership } from "./leases";
 import { metrics } from "../../observability/metrics";
 import type { NetworkPoolSelector } from "../../network/pool/selector";
 import type { ProxyRequestState } from "../request/state";
 import type { TelemetryBatchBuffer } from "../../observability/telemetry-buffer";
 import { flagPoolBlocked, flagPoolCooldown } from "../../network/pool-health";
-import { completeAttempt, errorClientResponseBody, estimatedUsage, type ProviderExchangeCapture } from "./attempt-finalize";
+import {
+  completeAttempt,
+  errorClientResponseBody,
+  estimatedUsage,
+  type AttemptCompletion,
+  type ProviderExchangeCapture,
+} from "./attempt-finalize";
 import { repriceUsage } from "../../providers/provider-usage";
 import { isFreeTierIpBlock, isOAuthCredentialInvalidated, shouldCooldownPool } from "./retry-policy";
 import { drainAbortReason } from "../shutdown-notice";
@@ -85,6 +98,50 @@ function buildMemberOrdinals(
   return ordinals;
 }
 
+/** Build the common failure payload; the call site supplies only attempt-specific decisions. */
+function failureCompletion(input: {
+  readonly state: ProxyRequestState;
+  readonly deps: AttemptLoopDeps;
+  readonly candidate?: RouteCandidate | undefined;
+  readonly status: AttemptCompletion["status"];
+  readonly errorCategory?: string;
+  readonly errorOrigin?: string;
+  readonly error: unknown;
+  readonly tenantId: string | null;
+  readonly terminal: boolean;
+  readonly networkPoolId?: string | undefined;
+  readonly lease?: AdmissionLease | undefined;
+  readonly commitUsage?: AttemptCompletion["commitUsage"];
+  readonly providerCapture?: ProviderExchangeCapture | undefined;
+  readonly includeClientResponse: boolean;
+}): AttemptCompletion {
+  const { state, deps, candidate } = input;
+  return {
+    status: input.status,
+    providerId: candidate?.provider_id ?? "",
+    ...(candidate?.provider_account_id ? { accountId: candidate.provider_account_id } : {}),
+    ...(candidate?.provider_account_label ? { accountLabel: candidate.provider_account_label } : {}),
+    ...(candidate?.model_id === undefined ? {} : { modelId: candidate.model_id }),
+    ...(input.networkPoolId === undefined ? {} : { networkPoolId: input.networkPoolId }),
+    ...(input.errorCategory === undefined ? {} : { errorCategory: input.errorCategory }),
+    ...(input.errorOrigin === undefined ? {} : { errorOrigin: input.errorOrigin }),
+    error: input.error,
+    ...(input.lease === undefined ? {} : { lease: input.lease }),
+    ...(input.commitUsage === undefined ? {} : { commitUsage: input.commitUsage }),
+    terminal: input.terminal,
+    tenantId: input.tenantId,
+    ingressBody: state.ingressBody,
+    responseBody: null,
+    ...(input.includeClientResponse && input.status !== "cancelled"
+      ? { clientResponseText: errorClientResponseBody(input.error) }
+      : {}),
+    ...(input.providerCapture === undefined ? {} : { providerCapture: input.providerCapture }),
+    db: deps.db,
+    ...(deps.telemetryBuffer === undefined ? {} : { telemetryBuffer: deps.telemetryBuffer }),
+    ...(deps.snapshotService === undefined ? {} : { snapshotService: deps.snapshotService }),
+  };
+}
+
 /** Route-specific preconditions resolved for one candidate before its leases are taken. */
 interface PreparedAttempt<TAdapter> {
   readonly credential: ResolvedCredential;
@@ -100,6 +157,14 @@ interface AttemptContext<TAdapter> {
   /** Zero-based candidate index; also this attempt's failover count. */
   readonly attemptIndex: number;
   readonly providerCapture: ProviderExchangeCapture;
+  /**
+   * Ownership of this attempt's account/network-pool release, when the route
+   * acquired a pool slot. A provider session that outlives this request (a
+   * Cursor Run held open for the client's tool result) calls
+   * `transferToProviderSession()` and takes it over; otherwise the request
+   * releases it through `releaseByResponse()`.
+   */
+  readonly leaseOwnership?: AttemptLeaseOwnership | undefined;
   /**
    * Hands lease ownership to the value this attempt returns (a streaming
    * response releases its own lease on stream completion/cancel). Without it
@@ -155,9 +220,14 @@ export async function runAttemptLoop<TResult, TAdapter>(
   // sink reaches the payload store. When the terminal attempt fails before it
   // fires an outbound request (lease/acquire/prepare threw, or failover
   // exhausted), its sink is empty and the drawer reads "—" for a request that
-  // DID reach an upstream on an earlier attempt. Keep the fired exchanges so
-  // the terminal completion can fall back to the last one that has a request.
-  const firedCaptures: ProviderExchangeCapture[] = [];
+  // DID reach an upstream on an earlier attempt. Only the LAST fired exchange
+  // is ever consulted — every consumer below falls back to the most recent
+  // capture that has a request — so this holds one reference, not the whole
+  // history: a request walking N attempts used to pin N provider exchanges
+  // (each holding its bounded provider tee) alive until the loop returned.
+  // Earlier attempts' captures are released as each new attempt fires; the
+  // payload store's own bounded writer is what bounds anything persisted.
+  let lastFiredCapture: ProviderExchangeCapture | undefined;
   const maxAttempts = resolveRouteMaxAttempts();
   // One combo member must not be able to spend the whole budget.
   //
@@ -178,12 +248,8 @@ export async function runAttemptLoop<TResult, TAdapter>(
   const perMemberCap =
     memberCount > 1 ? Math.max(1, Math.ceil(maxAttempts / memberCount)) : maxAttempts;
   const attemptsByMember = new Map<string, number>();
-  // Minimum wall-clock left before a follow-on attempt is worth starting. A
-  // retry repeats the whole pre-dispatch phase (credential, admission, pool
-  // slot, prepare), so it needs at least that much budget on top of whatever
-  // the upstream itself takes. Below this, the attempt would be killed by the
-  // deadline before it could return anything the client could use.
-  const MIN_RETRY_BUDGET_MS = 15_000;
+  // The budget itself is owned by failure-policy, so this loop, the
+  // empty-stream replay, and the Codex retry budget cannot drift apart.
   let index = 0;
   let attempts = 0;
   while (index < candidates.length && attempts < maxAttempts) {
@@ -211,36 +277,24 @@ export async function runAttemptLoop<TResult, TAdapter>(
       if (remainingMs < MIN_RETRY_BUDGET_MS) {
         if (lastError !== undefined && !state.completed) {
           const terminal = classifyTerminalOutcome(lastError, state.abortController.signal);
-          const lastFired = [...firedCaptures]
-            .reverse()
-            .find((capture) => capture.request !== null);
-          await completeAttempt(state, {
+          const lastFired =
+            lastFiredCapture?.request !== null && lastFiredCapture !== undefined
+              ? lastFiredCapture
+              : undefined;
+          await completeAttempt(state, failureCompletion({
+            state,
+            deps,
+            candidate,
             status: terminal.status,
-            providerId: candidate.provider_id,
-            ...(candidate.provider_account_id
-              ? { accountId: candidate.provider_account_id }
-              : {}),
-            ...(candidate.provider_account_label
-              ? { accountLabel: candidate.provider_account_label }
-              : {}),
             errorCategory: terminal.errorCategory,
             errorOrigin: terminal.errorOrigin,
-            modelId: candidate.model_id,
+            ...(terminal.httpStatus === undefined ? {} : { terminalHttpStatus: terminal.httpStatus }),
             error: lastError,
-            terminal: true,
             tenantId: input.tenantId,
-            ingressBody: state.ingressBody,
-            responseBody: null,
-            ...(terminal.status !== "cancelled"
-              ? { clientResponseText: errorClientResponseBody(lastError) }
-              : {}),
-            // Same fallback the terminal catch uses: a request that did fire
-            // upstream keeps that exchange in Request Detail.
-            ...(lastFired ? { providerCapture: lastFired } : {}),
-            db: deps.db,
-            ...(deps.telemetryBuffer ? { telemetryBuffer: deps.telemetryBuffer } : {}),
-            ...(deps.snapshotService ? { snapshotService: deps.snapshotService } : {}),
-          });
+            terminal: true,
+            providerCapture: lastFired,
+            includeClientResponse: true,
+          }));
           metrics.proxy_requests_total.inc(1, {
             status: terminal.status === "cancelled" ? "cancelled" : "failed",
           });
@@ -252,6 +306,7 @@ export async function runAttemptLoop<TResult, TAdapter>(
     let reservation: Reservation | undefined;
     let proxySlot: { poolId: string; release: () => void } | undefined;
     let networkPoolId: string | undefined;
+    let leaseOwnership: AttemptLeaseOwnership | undefined;
     let bindingEstablished = false;
     let leasesRetained = false;
     let retryDelayMs = 0;
@@ -278,6 +333,7 @@ export async function runAttemptLoop<TResult, TAdapter>(
       reservation = attemptLeases.reservation;
       proxySlot = attemptLeases.proxySlot;
       networkPoolId = attemptLeases.networkPoolId;
+      leaseOwnership = attemptLeases.ownership;
       // Downstream error paths gate `commitUsage(estimated)` on this flag so
       // the estimate is only charged once the request truly consumed
       // upstream resources; the lease and reservation are held from here on.
@@ -290,6 +346,7 @@ export async function runAttemptLoop<TResult, TAdapter>(
         leases: attemptLeases,
         attemptIndex: index,
         providerCapture,
+        ...(leaseOwnership === undefined ? {} : { leaseOwnership }),
         retainLeases: () => {
           leasesRetained = true;
         },
@@ -305,7 +362,7 @@ export async function runAttemptLoop<TResult, TAdapter>(
       // A drain is a *server* close, not a client cancel: it must be recorded
       // as a failure with the shutdown code, and it is never retryable.
       // Status, category, and origin come from one classifier so they cannot
-      // disagree (a `cancelled` row used to carry `transport_unavailable`/502).
+      // disagree and mark a `cancelled` row `transport_unavailable`/502.
       const terminal = classifyTerminalOutcome(error, state.abortController.signal);
       const cancelled = terminal.status === "cancelled";
       // A failure the *pool* caused retires that pool, not the candidate: the
@@ -344,7 +401,9 @@ export async function runAttemptLoop<TResult, TAdapter>(
         cancelled ||
         !isRetryableFailure(error) ||
         (index === candidates.length - 1 && !poolScopedFailure);
-      if (providerCapture.request !== null) firedCaptures.push(providerCapture);
+      // Track only the most recent fired exchange; the array this replaced
+      // accumulated every attempt's capture until the loop returned.
+      if (providerCapture.request !== null) lastFiredCapture = providerCapture;
       // The payload store only keeps the terminal attempt's exchange. When the
       // terminal attempt never fired (failover walked past the attempt that
       // did, or prepare/lease threw first), fall back to the last fired
@@ -353,50 +412,40 @@ export async function runAttemptLoop<TResult, TAdapter>(
       const terminalCapture =
         providerCapture.request !== null
           ? providerCapture
-          : [...firedCaptures].reverse().find((capture) => capture.request !== null) ??
-            providerCapture;
-      await completeAttempt(state, {
+          : lastFiredCapture ?? providerCapture;
+      await completeAttempt(state, failureCompletion({
+        state,
+        deps,
+        candidate,
         status: terminal.status,
-        providerId: candidate.provider_id,
-        ...(candidate.provider_account_id ? { accountId: candidate.provider_account_id } : {}),
-        ...(candidate.provider_account_label ? { accountLabel: candidate.provider_account_label } : {}),
         errorCategory: terminal.errorCategory,
         errorOrigin: terminal.errorOrigin,
-        modelId: candidate.model_id,
-        ...(networkPoolId ? { networkPoolId } : {}),
+        ...(terminal.httpStatus === undefined ? {} : { terminalHttpStatus: terminal.httpStatus }),
         error,
-        ...(lease ? { lease } : {}),
+        tenantId: input.tenantId,
+        terminal: terminalAttempt,
+        networkPoolId,
+        lease,
         // A failed attempt may have sent bytes upstream, so it is not free —
         // but it must not be charged the full input estimate plus a full
         // output reserve either, because a request that walks N candidates
         // would then leave N estimates on the counters for one client request.
         // Commit the input estimate only: nothing was generated, and the
         // `finally` release then refunds the (uncommitted) output reserve.
-        ...(!cancelled && bindingEstablished
-          ? {
-              commitUsage: repriceUsage(
-                estimatedUsage(leaseSource.estimatedInputTokens, 0),
-                candidate.provider_id,
-                candidate.model_id,
-              ),
-            }
-          : {}),
-        terminal: terminalAttempt,
-        tenantId: input.tenantId,
-        ingressBody: state.ingressBody,
-        responseBody: null,
+        commitUsage: !cancelled && bindingEstablished
+          ? repriceUsage(
+              estimatedUsage(leaseSource.estimatedInputTokens, 0),
+              candidate.provider_id,
+              candidate.model_id,
+            )
+          : undefined,
         // The client still receives the public error envelope on the wire —
         // store it so Request Detail's Client Response panel traces failures
         // exactly as the client saw them. Cancelled requests have no client
         // response (the caller is gone).
-        ...(terminalAttempt && !cancelled
-          ? { clientResponseText: errorClientResponseBody(error) }
-          : {}),
         providerCapture: terminalCapture,
-        db: deps.db,
-        ...(deps.telemetryBuffer ? { telemetryBuffer: deps.telemetryBuffer } : {}),
-        ...(deps.snapshotService ? { snapshotService: deps.snapshotService } : {}),
-      });
+        includeClientResponse: terminalAttempt,
+      }));
       // A 403 can be a deterministic provider policy rejection, not an
       // invalid OAuth credential. Only the evidence-based classifier above
       // may trigger a refresh.
@@ -450,7 +499,10 @@ export async function runAttemptLoop<TResult, TAdapter>(
       retryDelayMs = fallbackRetryDelayMs(attempts);
     } finally {
       if (!leasesRetained)
-        await releaseAttemptLeases({ lease, reservation, proxySlot }, leaseSource.routingEngine);
+        await releaseAttemptLeases(
+          { lease, reservation, proxySlot, ...(leaseOwnership === undefined ? {} : { ownership: leaseOwnership }) },
+          leaseSource.routingEngine,
+        );
     }
     attempts += 1;
     // Charged to the member that spent it, so one member's own attempts are
@@ -460,53 +512,44 @@ export async function runAttemptLoop<TResult, TAdapter>(
       try {
         await sleep(retryDelayMs, state.abortController.signal);
       } catch {
-        // Abort during backoff used to escape as the sleep's own error with
-        // no counter increment: attempts already recorded their telemetry,
-        // but `proxy_requests_total` missed the request. Fail with the last
-        // attempt's error so the client sees the real cause, counted once.
+        // Fail with the last attempt's error so the client sees the real cause,
+        // counted once: attempts already recorded their telemetry, but escaping
+        // as the sleep's own error would leave `proxy_requests_total` missing
+        // the request.
         metrics.proxy_requests_total.inc(1, { status: "cancelled" });
         throw lastError;
       }
     }
   }
   // The loop can fall out with a retryable error still in hand (every attempt
-  // was retryable, so the terminal branch in the catch never fired). That used
-  // to throw with no completion: no telemetry row, no payload capture, and
-  // `state.completed` left clear — so a request that genuinely exhausted its
-  // attempts was invisible in Request Detail. Record it as terminal here.
+  // was retryable, so the terminal branch in the catch never fired). Throwing
+  // here instead of recording it would leave no telemetry row, no payload
+  // capture, and `state.completed` clear — so a request that genuinely
+  // exhausted its attempts would be invisible in Request Detail. Record it as
+  // terminal here.
   if (!state.completed) {
     const terminal = classifyTerminalOutcome(lastError, state.abortController.signal);
     const lastCandidate = candidates[Math.min(index, candidates.length - 1)];
-    const terminalCapture = [...firedCaptures]
-      .reverse()
-      .find((capture) => capture.request !== null);
-    await completeAttempt(state, {
+    const terminalCapture =
+      lastFiredCapture?.request !== null && lastFiredCapture !== undefined
+        ? lastFiredCapture
+        : undefined;
+    await completeAttempt(state, failureCompletion({
+      state,
+      deps,
+      candidate: lastCandidate,
       status: terminal.status,
-      providerId: lastCandidate?.provider_id ?? "",
-      ...(lastCandidate?.provider_account_id
-        ? { accountId: lastCandidate.provider_account_id }
-        : {}),
-      ...(lastCandidate?.provider_account_label
-        ? { accountLabel: lastCandidate.provider_account_label }
-        : {}),
       errorCategory: terminal.errorCategory,
       errorOrigin: terminal.errorOrigin,
-      ...(lastCandidate?.model_id === undefined ? {} : { modelId: lastCandidate.model_id }),
+      ...(terminal.httpStatus === undefined ? {} : { terminalHttpStatus: terminal.httpStatus }),
       error: lastError,
       terminal: true,
       tenantId: input.tenantId,
-      ingressBody: state.ingressBody,
-      responseBody: null,
       // The client receives the public error envelope on the wire — store it
       // so the Client Response panel traces the failure as the client saw it.
-      ...(terminal.status === "cancelled"
-        ? {}
-        : { clientResponseText: errorClientResponseBody(lastError) }),
-      ...(terminalCapture === undefined ? {} : { providerCapture: terminalCapture }),
-      db: deps.db,
-      ...(deps.telemetryBuffer ? { telemetryBuffer: deps.telemetryBuffer } : {}),
-      ...(deps.snapshotService ? { snapshotService: deps.snapshotService } : {}),
-    });
+      providerCapture: terminalCapture,
+      includeClientResponse: true,
+    }));
   }
   metrics.proxy_requests_total.inc(1, { status: "failed" });
   throw lastError;

@@ -10,13 +10,15 @@ import { getCachedModelDiscovery } from "../../operations/model-discovery-cache"
 import { defineModel } from "../../provider-model-definition";
 import { clinePlatform, clinePlatformVersion } from "../../operations/cli-platform";
 import {
-  getClineClientVersion,
+  getClineCliVersion,
   getClineSdkVersion,
 } from "../../operations/client-versions";
 export const CLINE_BASE_URL = providerBaseUrl("cline");
 export const CLINE_PROVIDER_ID = "cline" as const;
 const CLINE_CHAT_PATH = "/chat/completions" as const;
 const CLINE_RECOMMENDED_MODELS_PATH = "/ai/cline/recommended-models" as const;
+/** The OpenAI-style listing; its `:free` suffix is a second free-tier roster. */
+const CLINE_MODELS_LIST_PATH = "/models" as const;
 /**
  * Cline's own model catalog. Unlike the roster above it states `context_length`
  * and `top_provider.max_completion_tokens`, so it is the authority for limits.
@@ -47,23 +49,37 @@ async function clineExtraHeaders(context: ProviderDispatchContext): Promise<Reco
       authOverride = { authorization: `Bearer ${token}` };
     }
   }
-  const clientVersion = getClineClientVersion();
+  // The chat surface claims the CLI identity, matching the billing surface in
+  // `cline-quota.ts` and the reference client: `cline` (npm, bin `cline`) is a
+  // separate release line from the VS Code extension, so the client version
+  // must come from the CLI package, not the extension manifest. `@cline/sdk`
+  // is a dependency of the CLI, so its version stays the core version.
+  const clientVersion = getClineCliVersion();
   const sdkVersion = getClineSdkVersion();
+  // Cline's own client sends `X-Task-ID` on inference calls as the stable
+  // prompt-cache/session key, and omits it on account and discovery calls
+  // rather than inventing a per-request identity. `conversation_affinity` is
+  // that same value here: stable across the retries of one conversation, so a
+  // retried dispatch keeps its cache entry instead of starting a new one.
+  const taskId = context.conversation_affinity;
 
   return {
     ...authOverride,
     "user-agent": `Cline/${clientVersion}`,
-    // Referer travels in both spellings; some upstream checks are case-sensitive.
-    "http-referer": "https://cline.bot",
+    // One spelling only. Header names are case-insensitive, so sending both
+    // `http-referer` and `HTTP-Referer` does not hedge against a case-sensitive
+    // check — it makes `Headers` merge them into the single value
+    // `https://cline.bot, https://cline.bot`.
     "HTTP-Referer": "https://cline.bot",
     "x-platform": clinePlatform(),
     "x-platform-version": clinePlatformVersion(),
     "x-title": "Cline",
-    "x-client-type": "cline-sdk",
+    "x-client-type": "cline-cli",
     "x-client-version": clientVersion,
     "x-core-version": sdkVersion,
     "X-Title": "Cline",
     "x-is-multi-root": "false",
+    ...(taskId ? { "x-task-id": taskId } : {}),
     accept: "text/event-stream, application/json",
   };
 }
@@ -161,6 +177,7 @@ function recommendedModels(
   value: unknown,
   pass: boolean,
   upstream: ReadonlyMap<string, ClineUpstreamLimits> = new Map(),
+  freeIds: readonly string[] | null = null,
 ): readonly ModelDefinition[] {
   if (typeof value !== "object" || value === null || Array.isArray(value)) return [];
   const payload = value as ClineRecommendedPayload;
@@ -237,14 +254,45 @@ function recommendedModels(
           ...(limits?.contextLimit === undefined ? {} : { ctx: limits.contextLimit }),
           ...(limits?.outputLimit === undefined ? {} : { out: limits.outputLimit }),
           reasoning: true,
-          // Two separate statements, so neither has to bend for the other: the
-          // free tier and the pass roster both bill zero per token, while only
-          // the free bucket is the tier the model list groups as free.
-          free: !subscription,
+          // `free` follows the free bucket, not "not a subscription": the
+          // `recommended` bucket is billed, and the flag is not cosmetic —
+          // `defineModel` prices a `free` row at zero, so the cost surface
+          // would report paid models as free. The upstream settles it:
+          // dispatching `anthropic/claude-sonnet-5.5` from `recommended` answers
+          // 402 `insufficient_credits`, while a `free` bucket id answers 200. A
+          // subscription row is also not free — it bills a subscription — so
+          // only the free bucket carries the flag.
+          free: freeTier,
           freeTier,
         }),
       );
     }
+  }
+  // `/models` names free ids the recommended roster does not, so it is read as
+  // a second free-tier source rather than a replacement. An id the roster
+  // already defined keeps the roster's row: it carries the endpoint's own
+  // pricing and subscription classification, which this listing cannot state.
+  for (const id of freeIds ?? []) {
+    if (seen.has(id)) continue;
+    seen.add(id);
+    const limits = upstreamLimitsFor(upstream, id);
+    out.push(
+      defineModel({
+        id,
+        providerId: "cline",
+        wireFamily: "chat",
+        endpoint: CLINE_CHAT_PATH,
+        vision: limits?.vision ?? false,
+        ...(limits?.contextLimit === undefined ? {} : { ctx: limits.contextLimit }),
+        ...(limits?.outputLimit === undefined ? {} : { out: limits.outputLimit }),
+        reasoning: true,
+        // The suffix is the provider's own free-tier spelling, so both
+        // statements hold: zero per token, and a row the model list groups
+        // under the free tier.
+        free: true,
+        freeTier: true,
+      }),
+    );
   }
   return out;
 }
@@ -348,7 +396,11 @@ export async function fetchClineRecommendedModels(
       // failure: the roster is still useful without them, and `defineModel`
       // falls back to the base catalog.
       const upstream = await fetchClineUpstreamCatalog(fetcher, composed);
-      const models = recommendedModels(json, pass, upstream);
+      // The recommended roster is not the whole free tier: `/models` names
+      // free ids it never lists (minimax among them). Union both, with the
+      // recommended roster winning on an id it already defined.
+      const freeIds = await fetchClineFreeModelIds(fetcher, composed);
+      const models = recommendedModels(json, pass, upstream, freeIds);
       return models.length > 0 ? models : null;
     } catch {
       return null;
@@ -406,51 +458,154 @@ async function fetchClineUpstreamCatalog(
 }
 
 /**
- * Static seed for Cline's free tier.
+ * The free tier as `/models` states it, which is not the same roster as
+ * `/ai/cline/recommended-models`.
+ *
+ * The two endpoints disagree, and the disagreement is the whole reason this
+ * exists: `recommended-models` files four free ids, all spelled `cline-free/…`,
+ * while `/models` publishes seventeen ids carrying a `:free` suffix — including
+ * `minimax/minimax-m3.1-flash:free`, which the recommended roster never names.
+ * Reading only the recommended roster therefore could not see minimax at all.
+ *
+ * The suffix is matched exactly rather than as a substring, the same rule
+ * OpenRouter's free discovery uses, so an id whose own name contains "free" is
+ * not swept in. A non-ok response is `null` — "this endpoint had nothing to
+ * say" — rather than an empty list, so the caller can tell a failed fetch from
+ * a genuinely empty tier.
+ */
+export async function fetchClineFreeModelIds(
+  fetcher: (input: RequestInfo | URL, init?: RequestInit) => Promise<Response> = globalThis.fetch,
+  signal: AbortSignal = AbortSignal.timeout(10_000),
+): Promise<readonly string[] | null> {
+  try {
+    const res = await fetcher(`${CLINE_BASE_URL}${CLINE_MODELS_LIST_PATH}`, {
+      headers: { accept: "application/json" },
+      signal,
+    });
+    if (!res.ok) return null;
+    const body = (await res.json()) as unknown;
+    const root = isRecord(body) ? body : undefined;
+    const rows = Array.isArray(root?.["data"]) ? root["data"] : Array.isArray(body) ? body : [];
+    const ids = new Set<string>();
+    for (const row of rows) {
+      if (!isRecord(row)) continue;
+      const id = typeof row["id"] === "string" ? row["id"].trim() : "";
+      if (id.length === 0) continue;
+      if (!id.endsWith(":free")) continue;
+      ids.add(id);
+    }
+    return [...ids];
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Static seed for Cline: the zero-cost tier and the Cline Pass roster.
  *
  * Every id here is materialized into the `models` table at boot with
  * `source: "builtin"`, and `seedBundledModels` deletes any builtin row this
  * list no longer declares. That makes the list the *owner* of these rows: an id
  * Cline retires from its roster keeps its catalog card — and its route — until
  * it is removed here, because nothing else prunes a builtin row. The seed is
- * therefore kept to ids Cline currently serves on the free tier; a stale entry
- * is a card that can only ever fail a probe.
+ * therefore kept to ids Cline currently serves; a stale entry is a card that
+ * can only ever fail a probe.
  *
  * Cline's live roster (`/ai/cline/recommended-models`, read by
  * `fetchClineRecommendedModels`) is the authority for what is routable right
  * now, and "Fetch models" reconciles against it. This list is the offline seed
  * that makes a fresh install usable before the first fetch.
+ *
+ * Both sections came from a live probe of that endpoint with a real key, not
+ * from the OpenRouter listing Cline is backed by — the two disagree, and the
+ * endpoint's own buckets are what the account can route. It is its own list
+ * rather than {@link openrouterFreeRoster}, which Kilo and OpenRouter still
+ * use: one list for three providers is right for a catalog fact and wrong for
+ * an account fact.
+ *
+ * This is a floor, and live discovery still finds every id the account can
+ * route — including any absent here. A manual fetch is unaffected by what this
+ * list declares.
  */
+interface ClineSeedRow {
+  readonly id: string;
+  readonly ctx: number;
+  readonly out: number;
+  readonly vision?: boolean;
+}
+
+function clineRow(
+  rows: readonly ClineSeedRow[],
+  extra: { free?: boolean; proOnly?: boolean },
+): readonly ModelDefinition[] {
+  return rows.map((row) =>
+    defineModel({
+      id: row.id,
+      providerId: CLINE_PROVIDER_ID,
+      wireFamily: "chat",
+      endpoint: CLINE_CHAT_PATH,
+      ctx: row.ctx,
+      out: row.out,
+      vision: row.vision ?? false,
+      reasoning: true,
+      toolCall: true,
+      ...(extra.free === true ? { free: true, freeTier: true } : {}),
+      ...(extra.proOnly === true ? { proOnly: true } : {}),
+    }),
+  );
+}
+
+/**
+ * The zero-cost tier, exactly as this account's `free` bucket publishes it.
+ *
+ * Probed against `/ai/cline/recommended-models` with a live key, not inferred
+ * from the OpenRouter listing. That matters because the two disagree: the
+ * `/models` listing names 17 `:free` ids, while the account's own `free` bucket
+ * names 5 and shares none of them. The listing is the upstream catalog; the
+ * bucket is what this account can actually route, and only the second is a
+ * fact worth seeding.
+ *
+ * Two ids carry the `cline-free/` prefix. That prefix is Cline's own namespace,
+ * not a tier marker — membership of the bucket is what makes a row free.
+ */
+const CLINE_FREE_ROWS: readonly ClineSeedRow[] = [
+  { id: "reflection/beam-free", ctx: 128_000, out: 32_000 },
+  { id: "cline-free/nemotron-3.5-super-vl", ctx: 1_000_000, out: 131_072, vision: true },
+  { id: "nvidia/nemotron-3.5-lightning-free", ctx: 1_000_000, out: 65_536 },
+  { id: "poolside/laguna-s-2.1-free", ctx: 262_144, out: 32_768 },
+  { id: "cline-free/solar-mini4", ctx: 524_288, out: 131_072 },
+];
+
+/**
+ * The Cline Pass subscription roster, as the account's `clinePass` bucket
+ * publishes it.
+ *
+ * Seeded with `proOnly`, matching how the buddy roster marks a row a free plan
+ * is refused: dispatching one without a subscription 401s, so the card should
+ * say so rather than fail at request time. Discovery reads `clineAccountHasPass`
+ * first and only asks for these rows when the account has one.
+ */
+const CLINE_PASS_ROWS: readonly ClineSeedRow[] = [
+  { id: "cline-pass/kimi-k3.1-pro", ctx: 1_000_000, out: 32_000 },
+  { id: "cline-pass/minimax-m3.1-flash", ctx: 1_000_000, out: 128_000 },
+  { id: "cline-pass/deepseek-v4.1-flash-1017", ctx: 1_000_000, out: 128_000 },
+  { id: "cline-pass/deepseek-v4.1-flash", ctx: 1_000_000, out: 128_000 },
+  { id: "cline-pass/mimo-v2.6-flash", ctx: 1_000_000, out: 128_000 },
+  { id: "cline-pass/mimo-v2.6-pro", ctx: 1_000_000, out: 128_000 },
+  { id: "cline-pass/glm-5.3", ctx: 1_000_000, out: 64_000 },
+  { id: "cline-pass/deepseek-v4-pro", ctx: 1_000_000, out: 128_000 },
+  { id: "cline-pass/qwen3.8-max", ctx: 1_000_000, out: 65_536 },
+  { id: "cline-pass/muse-spark-1.3-contributor", ctx: 1_000_000, out: 65_536 },
+  { id: "cline-pass/kimi-k3", ctx: 1_000_000, out: 32_000 },
+  { id: "cline-pass/glm-5.3-flash", ctx: 1_000_000, out: 32_000 },
+  { id: "cline-pass/qwen3.7-plus", ctx: 1_000_000, out: 65_536 },
+  { id: "cline-pass/qwen3.7-max", ctx: 1_000_000, out: 65_536 },
+  { id: "cline-pass/minimax-m3", ctx: 512_000, out: 64_000 },
+];
+
 export const CLINE_MODELS: readonly ModelDefinition[] = [
-  // `deepseek/deepseek-v4-flash` is servable on the free tier even though the
-  // roster's `free` bucket does not list it — the bucket is not the whole tier.
-  // It is routed and answers for a free account, so it belongs here.
-  defineModel({
-    id: "deepseek/deepseek-v4-flash",
-    ctx: 1_048_576,
-    out: 384_000,
-    reasoning: true,
-    vision: true,
-    free: true,
-  }),
-  // The `free` bucket's published ids are the tier; the upstream id prefixes
-  // are retained verbatim because they are part of Cline's model contract.
-  defineModel({
-    id: "cline-free/mimo-v2.6-flash",
-    ctx: 1_048_576,
-    out: 131_072,
-    reasoning: true,
-    vision: true,
-    free: true,
-  }),
-  defineModel({
-    id: "cline-free/muse-spark-1.3-contributor",
-    ctx: 1_048_576,
-    out: 943_718,
-    reasoning: true,
-    vision: true,
-    free: true,
-  }),
+  ...clineRow(CLINE_FREE_ROWS, { free: true }),
+  ...clineRow(CLINE_PASS_ROWS, { proOnly: true }),
 ];
 
 

@@ -25,6 +25,17 @@ export interface ApiKeyAdmissionRequest {
 export interface AdmissionReserveRequest {
   readonly reservationId: string;
   readonly apiKeyId: string;
+  /**
+   * The key whose rpm and concurrency counters are charged.
+   *
+   * Share child keys set this to their own id so each child has an independent
+   * rpm window and concurrency slot. Token budgets (daily / monthly / lifetime)
+   * are still charged to `apiKeyId` — the parent — so the shared pool is
+   * enforced globally across all children.
+   *
+   * Defaults to `apiKeyId` when absent (non-share keys, backward compat).
+   */
+  readonly rpmConcurrencyKeyId?: string;
   readonly now: number;
   readonly estimatedTokens: number;
   readonly rpmLimit: number | null;
@@ -33,6 +44,16 @@ export interface AdmissionReserveRequest {
   readonly lifetimeBudget: number | null;
   readonly lifetimeConsumed: number;
   readonly concurrencyLimit: number | null;
+  /**
+   * Hidden allowance added on top of `concurrencyLimit`.
+   *
+   * The configured limit is what an operator tunes and what the error names;
+   * this is deliberate slack so a run that lands a few requests over does not
+   * get refused at the number it was told. Effective max is
+   * `concurrencyLimit + concurrencyTolerance`. Only requests *beyond* that are
+   * refused — never ones already admitted.
+   */
+  readonly concurrencyTolerance?: number | null | undefined;
   readonly tenantId: string;
   readonly tenantConcurrencyLimit: number | null;
   /**

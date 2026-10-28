@@ -14,7 +14,7 @@ import {
   getCachedQuotaEntries,
   getCachedQuotaEntry,
   invalidateQuotaCache,
-} from "./cache";
+} from "../../providers/quota/cache";
 import {
   QUOTA_REFRESH_TIMEOUT_MS,
   refreshAccountQuota,
@@ -22,13 +22,14 @@ import {
   timeoutSignal,
   type QuotaRefreshDeps,
   type QuotaRefreshFailureCode,
-} from "./refresh";
+} from "../../providers/quota/refresh";
 import { selectAccountTestEgress } from "./account-test-egress";
 import type { ValidatedFetch } from "../../network/outbound-fetch";
 import type { ProviderId } from "../../providers/provider-contracts";
 import {
   DAILY_CHECKIN_PROVIDER_IDS,
   checkinAttemptedToday,
+  checkinAttemptedTodayBatch,
   dailyCheckinEgressForPass,
   markCheckinAttempted,
 } from "../../workers/daily-checkin";
@@ -38,6 +39,10 @@ import {
   type BuddyActivityReportResult,
   type DailyCheckinResult,
 } from "../../providers/integrations/buddy/buddy-checkin";
+import {
+  fetchQoderDailyCheckin,
+  isQoderCheckinProvider,
+} from "../../providers/integrations/qoder/qoder-checkin";
 import { buddyAccountUid } from "../../providers/integrations/buddy/buddy-oauth-shared";
 import {
   supportsAccountReset,
@@ -98,12 +103,20 @@ function toBuddyUsageView(
   };
 }
 
-/** One account's check-in through the buddy billing facade. */
+/** One account's check-in through the buddy billing facade (Qoder uses its own surface). */
 async function runAccountCheckin(
   account: { id: string; providerId: string },
   credential: string,
   forceClaim: boolean,
 ): Promise<DailyCheckinResult> {
+  if (isQoderCheckinProvider(account.providerId)) {
+    return fetchQoderDailyCheckin({
+      providerId: account.providerId,
+      accountId: account.id,
+      credential,
+      fetcher: globalThis.fetch,
+    });
+  }
   return fetchDailyCheckin({
     providerId: account.providerId,
     accountId: account.id,
@@ -114,7 +127,6 @@ async function runAccountCheckin(
 }
 
 /** Bound on accounts one manual daily-growth batch may cover. */
-const DAILY_GROWTH_MAX_IDS = 100;
 /** Concurrent accounts inside one manual daily-growth batch. */
 const DAILY_GROWTH_CONCURRENCY = 3;
 
@@ -153,10 +165,14 @@ async function runDailyGrowthForAccount(
   }
 
   // Report leg: needs a uid, which only a JWT carries, so an opaque API key
-  // fails closed instead of reporting under another account's identity.
+  // fails closed instead of reporting under another account's identity. Qoder
+  // has no activity-report leg — its daily grant is purely the check-in.
+  const qoderAccount = isQoderCheckinProvider(String(providerId));
   const userId = buddyAccountUid(credential);
   let report: { ok: boolean; message: string };
-  if (userId === undefined || userId.length === 0) {
+  if (qoderAccount) {
+    report = { ok: true, message: "Qoder has no activity-report leg" };
+  } else if (userId === undefined || userId.length === 0) {
     report = { ok: false, message: "Report needs an OAuth account (no uid in this credential)" };
   } else {
     try {
@@ -180,13 +196,20 @@ async function runDailyGrowthForAccount(
 
   let checkin: { ok: boolean; message: string };
   try {
-    const result = await fetchDailyCheckin({
-      providerId,
-      accountId: account.id,
-      credential,
-      forceClaim: true,
-      fetcher,
-    });
+    const result = qoderAccount
+      ? await fetchQoderDailyCheckin({
+          providerId: String(providerId),
+          accountId: account.id,
+          credential,
+          fetcher,
+        })
+      : await fetchDailyCheckin({
+          providerId,
+          accountId: account.id,
+          credential,
+          forceClaim: true,
+          fetcher,
+        });
     checkin =
       result.state === "error"
         ? { ok: false, message: result.error ?? "Daily check-in failed" }
@@ -252,8 +275,17 @@ function checkinStateMessage(result: DailyCheckinResult): string {
   }
 }
 
+/**
+ * How many accounts are refreshed at once.
+ *
+ * This is the bound, not a cap on how many may be requested. A tenant with
+ * several hundred accounts used to be refused outright at 100 — "accountIds
+ * exceeds the limit of 100" — so refreshing the whole fleet meant hand-batching
+ * in the UI. Concurrency is what actually protects the upstream and the
+ * gateway, and it does so regardless of how many ids arrive, so the request is
+ * accepted at any size and drained through this many workers.
+ */
 const QUOTA_REFRESH_CONCURRENCY = 5;
-const QUOTA_REFRESH_MAX_IDS = 100;
 
 /**
  * Registers the tenant-scoped account/quota routes onto `app`. Every route here
@@ -334,12 +366,14 @@ export function registerAccountQuotaTenantRoutes(
       // request; only check-in-capable accounts can carry one, so only they
       // are read.
       const checkinCandidates = rows.filter((row) => supportsAccountCheckin(row.providerId));
-      const checkinAttempted = new Map<string, boolean>();
-      await Promise.all(
-        checkinCandidates.map(async (row) => {
-          checkinAttempted.set(row.id, await todayCheckinAttempted(db, redis, row.id));
-        }),
-      );
+      // One batched read for the whole page. Per-account reads made opening
+      // this route scale with the account count — a round trip each, on the
+      // route the dashboard polls — for a marker that is one key per account.
+      const checkinAttempted = await checkinAttemptedTodayBatch({
+        db,
+        redis,
+        accountIds: checkinCandidates.map((row) => row.id),
+      });
       // Real credit deductions, read from the stored snapshots rather than from
       // the upstream: the page renders every account at once, and re-hitting the
       // billing endpoint per account would make opening it scale with the
@@ -351,12 +385,12 @@ export function registerAccountQuotaTenantRoutes(
       const accounts = rows.map((row) => {
         const entry =
           row.tenantId === null ? globalCache.get(row.id) : ownedCache.get(row.id);
-        // No background refresh is enqueued here. Opening the page used to
-        // enqueue one for every account whose cached value had aged out, so a
-        // single page open hit every provider's quota endpoint at once — and
-        // because the page also polled, the operator saw that fan-out as "the
-        // page refreshes everything when I open it". The periodic sweep owns
-        // freshness; this route renders what is cached.
+        // No background refresh is enqueued here: enqueuing one for every
+        // account whose cached value had aged out means a single page open hits
+        // every provider's quota endpoint at once — and because the page also
+        // polls, the operator sees that fan-out as "the page refreshes
+        // everything when I open it". The periodic sweep owns freshness; this
+        // route renders what is cached.
         //
         // `refreshing` still counts accounts with no cached value, so the client
         // can show them as pending while the sweep fills them.
@@ -544,13 +578,6 @@ export function registerAccountQuotaTenantRoutes(
           set.status = 400;
           return { error: "accountIds must be a non-empty array", code: "invalid_request" };
         }
-        if (ids.length > QUOTA_REFRESH_MAX_IDS) {
-          set.status = 400;
-          return {
-            error: `accountIds exceeds the limit of ${QUOTA_REFRESH_MAX_IDS}`,
-            code: "invalid_request",
-          };
-        }
         const accounts = await db
           .select({
             accountId: providerAccounts.id,
@@ -665,16 +692,11 @@ export function registerAccountQuotaTenantRoutes(
           active: t.Boolean(),
         }),
       },
-      async ({ request, body, set }) => {
+      async ({ request, body }) => {
         const access = requireTenantScope(accessResolver(request), "dashboard:write");
+        // No size cap: a tenant-wide enable/disable is a legitimate single
+        // request, and the UPDATE is one statement over `inArray` either way.
         if (body.ids.length === 0) return { ok: true, updated: 0 };
-        if (body.ids.length > QUOTA_REFRESH_MAX_IDS) {
-          set.status = 400;
-          return {
-            error: `ids exceeds the limit of ${QUOTA_REFRESH_MAX_IDS}`,
-            code: "invalid_request",
-          };
-        }
         const status = body.active ? ("active" as const) : ("disabled" as const);
         const updated = await db
           .update(providerAccounts)
@@ -777,13 +799,9 @@ export function registerAccountQuotaTenantRoutes(
             code: "not_found",
           };
         }
-        if (accounts.length > DAILY_GROWTH_MAX_IDS) {
-          set.status = 400;
-          return {
-            error: `accountIds exceeds the limit of ${DAILY_GROWTH_MAX_IDS}`,
-            code: "invalid_request",
-          };
-        }
+        // No size cap, for the same reason as the quota refresh: the work is
+        // already drained through a bounded worker pool, so refusing the request
+        // protected nothing and just forced the operator to batch by hand.
         // One egress rotator for the whole request, exactly as the sweep builds
         // it, so consecutive accounts leave from consecutive pools.
         const rotator =

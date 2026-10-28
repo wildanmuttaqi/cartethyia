@@ -33,10 +33,9 @@ interface AntigravityQuotaFamily {
  * resulting id, so a quota row exists for exactly the models the operator can
  * select.
  *
- * This replaced a hand-kept list plus a permissive id pattern, which let a
- * deployment the catalog no longer serves (`gemini-2.5-pro`) report a quota row
- * for a model that cannot be chosen. Deriving the set means removing a catalog
- * model removes its quota row in the same change.
+ * Deriving the set means removing a catalog model removes its quota row in the
+ * same change — a hand-kept list would let a deployment the catalog does not
+ * serve report a quota row for a model that cannot be chosen.
  */
 const CATALOG_MODEL_IDS: ReadonlySet<string> = new Set(
   ANTIGRAVITY_MODELS.filter((model) => model.serviceKind !== "websearch").map((model) => model.modelId),
@@ -83,9 +82,8 @@ const SUMMARY_WINDOW_LABELS: Readonly<Record<SummaryWindowKind, string>> = Objec
  *
  * The upstream names the window in `window` (`5h`, `daily`, `weekly`) and
  * repeats it in the display name. Daily must be tested before the 5-hour
- * session: an older spelling put `daily` on the session bucket, but a bucket
- * whose own text says "daily" is the daily allowance, and treating it as the
- * session is what dropped the daily row.
+ * session: a bucket whose own text says "daily" is the daily allowance, and
+ * treating it as the session is what drops the daily row.
  */
 function summaryWindowKind(bucket: Record<string, unknown>): SummaryWindowKind | undefined {
   const source = `${text(bucket.window) ?? ""} ${text(bucket.bucketId) ?? ""} ${text(bucket.displayName) ?? ""}`.toLowerCase();
@@ -189,12 +187,20 @@ function parseModelQuotas(payload: Record<string, unknown>): ProviderQuotaWindow
     const family = modelFamily(collapseAntigravityVariant(modelId));
     const familyLabel = FAMILY_LABELS[family.key] ?? family.label;
     for (const entry of modelQuotaEntries(model)) {
-      const fraction = number(entry.info.remainingFraction);
-      if (fraction === null) continue;
+      // A bucket with no fraction but a reset time is exhausted, not unknown:
+      // the upstream omits the field when there is nothing left to report, so
+      // dropping it let a healthy sibling window mask a lane that is blocked
+      // until reset. Only a bucket with neither signal is genuinely unknown.
+      // This matches what the summary path already does for a disabled bucket.
+      const reported = number(entry.info.remainingFraction);
+      const resetAt = isoDate(entry.info.resetTime);
+      const exhausted = reported === null && resetAt !== null;
+      if (reported === null && !exhausted) continue;
+      const fraction = reported ?? 0;
       const kind = entry.kind ?? summaryWindowKind(entry.info);
       const label = kind === undefined ? familyLabel : `${familyLabel} (${SUMMARY_WINDOW_LABELS[kind]})`;
       const key = `${family.key}:${kind ?? "model"}`;
-      const window = fractionWindow(key, label, fraction, isoDate(entry.info.resetTime));
+      const window = fractionWindow(key, label, fraction, resetAt);
       grouped.set(key, keepWorse(grouped.get(key), window));
     }
   }

@@ -3,18 +3,18 @@
  */
 import type { CanonicalRequest } from "../canonical-model";
 import { clampToolCallId, isRecord } from "../codecs";
-import { markLatestBreakpoint } from "../../transport/translation/cache-controls";
-import { pickWireSupportedControls } from "../../transport/translation/capabilities";
-import { normalizeGenerationControls } from "../../transport/translation/normalize";
-import { resolveWireMaxTokens } from "../../transport/translation/quirks";
+import { markLatestBreakpoint } from "../../protocol/translation/cache-controls";
+import { pickWireSupportedControls } from "../../protocol/translation/capabilities";
+import { normalizeGenerationControls } from "../../protocol/translation/normalize";
+import { resolveWireMaxTokens } from "../../protocol/translation/quirks";
 import {
   clampReasoningEffort,
   resolveSupportedReasoningEfforts,
-} from "../../transport/translation/thinking";
+} from "../../protocol/translation/thinking";
 import { isClaudeBillingHeaderText, resolveImageSource, resolveOutputVerbosity } from "../codecs";
 import { resolvePromptCacheKey } from "../../providers/operations/session-resolution";
-import { reasoningEffortFromIntent } from "../../providers/provider-reasoning";
-import { isWebSearchTool } from "../../transport/translation/search";
+import { reasoningEffortFromIntent } from "../../protocol/reasoning";
+import { isWebSearchTool } from "../../protocol/translation/search";
 import { parseResponsesResponseToEvents, decodeResponsesSseStream } from "../response/responses";
 import { repairToolArguments } from "../../transport/surface/chat/encode";
 
@@ -163,7 +163,15 @@ export function canonicalToResponsesPayload(
         flushMessage();
         // Replays prior encrypted reasoning so the model retains continuity
         // across turns; never decrypted or reconstructed from summary text.
-        input.push({ type: "reasoning", encrypted_content: p.encrypted_content });
+        // The upstream binds encrypted reasoning to the item it was issued
+        // for and rejects a replay whose id does not match ("Encrypted content
+        // item_id did not match the target item id"), so the item carries the
+        // id it was parsed with. Without one there is nothing to match and the
+        // payload would be rejected anyway — it is dropped rather than sent
+        // under an id the upstream cannot verify.
+        if (p.item_id !== undefined) {
+          input.push({ type: "reasoning", id: p.item_id, encrypted_content: p.encrypted_content });
+        }
       } else if (p.kind === "reasoning") {
         // Plain reasoning replayed from another surface (a Messages `thinking`
         // block, or Chat `reasoning_content`). It has no encrypted artifact, so

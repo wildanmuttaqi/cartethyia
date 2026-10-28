@@ -8,6 +8,11 @@ export interface CodecContext {
   readonly maxOutputTokens?: number;
   readonly promptCacheKey?: string;
   readonly signal?: AbortSignal;
+  /**
+   * Per-tenant ceiling for one inline attachment, in bytes. Absent means the
+   * deployment default; only wire encoders that clamp images read it.
+   */
+  readonly maxBytesOverride?: number;
 }
 
 /**
@@ -105,6 +110,8 @@ async function loadCodec(wireFamily: WireFamily): Promise<CodecModule> {
   const cached = codecCache.get(wireFamily);
   if (cached !== undefined) return cached;
   const promise = (async (): Promise<CodecModule> => {
+    // dynamic-import: codec picked by wire family at request time; static
+    // imports here would couple every request path to every codec module.
     switch (wireFamily) {
       case "chat":
         return (await import("./request/chat")).chatCodecModule;
@@ -138,6 +145,9 @@ export async function encodeWireRequest(
   if (codec.family === "messages") {
     return codec.encodeWireRequest(request, {
       ...(context?.isOAuth === undefined ? {} : { isOAuth: context.isOAuth }),
+      ...(context?.maxBytesOverride === undefined
+        ? {}
+        : { maxBytesOverride: context.maxBytesOverride }),
     });
   }
   if (codec.family === "chat") {

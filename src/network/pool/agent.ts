@@ -4,7 +4,7 @@
  * caches instances of these; the selector owns admission.
  */
 import { isIP } from "node:net";
-import { accountSocketBytes, accountSocketWrites } from "./byte-accounting";
+import { accountSocketBytes, accountSocketWrites, recordPoolBytes } from "./byte-accounting";
 import {
   Agent as HttpAgent,
   request as httpRequest,
@@ -236,6 +236,17 @@ function createProxyConnection(
       };
     }
     const proxyRequest = (isHttpsProxy ? httpsRequest : httpRequest)(proxyOptions);
+    // The CONNECT exchange itself costs bytes on this pool's egress. It is tens
+    // of bytes per tunnel, so it barely moves a quota on its own — but a pool
+    // that churns tunnels without ever establishing one spends real traffic and
+    // would otherwise meter as zero.
+    if (poolId) {
+      const requestLine = `CONNECT ${targetHost}:${targetPort} HTTP/1.1\r\n`;
+      const headerText = Object.entries(proxyOptions.headers ?? {})
+        .map(([name, value]) => `${name}: ${String(value)}\r\n`)
+        .join("");
+      recordPoolBytes(poolId, "sent", Buffer.byteLength(requestLine + headerText + "\r\n", "utf8"));
+    }
     // Every failure before the tunnel is established — the socket reset, the
     // connection refused, the peer closing early, the CONNECT request itself
     // erroring — is a handshake failure and is tagged as such, so a relay
@@ -258,9 +269,16 @@ function createProxyConnection(
           return;
         }
         established = true;
-        if (head.length > 0) socket.unshift(head);
-        // Tally the tunnel from here on. The CONNECT request itself is a few
-        // dozen bytes and is not counted; everything the tunnel carries is.
+        // `head` is whatever the peer had already sent by the time CONNECT
+        // completed. Unshifting it replays those bytes into the stream, but a
+        // `data` listener attached afterwards never sees them — so they were
+        // silently missing from the pool's metered totals.
+        if (head.length > 0) {
+          if (poolId) recordPoolBytes(poolId, "received", head.length);
+          socket.unshift(head);
+        }
+        // Tally the tunnel from here on: `write` on this socket is the TLS
+        // record stream, so what is counted is what actually went on the wire.
         if (poolId) {
           accountSocketBytes(socket, poolId);
           accountSocketWrites(socket, poolId);
@@ -291,6 +309,12 @@ export interface ProxyAgentPair {
    * validated fetcher sends `x-relay-target`/`x-relay-path` to this URL.
    */
   readonly relayEndpoint?: URL;
+  /**
+   * The proxy URL this pool dials through, forwarded to the runtime-native
+   * fetch (`proxy` option). The native transport has no agent concept, so
+   * the URL is what carries the pool egress.
+   */
+  readonly proxyUrl?: string;
 }
 
 export function isProxyAgentPair(value: unknown): value is ProxyAgentPair {
@@ -389,6 +413,7 @@ export function createHttpProxyAgent(
   return {
     http: new HttpProxyAgent(proxy, policy, config, poolId),
     https: new HttpsProxyAgent(proxy, policy, config, poolId),
+    proxyUrl: proxy.toString(),
     ...(isRelayHost(proxy.hostname) ? { relayEndpoint: proxy } : {}),
   };
 }
@@ -454,6 +479,7 @@ export function createSocks5Agent(
   return {
     http: http as unknown as HttpAgent,
     https: https as unknown as HttpsAgent,
+    proxyUrl: withCredential(url, credential).toString(),
   };
 }
 

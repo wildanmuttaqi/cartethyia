@@ -3,6 +3,7 @@
 import { asc, eq, ne } from "drizzle-orm";
 import type { CartethyiaDatabase } from "../../persistence/db-handle";
 import {
+  consoleSettings,
   models,
   modelAliases,
   modelCombos,
@@ -16,8 +17,6 @@ import {
   cliToolSettings,
 } from "../../persistence/schema";
 import { DEFAULT_PROVIDER_MAX_INFLIGHT } from "../../persistence/schema";
-import "../../providers/integrations/claude/claude-oauth";
-import "../../providers/integrations/codex/codex-oauth";
 import { resolveTenantOverride } from "../../persistence/tenant-scope";
 import {
   type RouteCandidate,
@@ -31,6 +30,7 @@ import { DEFAULT_PROXY_SKIP_PROVIDER_IDS } from "../../providers/provider-metada
 import { buildClaudeCliUserAgent } from "../../providers/operations/custom-cli-headers";
 import { isBundledProviderId } from "../../providers/provider-contracts";
 import type { ServiceKind, WireFamily } from "../../protocol/canonical-model";
+import { BoundedLruMap } from "./bounded-lru";
 import { providerHasAdapterUserAgent, providerUsesBespokeWire } from "../../providers/provider-metadata";
 
 const CLAUDE_MODEL_FAMILIES = new Set(["opus", "sonnet", "haiku", "fable", "mythos"]);
@@ -114,14 +114,21 @@ export function buildCapabilityProfile(row: {
   // and `audio` parts; the messages codec encodes the first two but has no
   // audio block (see `AUDIO_CAPABLE_WIRE_FAMILIES`). A bespoke adapter (Cursor)
   // frames its own protocol and has no generic rich-content path.
-  // Treating the codec routes as capable by default keeps pass-through behavior
-  // instead of degrading a caller's attachment to text on the strength of a
-  // metadata guess. An explicit modality still wins, so a catalog can declare
-  // support for a bespoke adapter too. Whether a given upstream model accepts
-  // the part is the upstream's call — a capability declared here only decides
-  // whether the router strips the part before it ever sees it, and the audio
-  // grant is narrowed per wire family at projection time.
+  //
+  // The codec grant is a **fallback for rows with no modality metadata**, not
+  // an override: `defineModel` always seeds `"text"`, so a non-empty array is
+  // an explicit declaration and its contents are authoritative — a row that
+  // declares `["text"]` is a text-only row and the router must strip the image
+  // rather than forward it to an upstream that rejects it. An empty array is a
+  // discovered or legacy row that carried no metadata, and pass-through keeps
+  // a caller's attachment from being degraded on the strength of a guess.
+  // Whether a given upstream model accepts the part is still the upstream's
+  // call — a capability declared here only decides whether the router strips
+  // the part before it ever sees it, and the audio grant is narrowed per wire
+  // family at projection time.
   const codecEncodesRichContent = !providerUsesBespokeWire(row.providerId);
+  const declaredInput = inputMods.length > 0;
+  const richContentByCodec = codecEncodesRichContent && !declaredInput;
   // Reasoning and tools are never stripped here. A `false` flag — whether a
   // discovered row recorded it for lack of metadata, or a catalog row set it
   // explicitly — must not become a silent rewrite of a request the caller
@@ -132,9 +139,9 @@ export function buildCapabilityProfile(row: {
     // because the capability predicates downstream see only this snapshot, not
     // the provider registry.
     bespokeWire: !codecEncodesRichContent,
-    image: inputMods.includes("image") || codecEncodesRichContent,
-    document: inputMods.includes("document") || codecEncodesRichContent,
-    audio: inputMods.includes("audio") || codecEncodesRichContent,
+    image: inputMods.includes("image") || richContentByCodec,
+    document: inputMods.includes("document") || richContentByCodec,
+    audio: inputMods.includes("audio") || richContentByCodec,
     mediaGeneration: outputMods.includes("image"),
     tools: true,
     parallelToolCalls: true,
@@ -147,6 +154,49 @@ export function buildCapabilityProfile(row: {
     responseJsonSchema: true,
     promptCaching: true,
   };
+}
+
+/**
+ * Upper bound on the capability-profile memo. Same value as the hand-rolled
+ * bound it replaces: far above any real catalog, so eviction only ever targets
+ * rows deleted from the catalog.
+ */
+const CAPABILITY_PROFILE_CACHE_MAX_ENTRIES = 4096;
+const capabilityProfileCache = new BoundedLruMap<string, Record<string, boolean>>(
+  CAPABILITY_PROFILE_CACHE_MAX_ENTRIES,
+);
+
+/**
+ * The capability profile for one model row, memoized across rebuilds.
+ *
+ * The value is a pure function of the row's metadata, so two rebuilds that see
+ * the same row get the same object instead of two identical ones. The cache is
+ * a {@link BoundedLruMap} keyed by `providerId/modelId` **plus the row's
+ * modalities**: the key must change when the operator edits a row's modalities
+ * (text-only → vision), otherwise the rebuild would hand routing the stale
+ * pre-edit profile until the entry aged out of the LRU. A row that has never
+ * carried modality metadata keys with `null`, which only collides with another
+ * metadata-less row for the same provider/model — the same profile by
+ * construction.
+ */
+function capabilityProfileFor(row: {
+  modalities: unknown;
+  reasoning: boolean;
+  toolCall: boolean;
+  providerId: string;
+  modelId: string;
+}): Record<string, boolean> {
+  const key = `${row.providerId}/${row.modelId}/${JSON.stringify(row.modalities ?? null)}`;
+  const cached = capabilityProfileCache.get(key);
+  if (cached !== undefined) return cached;
+  const profile = buildCapabilityProfile(row);
+  capabilityProfileCache.set(key, profile);
+  return profile;
+}
+
+/** Live memo size, for tests and the metrics gauge. */
+export function capabilityProfileCacheSize(): number {
+  return capabilityProfileCache.size;
 }
 
 /** Resolves route identity only for bundled adapters without a native User-Agent builder. */
@@ -180,6 +230,9 @@ interface MergedModelRow {
   reasoning: boolean;
   toolCall: boolean;
   enabled: boolean;
+  proOnly: boolean | null;
+  /** Whether the provider publishes the row as free. Read for plan logging. */
+  freeTier: boolean | null;
 }
 /**
  * Converts persisted model rows into candidate input. Seed materialization is
@@ -201,6 +254,8 @@ function mergeModelCatalog(
       reasoning: row.reasoning,
       toolCall: row.toolCall,
       enabled: row.enabled,
+      freeTier: row.freeTier ?? null,
+      proOnly: row.proOnly ?? null,
     }));
 }
 
@@ -238,6 +293,12 @@ const MODEL_COLUMNS = {
   reasoning: models.reasoning,
   toolCall: models.toolCall,
   enabled: models.enabled,
+  // Carried for the plan gate: an upstream may refuse a model on a free plan,
+  // and only the row says which. See `planAllowsModel`.
+  proOnly: models.proOnly,
+  // Carried alongside it: the provider's own statement that the row is free,
+  // which is the other half of the same plan question.
+  freeTier: models.freeTier,
 } as const;
 const ACCOUNT_COLUMNS = {
   id: providerAccounts.id,
@@ -248,6 +309,10 @@ const ACCOUNT_COLUMNS = {
   cooldownUntil: providerAccounts.cooldownUntil,
   modelCooldowns: providerAccounts.modelCooldowns,
   lastErrorCategory: providerAccounts.lastErrorCategory,
+  // The account's last reported plan. Read here rather than from the quota
+  // cache, which is empty on a cold start — exactly when routing must not be
+  // guessing whether an account is free.
+  quotaPlan: providerAccounts.quotaPlan,
 } as const;
 
 const ALIAS_COLUMNS = {
@@ -327,7 +392,7 @@ class RouteCatalogRepository {
   constructor(private readonly db: CartethyiaDatabase) {}
 
   async loadRouteCatalogSnapshot(tenantId?: string): Promise<RouteCatalogSnapshotResult> {
-    const [providerRows, modelRows, accountRows, aliasRows, comboRows, routingRows, poolRows, disabledModelRows, cliMappingRows, cliMappingSettingRows, poolSettingRows] =
+    const [providerRows, modelRows, accountRows, aliasRows, comboRows, routingRows, poolRows, disabledModelRows, cliMappingRows, cliMappingSettingRows, poolSettingRows, settingsRows] =
       await Promise.all([
         this.db.select(PROVIDER_COLUMNS).from(providers).where(eq(providers.enabled, true)),
         this.db.select(MODEL_COLUMNS).from(models),
@@ -344,8 +409,42 @@ class RouteCatalogRepository {
         this.db.select(CLI_MAPPING_COLUMNS).from(cliToolMappings),
         this.db.select(CLI_MAPPING_SETTING_COLUMNS).from(cliToolSettings),
         this.db.select(POOL_SETTING_COLUMNS).from(poolRoutingSettings),
+        // The cooldown override is a console_settings preference, read inside
+        // the same fan-out rather than per request: one more row set on a
+        // query that already runs, instead of a Postgres round trip on every
+        // admitted request.
+        this.db
+          .select({ tenantId: consoleSettings.tenantId, preferences: consoleSettings.preferences })
+          .from(consoleSettings),
       ]);
     const mergedModelRows = mergeModelCatalog(modelRows);
+    /**
+     * Tenants that asked to ignore an account-wide cooldown.
+     *
+     * Read-only override: the cooldown is still on the row, still shown in
+     * Health, and still recovered by the sweep. This only stops it from
+     * excluding the candidate, so turning the setting off needs no cleanup.
+     *
+     * Per-(account, model) cooldowns are deliberately NOT overridden — see the
+     * preference's own doc.
+     */
+    const cooldownOverrideTenants = new Set<string>();
+    const invokeDisabledTenants = new Set<string>();
+    for (const row of settingsRows ?? []) {
+      if (row.preferences?.forceDisableCooldown === true && row.tenantId) {
+        cooldownOverrideTenants.add(row.tenantId);
+      }
+      if (row.preferences?.invokeDisabled === true && row.tenantId) {
+        invokeDisabledTenants.add(row.tenantId);
+      }
+    }
+    /**
+     * A shared account has no tenant of its own (`tenant_id IS NULL`), so a
+     * tenant-keyed override would never match it — yet a shared account is
+     * exactly the one every tenant dials, and parking it stops all of them.
+     * When any tenant asks, the override covers shared accounts too.
+     */
+    const anyTenantOverrides = cooldownOverrideTenants.size > 0;
 
     // Compile tenant-scoped disables into a lookup keyed by the same
     // composite identity the `models` table uses. A disabled key suppresses
@@ -527,7 +626,12 @@ class RouteCatalogRepository {
       const providerTenantId = providerTenantById.get(model.providerId);
       if (providerTenantId === undefined) continue;
       const accounts = accountsByProvider.get(model.providerId) ?? [];
-      const capabilityProfile = buildCapabilityProfile(model);
+      // One profile per model row, memoized across snapshot rebuilds. The
+      // profile is derived purely from the row's metadata, is never mutated
+      // (grep finds no write to `capability_profile`), and is shared by every
+      // candidate this row fans out to — so a rebuild no longer constructs a
+      // fresh object per model on top of the fan-out it already had.
+      const capabilityProfile = capabilityProfileFor(model);
       if (accounts.length === 0) {
         const providerRequiresAccount = requiresAccountById.get(model.providerId) ?? true;
         if (!providerRequiresAccount) {
@@ -612,6 +716,13 @@ class RouteCatalogRepository {
           ...(routeUserAgent === undefined ? {} : { user_agent: routeUserAgent }),
           tenant_id: rowTenantId,
           provider_account_id: account.id,
+          // The plan gate is per (account, model): the model may be refused on
+          // a free plan and the account may be on one. Both ride here because
+          // `plan()` sees the candidate and nothing else.
+          ...(model.proOnly === true ? { pro_only: true } : {}),
+          ...(account.quotaPlan === null || account.quotaPlan === undefined
+            ? {}
+            : { account_plan: account.quotaPlan }),
           // Provider-wide concurrency ceiling from Routing Strategy; legacy
           // account overrides are never read here.
           ...(() => {
@@ -630,19 +741,53 @@ class RouteCatalogRepository {
             : {}),
         };
         if (account.status === "cooldown") {
-          // Expired cooldowns read as healthy here without a fire-and-forget
-          // write: AccountHealthSweeper materializes the recovery every 30s,
-          // so the builder stays a pure read (no UPDATE racing the request).
-          if (account.cooldownUntil && account.cooldownUntil.getTime() > Date.now()) {
+          // A row that still says `cooldown` stays excluded until the sweeper
+          // flips it back to `active`. An *expired* deadline used to read as
+          // healthy here (the comment below's "pure read" reasoning), which let
+          // routing redial the account in the window between the deadline
+          // elapsing and the next 30s sweep — reproducing the refusal that
+          // cooled it and logging a fresh `cooldown → cooldown` row each time
+          // (the operator's "still hit a cooled-down account" report). The
+          // sweep is the only exit from `cooldown`; until it runs the row is
+          // not proof the account can serve.
+          //
+          // `forceDisableCooldown` skips the exclusion entirely. The cooldown
+          // is still real and still recorded — it simply stops deciding
+          // routing. That is what makes the setting reversible: nothing was
+          // written, so turning it off needs no cleanup, and Health still
+          // reports the truth about the account.
+          const overrideActive =
+            rowTenantId === null
+              ? anyTenantOverrides
+              : cooldownOverrideTenants.has(rowTenantId);
+          const accountDeadline = account.cooldownUntil;
+          const unexpired =
+            accountDeadline !== null && accountDeadline.getTime() > Date.now();
+          if (overrideActive) {
+            // The account is still cooling — this only stops it from being
+            // excluded. `plan()` reads `cooldown_until` to answer the
+            // all-cooling case, so it stays populated either way.
+            //
+            // Neither `health_status` nor `cooldown_kind` is set: the
+            // evaluator excludes a hard cooldown on `health_status ===
+            // "cooldown"` alone, so stamping it here would keep excluding
+            // the very accounts the override exists to reach — a spent quota
+            // or a policy block, which are the ones an operator actually
+            // wants to override.
+            if (unexpired) candidate.cooldown_until = accountDeadline!.getTime();
+          } else {
             candidate.health_status = "cooldown";
             candidate.cooldown_kind = hardCooldownCategory(account.lastErrorCategory)
               ? "hard"
               : "soft";
-            // The deadline rides with the exclusion it explains. `plan()` reads
-            // it to answer the all-cooling case with the real reset instead of
-            // a bare 429, so a client backs off for the window that is actually
-            // open rather than inventing one.
-            candidate.cooldown_until = account.cooldownUntil.getTime();
+            // The deadline rides with the exclusion it explains. `plan()`
+            // reads it to answer the all-cooling case with the real reset
+            // instead of a bare 429, so a client backs off for the window
+            // that is actually open rather than inventing one. An expired
+            // deadline carries no reset — the sweep is about to recover the
+            // row, and quoting a past instant would tell the client to retry
+            // "immediately" for a wait that is already over.
+            if (unexpired) candidate.cooldown_until = accountDeadline!.getTime();
           }
         }
 
@@ -720,6 +865,7 @@ class RouteCatalogRepository {
       combos,
       ...(routingMap ? { providerRouting: routingMap } : {}),
       ...(Object.keys(poolRouting).length > 0 ? { poolRouting } : {}),
+      ...(invokeDisabledTenants.size > 0 ? { invokeDisabledTenants } : {}),
     };
   }
 }

@@ -1,5 +1,7 @@
 import type { CanonicalEvent, CanonicalStopReason } from "../../../protocol/canonical-model";
+import { jsonrepair } from "jsonrepair";
 import { reasoningSummaryIdentity, reasoningSummarySeparator, type ReasoningSummaryIdentity } from "../reasoning-summary";
+import { reasoningTextOf } from "../../../protocol/reasoning-text";
 import { eventText } from "../adapters";
 import { isRecord } from "../../../protocol/codecs";
 import {
@@ -20,50 +22,36 @@ import type { ChatEncodeOptions, ChunkBase, JsonObject } from "./parse";
  * a raw control character inside a string, a trailing comma, an unquoted key.
  * The client parses the assembled string with `JSON.parse` and, on failure,
  * reports the call as `Tool <name> not found` with the parser's message
- * (`Unexpected trailing characters`, `Invalid number`). The repair is the same
- * one oh-my-pi applies before a tool runs: escape what strict JSON forbids,
- * then drop a trailing comma. A value that still does not parse is returned
- * unchanged — a half-repaired call is worse than the original error.
+ * (`Unexpected trailing characters`, `Invalid number`).
+ *
+ * Repairing is delegated to `jsonrepair`, which handles the whole family of
+ * near-JSON shapes (truncated objects, unquoted keys, single quotes, trailing
+ * commas) instead of the two cases a hand-rolled scanner covered.
+ *
+ * The policy around it is unchanged and is the load-bearing part: the result
+ * is parsed only to validate, and anything that does not parse *to an object*
+ * is discarded in favour of the original text — a half-repaired call is worse
+ * than the original error. The object check matters because `jsonrepair` will
+ * happily turn arbitrary prose into a quoted JSON string, which parses but is
+ * not a tool-argument object.
  */
 export function repairToolArguments(raw: string): string {
   if (raw.length === 0) return "{}";
   const repaired = repairToolArgumentText(raw);
   try {
-    JSON.parse(repaired);
+    const parsed: unknown = JSON.parse(repaired);
+    if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) return raw;
     return repaired;
   } catch {
     return raw;
   }
 }
 
+/** Repairs near-JSON text into strict JSON. Throws when the text is unrepairable. */
 function repairToolArgumentText(json: string): string {
-  const parts: string[] = [];
-  let last = 0;
-  let inString = false;
-  for (let i = 0; i < json.length; i++) {
-    const code = json.charCodeAt(i);
-    if (!inString) {
-      if (code === 0x22) inString = true;
-      continue;
-    }
-    if (code === 0x22) {
-      inString = false;
-      continue;
-    }
-    if (code === 0x5c) {
-      i++;
-      continue;
-    }
-    if (code < 0x20) {
-      const escape =
-        code === 0x0a ? "\\n" : code === 0x0d ? "\\r" : code === 0x09 ? "\\t" : `\\u${code.toString(16).padStart(4, "0")}`;
-      parts.push(json.slice(last, i), escape);
-      last = i + 1;
-    }
-  }
-  const escaped = parts.length === 0 ? json : parts.join("") + json.slice(last);
-  return escaped.replace(/,(\s*[}\]])/g, "$1");
+  return jsonrepair(json);
 }
+
 export function bytesToString(value: string | Uint8Array): string {
   return typeof value === "string" ? value : new TextDecoder().decode(value);
 }
@@ -126,9 +114,7 @@ export function eventAudio(event: CanonicalEvent): Record<string, unknown> | und
 
 export function eventReasoningText(event: CanonicalEvent): string | undefined {
   if (event.type !== "content_delta" || event.content.kind !== "reasoning") return undefined;
-  if (event.content.opaque === true) return undefined;
-  if (typeof event.content.payload === "string") return event.content.payload;
-  return typeof event.content.summary === "string" ? event.content.summary : undefined;
+  return reasoningTextOf(event.content);
 }
 
 function mergedReasoningText(events: readonly CanonicalEvent[]): string {

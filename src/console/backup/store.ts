@@ -32,7 +32,8 @@
 import { and, eq, sql } from "drizzle-orm";
 import { gzipSync, gunzipSync } from "node:zlib";
 import { differsFrom } from "../../persistence/dialect";
-import { readTelemetryEvents, TELEMETRY_EVENT_DIR } from "../../observability/event-log";
+import { TELEMETRY_EVENT_DIR } from "../../observability/event-log";
+import { queryTelemetryEvents as querySqlEvents } from "../../observability/event-query";
 import { appendFile, mkdir } from "node:fs/promises";
 import { getTableColumns, type Column, type SQL, type Table } from "drizzle-orm";
 import type { CartethyiaDatabase } from "../../persistence/db-handle";
@@ -283,13 +284,24 @@ export async function exportBackup(
   const config: Record<string, readonly BackupRow[]> = {};
   const telemetry: Record<string, readonly BackupRow[]> = {};
   const counts: Record<string, number> = {};
-  const configSet = new Set<Table>([...CONFIG_TABLES, TENANT_TABLE]);
+  const configSet = new Set<Table>([...CONFIG_TABLES]);
   const telemetrySet = new Set<Table>(TELEMETRY_TABLES);
 
-  for (const table of tables) {
-    const rows = table === telemetryEvents
-      ? await exportEventFile(tenantId)
-      : await exportTable(db, table, tenantId);
+  // Table reads are independent tenant-scoped `SELECT`s plus one disk read for
+  // the event file; firing them concurrently cuts a many-table export from
+  // one round-trip-at-a-time to the single slowest query. The DB driver pools
+  // these; the table list is bounded by `CONFIG_TABLES + TELEMETRY_TABLES`
+  // (small and known), so fan-out is bounded without an extra limiter.
+  const reads = tables.map(async (table) =>
+    [
+      table,
+      table === telemetryEvents ? await exportEventFile(db, tenantId) : await exportTable(db, table, tenantId),
+    ] as const,
+  );
+  // Preserve the caller's `tables` order when writing into the output maps so
+  // the payload's key order is deterministic across runs.
+  const settled = await Promise.all(reads);
+  for (const [table, rows] of settled) {
     const name = tableName(table);
     counts[name] = rows.length;
     if (configSet.has(table)) config[name] = rows;
@@ -362,10 +374,12 @@ export function decompressBackup(bytes: Uint8Array): string {
  * backup contract still names. The table is no longer written, so reading it
  * would export nothing.
  */
-async function exportEventFile(tenantId: string): Promise<readonly BackupRow[]> {
-  const events = await readTelemetryEvents();
-  return events
-    .filter((event) => event.tenantId === tenantId)
+async function exportEventFile(db: CartethyiaDatabase, tenantId: string): Promise<readonly BackupRow[]> {
+  // The SQL table is the durable record now, and it is tenant-scoped and
+  // retained by the same rule as the raw files — so the export reads it
+  // instead of scanning every raw file and filtering by tenant afterwards.
+  const page = await querySqlEvents(db, { tenantId, limit: MAX_ROWS_PER_TABLE });
+  return page.events
     .slice(0, MAX_ROWS_PER_TABLE)
     .map((event) => {
       const row: BackupRow = {};
@@ -454,13 +468,15 @@ function createdAtIso(value: unknown): string {
  * so the two sides are comparable regardless of how the driver types them.
  */
 /** Natural keys already present in the event file, so a re-import skips them. */
-async function existingEventFileKeys(rows: readonly BackupRow[]): Promise<Set<string>> {
+async function existingEventFileKeys(db: CartethyiaDatabase, tenantId: string, rows: readonly BackupRow[]): Promise<Set<string>> {
   const wanted = new Set(rows.map((row) => row.request_id).filter((id): id is string => typeof id === "string"));
   if (wanted.size === 0) return new Set();
-  const events = await readTelemetryEvents();
+  // One indexed query for the ids being restored, instead of reading every
+  // raw file to test membership. `id = request_id`, so the unique index serves
+  // this directly.
+  const page = await querySqlEvents(db, { tenantId, requestIds: [...wanted] });
   return new Set(
-    events
-      .filter((event) => wanted.has(event.requestId))
+    page.events
       .map((event) => `${event.tenantId ?? ""}\u0000${event.requestId}\u0000${event.createdAt}`),
   );
 }
@@ -517,12 +533,22 @@ async function clearOwnedRows(
 }
 
 /**
- * Inserts rows one at a time so a single bad row names its own failure.
+ * Inserts rows in bulk with a per-row fallback for diagnostics.
  *
  * `conflictTarget` is supplied for tables a restore may not delete from: the
  * payload's rows are upserted by the table's unique key, so re-importing a
  * backup updates what is already there instead of failing on the first
  * duplicate.
+ *
+ * Historically rows went in one statement at a time so a single bad row could
+ * name its own failure. On a real backup — thousands of telemetry events, a
+ * tenant's models and accounts — that cost one DB round-trip per row and the
+ * restore stalled on network latency rather than the server's write path. The
+ * fast path collapses those statements into one `INSERT ... VALUES (...), ...`
+ * per chunk; if a chunk fails for any reason (bad row, constraint, oversized
+ * parameter list) the chunk is re-run one row at a time so the diagnostic
+ * surface is unchanged. The slow path is only reached on real errors, so a
+ * clean restore pays zero penalty for the diagnostic.
  */
 async function insertRows(
   tx: CartethyiaDatabase,
@@ -533,48 +559,175 @@ async function insertRows(
     readonly keyOf?: (row: BackupRow) => string;
     readonly conflictTarget?: readonly Column[];
     readonly ignoreConflicts?: boolean;
+    readonly tenantId?: string;
   } = {},
 ): Promise<number> {
-  let inserted = 0;
+  // Normalise rows up front: filter skips, drop empty-value rows (no
+  // insertable columns), and project to Drizzle values. Doing it once keeps
+  // the two paths from diverging in what counts as insertable.
+  const prepared: Record<string, unknown>[] = [];
   for (const row of rows) {
     if (options.skipKeys !== undefined && options.keyOf !== undefined && options.skipKeys.has(options.keyOf(row))) {
       continue;
     }
     const values = toValues(table, row);
+    if (options.tenantId !== undefined && "tenantId" in values) values.tenantId = options.tenantId;
     if (Object.keys(values).length === 0) continue;
+    prepared.push(values);
+  }
+  if (prepared.length === 0) return 0;
+
+  // The `set` clause for upserts: every column the payload carries is written,
+  // so a re-import restores the file's state rather than leaving stale values
+  // behind. `excluded` is the row that failed to insert, and column names come
+  // from the schema rather than the JS key — guessing the database spelling
+  // from a camelCase key breaks the moment the two differ.
+  const columnNameMap = new Map(
+    Object.entries(getTableColumns(table)).map(([key, column]) => [key, column.name]),
+  );
+  const buildUpsertSet = (values: Record<string, unknown>): Record<string, unknown> =>
+    Object.fromEntries(
+      Object.keys(values).map((key) => {
+        const name = columnNameMap.get(key);
+        if (name === undefined) throw new Error(`${tableName(table)} has no column ${key}`);
+        return [key, sql.raw(`excluded."${name}"`)];
+      }),
+    );
+
+  // One row's path, kept as its own function so the bulk fallback can reuse it
+  // without duplicating the control flow.
+  const insertOne = async (values: Record<string, unknown>): Promise<number> => {
     const statement = insertRow(tx, table, values);
     if (options.ignoreConflicts) {
-      if (options.conflictTarget === undefined)
+      if (options.conflictTarget === undefined) {
         throw new Error(`ignoreConflicts requires a target for ${tableName(table)}`);
+      }
       const insertedRows = await statement
         .onConflictDoNothing({ target: options.conflictTarget as never })
         .returning();
-      inserted += insertedRows.length;
-      continue;
+      return insertedRows.length;
     }
     if (options.conflictTarget === undefined) {
       await statement;
-    } else {
-      // Every column the payload carries is written, so a re-import restores
-      // the file's state rather than leaving stale values behind. `excluded`
-      // is the row that failed to insert, and the column names come from the
-      // schema rather than from the JS key — guessing the database spelling
-      // from a camelCase key breaks the moment the two differ.
-      const names = new Map(
-        Object.entries(getTableColumns(table)).map(([key, column]) => [key, column.name]),
-      );
-      await statement.onConflictDoUpdate({
-        target: options.conflictTarget as never,
-        set: Object.fromEntries(
-          Object.keys(values).map((key) => {
-            const name = names.get(key);
-            if (name === undefined) throw new Error(`${tableName(table)} has no column ${key}`);
-            return [key, sql.raw(`excluded."${name}"`)];
-          }),
-        ) as never,
-      });
+      return 1;
     }
-    inserted += 1;
+    await statement.onConflictDoUpdate({
+      target: options.conflictTarget as never,
+      set: buildUpsertSet(values) as never,
+    });
+    return 1;
+  };
+
+  // Bulk chunk size: keeps each statement's parameter count comfortably under
+  // Postgres's 65535 limit even for the widest table. 500 rows × ~60 columns
+  // leaves plenty of headroom; a narrower table just means a faster chunk.
+  const BULK_CHUNK = 500;
+
+  // Attempts one chunk in a single statement. Returns the inserted count on
+  // success, or `null` to signal "fall back to per-row for this chunk". The
+  // chunk is wrapped in a savepoint so a bulk failure can be rolled back
+  // *inside* the outer restore transaction — without this, Postgres marks the
+  // outer transaction as aborted on the first error and the per-row diagnostic
+  // fallback would itself fail with "current transaction is aborted".
+  const insertChunk = async (
+    chunk: readonly Record<string, unknown>[],
+  ): Promise<{ count: number } | { error: unknown }> => {
+    try {
+      // `tx.transaction(...)` nests as a `SAVEPOINT ... ROLLBACK TO SAVEPOINT`
+      // on both Postgres and SQLite drivers Drizzle supports here, which is
+      // exactly what the fallback needs: on failure the outer transaction
+      // stays writable and the per-row path can isolate the offending row.
+      const count = await tx.transaction(async (innerTx) => {
+        // Drizzle types the nested transaction callback with the dialect's
+        // own transaction handle; cast once to a named local with a reason,
+        // never inline on member access.
+        const inner = innerTx as unknown as CartethyiaDatabase; // nested-tx handle; mirrors applyRestore's outer `scoped` cast on line 607.
+        const statement = inner.insert(table).values(chunk as never);
+        if (options.ignoreConflicts) {
+          if (options.conflictTarget === undefined) {
+            throw new Error(`ignoreConflicts requires a target for ${tableName(table)}`);
+          }
+          const insertedRows = await statement
+            .onConflictDoNothing({ target: options.conflictTarget as never })
+            .returning();
+          return insertedRows.length;
+        }
+        if (options.conflictTarget === undefined) {
+          await statement;
+          return chunk.length;
+        }
+        // For a bulk upsert `excluded.*` references the row the driver tried
+        // to insert, so each column mapping is the same regardless of which
+        // row in the chunk conflicts. Build the set clause from the first
+        // row's keys — every prepared row for one table carries the same key
+        // set because `toValues` is deterministic for a given schema.
+        const firstRow = chunk[0];
+        if (firstRow === undefined) return 0;
+        await statement.onConflictDoUpdate({
+          target: options.conflictTarget as never,
+          set: buildUpsertSet(firstRow) as never,
+        });
+        return chunk.length;
+      });
+      return { count };
+    } catch (error) {
+      // Signal "re-run row by row": a bulk failure must not swallow the
+      // specific row's error, because the per-row path is what names the
+      // offending row to the operator. Keep the bulk error too: when the
+      // per-row fallback also fails (connection drop, aborted transaction,
+      // oversized statement), the derived row error would otherwise hide the
+      // real cause from the operator.
+      return { error };
+    }
+  };
+
+  let inserted = 0;
+  // Group adjacent rows that share the same column key set. Different rows in
+  // one table can carry different keys (an optional column omitted when the
+  // payload cell is absent; `parent_key_id` present on child api_keys but not
+  // parents), and Drizzle's bulk `.values([...])` compiles one SQL statement
+  // with a column list taken from the first row — so a bulk of mixed shapes
+  // produces malformed SQL. Grouping by signature keeps each bulk statement
+  // uniform while preserving row order within the group.
+  //
+  // Signature is a stable `|`-joined list of sorted keys; empty columns were
+  // already dropped by the `toValues` → `Object.keys(values).length === 0`
+  // check above, so empty signatures never occur here.
+  const signatureOf = (values: Record<string, unknown>): string =>
+    Object.keys(values).sort().join("|");
+  let groupStart = 0;
+  while (groupStart < prepared.length) {
+    const groupSignature = signatureOf(prepared[groupStart]!);
+    let groupEnd = groupStart + 1;
+    while (
+      groupEnd < prepared.length &&
+      signatureOf(prepared[groupEnd]!) === groupSignature &&
+      groupEnd - groupStart < BULK_CHUNK
+    ) {
+      groupEnd += 1;
+    }
+    const chunk = prepared.slice(groupStart, groupEnd);
+    const bulk = await insertChunk(chunk);
+    if ("count" in bulk) {
+      inserted += bulk.count;
+    } else {
+      // Diagnostic fallback: let the single statement that actually errors
+      // reach the caller with the row that caused it. If the fallback itself
+      // fails, the row-level error is derived — chain the original bulk error
+      // so a connection-level fault is not reported as a bad row.
+      try {
+        for (const values of chunk) {
+          inserted += await insertOne(values);
+        }
+      } catch (perRowError) {
+        const bulkMessage = bulk.error instanceof Error ? bulk.error.message : String(bulk.error);
+        throw new Error(
+          `bulk insert into ${tableName(table)} failed (${bulkMessage}); per-row diagnostic also failed`,
+          { cause: perRowError },
+        );
+      }
+    }
+    groupStart = groupEnd;
   }
   return inserted;
 }
@@ -610,6 +763,14 @@ export async function applyRestore(
     // its PK is `id`, so a conflict means "already there" rather than an error.
     // The payload's tenant is forced to the restoring tenant — a payload naming
     // someone else's tenant id must not create or claim that tenant.
+    //
+    // Current exports deliberately omit the `tenants` section, so
+    // `tenantRows` is normally empty. Child rows still carry
+    // `tenant_id = tenantId`, which means a restore into a tenant that does
+    // not exist yet would fail the `api_keys` (and other) foreign keys unless
+    // we ensure the receiving tenant here. The minimal placeholder row is
+    // written only for a tenant that did not already exist; on conflict it is
+    // a no-op and the existing tenant's name/status are left untouched.
     if (validation.tenantRows.length > 0) {
       let inserted = 0;
       for (const row of validation.tenantRows) {
@@ -621,6 +782,15 @@ export async function applyRestore(
         inserted += result.length;
       }
       restored["tenants"] = inserted;
+    } else {
+      const result = await insertRow(scoped, TENANT_TABLE, {
+        id: tenantId,
+        name: "restored",
+        status: "active",
+      })
+        .onConflictDoNothing()
+        .returning({ id: sql<number>`1` });
+      restored["tenants"] = result.length;
     }
 
     const replaceTables = order.filter(
@@ -660,6 +830,7 @@ export async function applyRestore(
           : entry.rows;
       restored[tableName(table)] = await insertRows(scoped, table, rows, {
         ...(ownership.kind === "authored" ? { conflictTarget: ownership.keyColumns } : {}),
+        tenantId,
       });
     }
 
@@ -669,8 +840,12 @@ export async function applyRestore(
       const entry = validation.tables.get(table);
       if (entry === undefined) continue;
       if (table === telemetryEvents) {
-        const existing = await existingEventFileKeys(entry.rows);
-        const fresh = entry.rows.filter((row) => !existing.has(telemetryKey(row)));
+        // The payload rows are remapped to the restoring tenant before the
+        // idempotency filter runs, so the dedupe keys and the appended file
+        // rows are owned by the receiving tenant, not the backup's tenant.
+        const remapped = entry.rows.map((row) => ({ ...row, tenant_id: tenantId }));
+        const existing = await existingEventFileKeys(db, tenantId, entry.rows);
+        const fresh = remapped.filter((row) => !existing.has(telemetryKey(row)));
         await appendRestoredEvents(fresh);
         restored[tableName(table)] = fresh.length;
         skipped[tableName(table)] = entry.rows.length - fresh.length;
@@ -682,11 +857,12 @@ export async function applyRestore(
             telemetryUsageTotals.entityId,
           ],
           ignoreConflicts: true,
+          tenantId,
         });
         restored[tableName(table)] = restoredCount;
         skipped[tableName(table)] = entry.rows.length - restoredCount;
       } else {
-        restored[tableName(table)] = await insertRows(scoped, table, entry.rows);
+        restored[tableName(table)] = await insertRows(scoped, table, entry.rows, { tenantId });
       }
     }
   });

@@ -1,3 +1,4 @@
+import { log } from "../../observability/logger";
 // API-key authentication guard for `/v1/*`: token resolution, scope check,
 // client-router denylist, and the model-abuse ban gate.
 import { Elysia } from "elysia";
@@ -5,13 +6,12 @@ import { GatewayError } from "../../protocol/gateway-error";
 import type { ProxyRequestStateStore } from "../request/state";
 import { fastPathname } from "../pathname";
 import type { CartethyiaDatabase } from "../../persistence/db-handle";
-import { requestToken, resolveApiKeyAuthorization } from "../../security/api-key-auth";
+import { requestToken, resolveApiKeyAuthorization, unknownApiKeyError } from "../../security/api-key-auth";
 import {
   deniedClientRouter,
   detectClientRouter,
 } from "../../security/client-router-fingerprint";
 import { createAccessDecision } from "../../security/access-control";
-import { modelAbuseBannedError, type ModelStrikeService } from "../../security/model-abuse";
 
 /**
  * Stateless Elysia `beforeHandle` gateway check: API-key authentication,
@@ -26,7 +26,12 @@ export function createApiKeyAuthenticationMiddleware(deps: {
    * assigned — so a banned caller's attempts produce no telemetry row and no
    * console error, which is exactly the noise this layer exists to stop.
    */
-  readonly modelStrikes?: Pick<ModelStrikeService, "check">;
+  /**
+   * Tenant invoke kill switch. Checked after the key resolves, because the
+   * tenant is a property of the key: the same gateway serves several tenants
+   * and one switching itself off must not stop the others.
+   */
+  readonly isInvokeDisabled?: (tenantId: string) => Promise<boolean | undefined>;
 }): Elysia {
   // Single policy for every `/v1/*` gateway route: authenticated, scoped to
   // `routing:invoke`, and tenant-bound (the snapshot's tenant is the only
@@ -39,9 +44,32 @@ export function createApiKeyAuthenticationMiddleware(deps: {
       const pathname = fastPathname(request.url);
       if (!pathname.startsWith("/v1/")) return;
       const token = requestToken(request.headers);
-      const authorization = await resolveApiKeyAuthorization(deps.db, token);
-      if (!authorization)
-        throw new GatewayError("invalid_request", 401, "This API key is unknown, revoked, or expired. Issue a new key and send it as: Authorization: Bearer <key>.");
+      // A database failure here is not "the key is bad". Left to propagate it
+      // surfaced as a 500 whose log line carried the whole statement and its
+      // bound parameters — including the key hash — once per request. Under an
+      // overloaded database that is a credential leak written at request rate.
+      //
+      // It is also the wrong answer: the caller cannot fix it by sending a
+      // different key, so it is a capacity signal, not an auth one.
+      const authorization = await resolveApiKeyAuthorization(deps.db, token).catch((error: unknown) => {
+        // Only the error's identity is logged, never its message: a drizzle
+        // query error carries the full statement and its bound parameters, and
+        // on this path one of those parameters is the key hash.
+        // A sanitized stand-in, not the original: a drizzle query error's
+        // message is the statement plus its bound parameters, and one of those
+        // parameters is the key hash.
+        const safe = new Error("[redacted: credential-store query failed]");
+        safe.name = error instanceof Error ? error.name : "Error";
+        log.error("[auth] key lookup failed; treating as unavailable", safe);
+        throw new GatewayError(
+          "accounts_unavailable",
+          503,
+          "The gateway could not verify this API key because its credential store is unavailable. Retry shortly.",
+          {},
+          "cartethyia",
+        );
+      });
+      if (!authorization) throw unknownApiKeyError();
       const decision = createAccessDecision({
         id: authorization.id,
         tenantId: authorization.tenantId,
@@ -49,6 +77,17 @@ export function createApiKeyAuthenticationMiddleware(deps: {
       });
       if (!decision.scopes.includes("routing:invoke"))
         throw new GatewayError("invalid_request", 403, "This API key is not allowed to invoke routing. Grant it the routing:invoke scope, or use a key that has it.");
+      // Kill switch: refuse before any upstream is touched. Distinct from the
+      // scope check above, which is a property of the key — this is the tenant
+      // having stopped all traffic, and it applies to every key the tenant owns.
+      // 503 rather than 403: nothing about the request is invalid, and the
+      // caller should retry later instead of "fixing" a request that is fine.
+      if ((await deps.isInvokeDisabled?.(authorization.tenantId)) === true)
+        throw new GatewayError(
+          "platform_unavailable",
+          503,
+          "This gateway has invoke switched off. Nothing upstream is being dialed while the switch is off; turn it back on from the dashboard overview to resume routing.",
+        );
       // A key may refuse a downstream router it has been resold to. This is a
       // policy check on the resolved key, so it belongs with the other
       // authorization decisions rather than in routing: the request is refused
@@ -64,19 +103,6 @@ export function createApiKeyAuthenticationMiddleware(deps: {
           "No API invocation access for this client.",
           { reason: "client_router_denied", clientRouter: denied },
         );
-      // Abuse ban: refuse before parse/prepare and before authorization is
-      // recorded, so a banned caller cannot keep producing failed rows. The ban
-        // is keyed on the client address, not the key: one key can be shared by
-        // every recipient of a share link, so refusing the key would punish
-        // callers that did nothing.
-      if (deps.modelStrikes) {
-        const state = deps.stateStore.get(request);
-        const ip = state?.clientIdentity?.address;
-        if (ip !== undefined) {
-          const banned = await deps.modelStrikes.check({ ip }).catch(() => false);
-          if (banned) throw modelAbuseBannedError();
-        }
-      }
       deps.stateStore.require(request).authorization = authorization;
     })
     .as("plugin");

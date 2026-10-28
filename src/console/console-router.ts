@@ -26,11 +26,11 @@ import type { NetworkPoolSelector } from "../network/pool/selector";
 import type { TelemetryBatchBuffer } from "../observability/telemetry-buffer";
 import type { OAuthRefreshService } from "../providers/authentication/oauth-refresh-service";
 import type { ApiKeyAdmissionService } from "../security/admission/service";
-import type { ModelStrikeService } from "../security/model-abuse";
 import type { RedisClient } from "../persistence/redis";
 import { CliToolMappingStore } from "./cli-tools/store";
 import { CliToolService } from "./cli-tools/service";
 import { DrizzleCliToolSecretSource } from "./cli-tools/secret-source";
+import type { ShareLinkStore } from "../persistence/stores/share-store";
 import type { ProviderRegistry } from "../providers/provider-registry";
 import type { BundledProviderCatalog } from "../providers/operations/provider-catalog-service";
 import type { ValidatedNetworkBindingFactory } from "../network/pool/resolver";
@@ -49,6 +49,13 @@ export interface ConsoleApiCompositionDeps {
   readonly poolSelector: NetworkPoolSelector;
   readonly telemetryBuffer: TelemetryBatchBuffer;
   /**
+   * Queued writers the console can drain on demand (telemetry, usage, health
+   * events). Optional for the same reason the other reduced composition
+   * surface is: absent means the flush control is not offered rather than the
+   * console failing to build.
+   */
+  readonly flushBuffers?: { flush(): Promise<void> };
+  /**
    * The request state store owns the live in-flight gauge, so the console reads
    * its snapshot/subscription from here rather than a free-standing module.
    */
@@ -58,13 +65,13 @@ export interface ConsoleApiCompositionDeps {
   readonly networkBindingFactory: ValidatedNetworkBindingFactory;
   readonly redis: RedisClient | undefined;
   readonly oauthRefreshService: OAuthRefreshService;
-  readonly admissionService: Pick<ApiKeyAdmissionService, "purgeKey">;
   /**
-   * Graduated model-abuse strikes: list and lift bans from the console.
-   * Optional so reduced compositions (route-only shell, console stubs) stay
-   * valid; absent means the `/model-bans` routes are not mounted.
+   * Share-link store shared with the public share router, so both surfaces
+   * wrap the same table through one instance. Optional: absent means the
+   * console builds its own store from `db`.
    */
-  readonly modelStrikes?: Pick<ModelStrikeService, "listBans" | "unban" | "ban">;
+  readonly shareStore?: ShareLinkStore;
+  readonly admissionService: Pick<ApiKeyAdmissionService, "purgeKey">;
   readonly readRoutingAccountInflight?:
     | ((
         providerId: string,
@@ -183,12 +190,13 @@ export function createConsoleRouter(deps: ConsoleApiCompositionDeps): Elysia {
     poolSelector,
     telemetryBuffer,
     ...(deps.stateStore ? { stateStore: deps.stateStore } : {}),
+    ...(deps.shareStore ? { shareStore: deps.shareStore } : {}),
     providerRegistry: deps.providerRegistry,
     bundledModelCatalog: deps.bundledModelCatalog,
     networkBindingFactory: deps.networkBindingFactory,
     admissionService: deps.admissionService,
-    ...(deps.modelStrikes ? { modelStrikes: deps.modelStrikes } : {}),
     readRoutingAccountInflight: deps.readRoutingAccountInflight,
+    ...(deps.flushBuffers ? { flushBuffers: deps.flushBuffers } : {}),
     credentialService,
     // The backup surface re-authenticates the operator, so it needs the current
     // user's hash. Read from the session on the request that asks for it, never
@@ -209,9 +217,11 @@ export function createConsoleRouter(deps: ConsoleApiCompositionDeps): Elysia {
   // nothing to compress and no size to judge. `wrap` sits outside the router
   // and sees the finished `Response`, which is what this needs.
   //
-  // Scoped to the console instance: `/v1/*` is a separate Elysia and is
-  // deliberately not covered, because a streaming completion must not be
-  // buffered and proxied bodies are the provider's own bytes. See
+  // Scoped by path *inside* `gzipResponse`, not by this instance: Elysia's
+  // `use()` merges a child's `hoc` into the root app's ext, so this wrap is
+  // reached by `/v1/*` as well. The allowlist is `/console/api/` + `/metrics`.
+  // `/v1/*` is deliberately excluded, because a streaming completion must not
+  // be buffered and proxied bodies are the provider's own bytes. See
   // `response-compression.ts` for the full reasoning and the measured win.
   console.wrap(
     (fetch) => (request: Request, ...rest: unknown[]) =>

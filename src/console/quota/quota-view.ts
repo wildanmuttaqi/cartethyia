@@ -1,14 +1,14 @@
 import { providerAccounts } from "../../persistence/schema";
 import type { ProviderQuotaResult } from "../../providers/quota/quota-contracts";
 import { log } from "../../observability/logger";
-import { GLOBAL_QUOTA_LENS } from "./cache";
+import { GLOBAL_QUOTA_LENS } from "../../providers/quota/cache";
 import {
   QUOTA_REFRESH_TIMEOUT_MS,
   refreshAccountQuota,
   signalFetch,
   type QuotaRefreshDeps,
   type QuotaRefreshTarget,
-} from "./refresh";
+} from "../../providers/quota/refresh";
 
 /** Shape returned for quota data on dashboard account responses. */
 export interface QuotaRefreshView {
@@ -154,7 +154,7 @@ export function toQuotaAccountHealth(row: {
     cooldownUntil: row.cooldownUntil ? row.cooldownUntil.toISOString() : null,
     // Only deadlines still in force are returned: the sweep prunes the column
     // on a timer, so a raw read can carry an entry that has already elapsed and
-    // would render as a cooldown that no longer applies.
+    // would render as a cooldown that is not in force.
     modelCooldowns: liveModelCooldowns(row.modelCooldowns),
   };
 }

@@ -26,6 +26,7 @@ import { metrics } from "../../../observability/metrics";
 import { flagPoolBlocked, flagPoolCooldown } from "../../../network/pool-health";
 import { isFreeTierIpBlock, shouldCooldownPool } from "../retry-policy";
 import { releaseAttemptLeases } from "../leases";
+import type { AttemptLeaseOwnership } from "../leases";
 import { finalizeRequestTelemetry } from "../../guards/error-lifecycle";
 import { drainAbortReason } from "../../shutdown-notice";
 import {
@@ -69,6 +70,12 @@ export interface StreamFinalizeInput {
    * single pre-content Responses retry rebinds it mid-stream.
    */
   readonly getIterator: () => AsyncIterator<CanonicalEvent>;
+  /**
+   * Ownership of this attempt's account/network-pool release. A provider
+   * session that outlived this request already took it over, so
+   * `releaseByResponse()` is a no-op and the slot stays held for the session.
+   */
+  readonly leaseOwnership?: AttemptLeaseOwnership | undefined;
   /** First-token latency in the spread shape `completeAttempt` accepts. */
   readonly ttfbFields: (
     firstByteAt: number | undefined,
@@ -89,6 +96,17 @@ export interface StreamFinalizeInput {
  * stream back into the error path and emitting duplicate telemetry rows (and
  * a second resource release) for one request.
  */
+
+/**
+ * How long a deferred release waits for the reader it was handed to.
+ *
+ * Only a backstop: the pull or `attachController` it defers to normally
+ * releases first. Long enough that a reader mid-write is never cut off, short
+ * enough that a reader which never runs does not leave the flight registered
+ * indefinitely.
+ */
+const DEFERRED_RELEASE_BACKSTOP_MS = 30_000;
+
 export class StreamFinalizer {
   /**
    * True only while a `pull()` is awaiting the upstream iterator. A watchdog
@@ -98,6 +116,8 @@ export class StreamFinalizer {
    * abort handler instead.
    */
   pullActive = false;
+  /** Backstop timer for an abort whose release was deferred to another reader. */
+  private releaseBackstop: ReturnType<typeof setTimeout> | undefined;
 
   /**
    * Max time between upstream events before the stream is declared stalled,
@@ -147,7 +167,7 @@ export class StreamFinalizer {
    *
    * Once the upstream has produced anything — even surface-invisible
    * reasoning deltas — it is alive: the stall bound governs and the tighter
-   * first-chunk bound no longer applies.
+   * first-chunk bound does not apply.
    *
    * The request deadline is a fixed ceiling measured from ingress, and a
    * stream that keeps sending past it is not stalled. A live WorkBuddy stream
@@ -174,6 +194,29 @@ export class StreamFinalizer {
   clearStallWatchdog(): void {
     clearTimeout(this.stallTimer);
     this.stallTimer = undefined;
+  }
+
+  /**
+   * Guarantees {@link releaseStreamResources} runs after a deferred abort.
+   *
+   * Two branches of `onStreamAbort` hand the release to some other reader — an
+   * active pull, or `attachController` — and return. When that reader never
+   * runs, nothing releases: the flight stays in the in-flight registry and the
+   * gauge never returns to zero, which is indistinguishable from permanent
+   * load. A server-side abort (deadline, 504) is the case that reaches them,
+   * because only a client disconnect is handled inline.
+   *
+   * The timer is unref'd so it cannot keep the process alive during shutdown,
+   * and `releaseStreamResources` is idempotent (`streamReleased`), so a pull
+   * that does settle first simply makes this a no-op.
+   */
+  private armDeferredReleaseBackstop(): void {
+    if (this.releaseBackstop !== undefined) return;
+    this.releaseBackstop = setTimeout(() => {
+      this.releaseBackstop = undefined;
+      void this.releaseStreamResources();
+    }, DEFERRED_RELEASE_BACKSTOP_MS);
+    this.releaseBackstop.unref?.();
   }
 
   /**
@@ -250,10 +293,28 @@ export class StreamFinalizer {
     // Let an active pull emit the terminal frame for a server drain or
     // deadline. With no pull, no reader will handle it, so this listener must
     // emit and close through the attached controller itself.
-    if (this.pullActive && !clientDisconnect) return;
+    // Deferring to the pull assumes the pull will settle and release. It may
+    // not: a pull awaits the upstream iterator, and an upstream that went
+    // quiet after the abort leaves that await pending — so nothing ever
+    // reaches `releaseStreamResources()` and the flight stays registered
+    // forever. A server-side abort (deadline, 504) is exactly the case, since
+    // only a client disconnect takes the path below.
+    //
+    // Arm a backstop instead of returning bare. If the pull does settle it
+    // releases first and this becomes a no-op, so the normal path is
+    // unchanged; if it never does, the flight is still reaped.
+    if (this.pullActive && !clientDisconnect) {
+      this.armDeferredReleaseBackstop();
+      return;
+    }
     // Before ReadableStream.start attaches its controller, defer server-side
     // failures so attachController can deliver the typed terminal frame.
-    if (!clientDisconnect && this.streamController === undefined) return;
+    if (!clientDisconnect && this.streamController === undefined) {
+      // Same assumption, same consequence: attachController is expected to
+      // deliver the frame and release. Nothing guarantees it runs.
+      this.armDeferredReleaseBackstop();
+      return;
+    }
     if (clientDisconnect) {
       const { candidate } = this.input;
       if (!state.outcome) {
@@ -329,6 +390,14 @@ export class StreamFinalizer {
     if (this.streamReleased) return;
     this.streamReleased = true;
     const { state, deps, prepared, lease, reservation, proxySlot } = this.input;
+    // The deferred-release backstop has done its job — or the reader it
+    // deferred to beat it here. Either way the timer must not outlive the
+    // release, and an unref'd timer left armed would fire into a released
+    // finalizer.
+    if (this.releaseBackstop !== undefined) {
+      clearTimeout(this.releaseBackstop);
+      this.releaseBackstop = undefined;
+    }
     state.abortController.signal.removeEventListener("abort", this.handleAbort);
     this.streamController = undefined;
     this.clearClientKeepaliveTimer();
@@ -338,6 +407,9 @@ export class StreamFinalizer {
         lease,
         reservation,
         proxySlot,
+        ...(this.input.leaseOwnership === undefined
+          ? {}
+          : { ownership: this.input.leaseOwnership }),
       },
       prepared.routingEngine,
     );
@@ -392,6 +464,11 @@ export class StreamFinalizer {
         candidate.providerId,
         candidate.modelId,
       );
+      // A deferred terminal means the provider's turn is not over: the stream
+      // ended because the model asked for a tool the client must answer, and the
+      // authoritative usage arrives with the request that continues the same
+      // upstream turn. Committing an estimate here would bill that turn twice.
+      const deferredUsage = pipeline.terminal.usage_deferred === true;
       await completeAttempt(state, {
         status: upstreamTruncated ? "truncated" : "completed",
         ...this.streamCompletionContext(),
@@ -404,7 +481,7 @@ export class StreamFinalizer {
             }
           : {}),
         usage: finalUsage,
-        commitUsage: finalUsage,
+        ...(deferredUsage ? {} : { commitUsage: finalUsage }),
         responseBody: pipeline.telemetryEventTranscript,
         ...(pipeline.clientResponseText ? { clientResponseText: pipeline.clientResponseText } : {}),
         ...(pipeline.firstContentDeltaAtMs !== undefined ? { firstContentDeltaAtMs: pipeline.firstContentDeltaAtMs } : {}),
@@ -481,6 +558,9 @@ export class StreamFinalizer {
       // never an upstream-reported error — the upstream path is already
       // covered by the `GatewayError` branch keeping its own origin.
       errorOrigin: terminalOutcome.errorOrigin,
+      ...(terminalOutcome.httpStatus === undefined
+        ? {}
+        : { terminalHttpStatus: terminalOutcome.httpStatus }),
       ...(!cancelled ? { error: streamError } : {}),
       ...(!cancelled
         ? {

@@ -19,3 +19,4 @@ export function resolveTelemetryPayloadMaxBytes(): number {
     CONFIG_SPEC.CARTETHYIA_TELEMETRY_PAYLOAD_MAX_BYTES,
   );
 }
+

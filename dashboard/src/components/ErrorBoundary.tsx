@@ -10,6 +10,9 @@ interface ErrorBoundaryProps {
 
 interface ErrorBoundaryState {
   readonly error: Error | null;
+  /** Which component threw. Surfaced in the UI because the console log is not
+   * reachable from a browser the operator only sees the rendered page on. */
+  readonly componentStack: string | null;
 }
 
 /**
@@ -18,14 +21,15 @@ interface ErrorBoundaryState {
  * renders a recoverable surface and offers a full reload as the last resort.
  */
 export default class ErrorBoundary extends Component<ErrorBoundaryProps, ErrorBoundaryState> {
-  override state: ErrorBoundaryState = { error: null };
+  override state: ErrorBoundaryState = { error: null, componentStack: null };
 
   static getDerivedStateFromError(error: Error): ErrorBoundaryState {
-    return { error };
+    return { error, componentStack: null };
   }
 
   override componentDidCatch(error: Error, info: ErrorInfo): void {
     console.error("[console] route render failed:", error, info.componentStack);
+    this.setState({ componentStack: info.componentStack ?? null });
   }
 
   override componentDidUpdate(previousProps: ErrorBoundaryProps): void {
@@ -36,6 +40,14 @@ export default class ErrorBoundary extends Component<ErrorBoundaryProps, ErrorBo
 
   override render(): ReactNode {
     if (this.state.error === null) return this.props.children;
+    const componentStack = this.state.componentStack?.trim();
+    const errorStack = this.state.error.stack?.trim();
+    const trace =
+      componentStack !== undefined && componentStack.length > 0
+        ? componentStack
+        : errorStack !== undefined && errorStack.length > 0
+          ? errorStack
+          : null;
     return (
       <main className="auth-viewport">
         <div className="card-solid auth-window border border-red-soft">
@@ -51,6 +63,16 @@ export default class ErrorBoundary extends Component<ErrorBoundaryProps, ErrorBo
             <span className="select-text break-words">
               {this.state.error.message}
             </span>
+            {/* One trace, not two. `componentStack` and `error.stack` name the
+                same failure and overlap almost entirely, so showing both read
+                as the same error printed twice. The component stack wins when
+                present because it names the component that threw; the raw stack
+                is the fallback for an error caught without one. */}
+            {trace !== null ? (
+              <pre className="mt-4 max-h-80 overflow-auto whitespace-pre-wrap break-words text-badge text-text-tertiary">
+                {trace}
+              </pre>
+            ) : null}
           </div>
 
           <button

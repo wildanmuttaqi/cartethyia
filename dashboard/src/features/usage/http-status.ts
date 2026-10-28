@@ -1,18 +1,11 @@
 /**
  * HTTP reason phrases for the statuses the gateway can return.
  *
- * The Requests filter buttons and the status cell previously hardcoded
- * `"200 OK"` and `"500 ERR"` as literals, and only `200` ever received a
- * reason phrase — every other code rendered as a bare number (`404`, `503`),
- * so the label told an operator nothing they could not already read off the
- * digits, and the two literals could drift from the codes the backend emits.
- *
  * The phrases are the standard ones (`node:http`'s `STATUS_CODES` agrees for
- * every code below), kept as a local table rather than imported from
- * `node:http` because this is browser code. `499` is not in the standard and
- * has no registered phrase; it is named here because the gateway emits it for
- * a client abort and an operator needs to recognize it as "the client left",
- * not as a server defect.
+ * every standard code below), kept as a local table rather than imported from
+ * `node:http` because this is browser code. `499` and `529` have no registered
+ * phrase; they are named for the gateway's client
+ * abort and capacity-exhausted outcomes rather than inventing standard text.
  *
  * Codes the gateway cannot currently return are deliberately absent: an
  * unknown code falls back to the bare number rather than inventing a phrase.
@@ -21,8 +14,11 @@ const REASON_PHRASES: Readonly<Record<number, string>> = {
   200: "OK",
   400: "Bad Request",
   401: "Unauthorized",
+  402: "Payment Required",
   403: "Forbidden",
   404: "Not Found",
+  407: "Proxy Authentication Required",
+  408: "Request Timeout",
   409: "Conflict",
   413: "Payload Too Large",
   415: "Unsupported Media Type",
@@ -34,6 +30,7 @@ const REASON_PHRASES: Readonly<Record<number, string>> = {
   502: "Bad Gateway",
   503: "Service Unavailable",
   504: "Gateway Timeout",
+  529: "Capacity Exhausted",
 };
 
 /** `200` -> `"200 OK"`; an unrecognized code returns just its digits. */
@@ -56,8 +53,11 @@ const SHORT_REASONS: Readonly<Record<number, string>> = {
   200: "OK",
   400: "BAD",
   401: "AUTH",
+  402: "QUOTA",
   403: "DENY",
   404: "MISS",
+  407: "PROXY",
+  408: "TIME",
   409: "CONFL",
   413: "LARGE",
   415: "TYPE",
@@ -69,6 +69,7 @@ const SHORT_REASONS: Readonly<Record<number, string>> = {
   502: "GATE",
   503: "DOWN",
   504: "TIME",
+  529: "CAP",
 };
 
 /** `500` -> `"500 ERR"`; an unknown code falls back to just its digits. */

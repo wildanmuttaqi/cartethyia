@@ -3,7 +3,7 @@ import type { ApiErrorShape } from "../data/api";
 // Console-owned device-poll DTO; token material remains provider-internal.
 import type { AccountHealthEventRecord, ByokConnectionTestRequest, ByokConnectionTestResult, CreateProviderAccountBatchResult, CreateProviderAccountRequest, CreateProviderRequest, OAuthDevicePollResponse as OAuthDevicePollResult, ProbeAllAccountsResult, ProbeModelRequest, ProbeModelResult, ProviderAccountResponse, ProviderAccountsExportResponse, ProviderResponse, SetModelEnabledRequest, UpdateProviderAccountRequest, UpdateProviderRequest } from "../data/contracts";
 import { queryKeys } from "../data/query-keys";
-import { assertModels, assertProviders, querySignal } from "../data/assert";
+import { assertModels, assertProvider, assertProviders, querySignal } from "../data/assert";
 import { DASHBOARD_QUERY_OPTIONS, POLL } from "../data/query-policy";
 import { getErrorMessage } from "../data/api";
 import { toast } from "../lib/toast";
@@ -31,8 +31,9 @@ export interface ModelMetadataPayload {
  * Loads the tenant provider catalog and observes background metadata refreshes.
  *
  * Lazy by design: the cached list renders instantly on revisit and revalidates
- * in the background (60 s freshness + 60 s poll). Mutations invalidate this
- * key, so a longer stale window can never strand a create/update/delete.
+ * in the background (the default 60 s freshness + 60 s poll). Mutations
+ * invalidate this key, so a longer stale window can never strand a
+ * create/update/delete. `staleTime` is left at the shared default.
  */
 export function useProviders() {
   return useQuery({
@@ -40,9 +41,21 @@ export function useProviders() {
     queryFn: (context) =>
       consoleRequest<unknown>("/providers", { signal: querySignal(context) }).then(assertProviders),
     ...DASHBOARD_QUERY_OPTIONS,
-    staleTime: 60_000,
     gcTime: 600_000,
     refetchInterval: POLL.catalog,
+  });
+}
+
+/** Loads one provider's detail DTO, including the private-to-detail base URL. */
+export function useProviderDetail(providerId: string | undefined) {
+  return useQuery({
+    queryKey: queryKeys.providers.detail(providerId ?? ""),
+    queryFn: (context) =>
+      consoleRequest<unknown>(`/providers/${encodeURIComponent(providerId ?? "")}`, {
+        signal: querySignal(context),
+      }).then(assertProvider),
+    enabled: Boolean(providerId),
+    ...DASHBOARD_QUERY_OPTIONS,
   });
 }
 
@@ -262,6 +275,86 @@ export function useProviderAccounts(providerId: string | undefined) {
   });
 }
 
+/** One day × model usage cell from the provider usage matrix endpoint. */
+export interface ProviderUsageDayRow {
+  /** UTC day, `YYYY-MM-DD`. */
+  readonly day: string;
+  readonly model: string | null;
+  readonly requests: number;
+  readonly inputTokens: number;
+  readonly cachedInputTokens: number;
+  readonly outputTokens: number;
+  readonly costUsd: number;
+}
+
+export interface ProviderUsageMatrixResponse {
+  readonly days: number;
+  readonly rows: readonly ProviderUsageDayRow[];
+}
+
+/**
+ * Normalizes the matrix response defensively: the endpoint aggregates over SQL
+ * values that can arrive as strings (`numeric`/bigint), and a hostile payload
+ * must never reach the calendar as `NaN`.
+ */
+function assertUsageMatrix(raw: unknown): ProviderUsageMatrixResponse {
+  const shape = raw as {
+    days?: unknown;
+    rows?: readonly {
+      day?: unknown;
+      model?: unknown;
+      requests?: unknown;
+      inputTokens?: unknown;
+      cachedInputTokens?: unknown;
+      outputTokens?: unknown;
+      costUsd?: unknown;
+    }[];
+  };
+  const rows = Array.isArray(shape.rows) ? shape.rows : [];
+  const asNumber = (value: unknown): number => {
+    const parsed = Number(value ?? 0);
+    return Number.isFinite(parsed) ? parsed : 0;
+  };
+  return {
+    days: Math.max(1, Math.trunc(asNumber(shape.days)) || 30),
+    rows: rows.map((row) => ({
+      day: typeof row.day === "string" ? row.day : "",
+      model: typeof row.model === "string" ? row.model : null,
+      requests: asNumber(row.requests),
+      inputTokens: asNumber(row.inputTokens),
+      cachedInputTokens: asNumber(row.cachedInputTokens),
+      outputTokens: asNumber(row.outputTokens),
+      costUsd: asNumber(row.costUsd),
+    })),
+  };
+}
+
+/**
+ * Day × model usage for the provider Activity Matrix.
+ *
+ * Deliberately lazy-friendly: pass `enabled: false` until the card is
+ * expanded, so a provider the operator only brands on never costs an
+ * aggregate scan. The matrix barely changes within a minute, so a 60 s
+ * freshness window covers repeated expand/collapse toggles.
+ */
+export function useProviderUsageMatrix(
+  providerId: string | undefined,
+  enabled: boolean,
+): ReturnType<typeof useQuery<ProviderUsageMatrixResponse>> {
+  return useQuery({
+    queryKey: queryKeys.providers.usageMatrix(providerId),
+    queryFn: (context) => {
+      if (!providerId) throw { status: 400, code: "invalid_request", message: "Provider is required" } satisfies ApiErrorShape;
+      return consoleRequest<unknown>(
+        `/providers/${encodeURIComponent(providerId)}/usage/matrix`,
+        { signal: querySignal(context) },
+      ).then(assertUsageMatrix);
+    },
+    ...DASHBOARD_QUERY_OPTIONS,
+    enabled: Boolean(providerId) && enabled,
+  });
+}
+
 /** Creates a provider account. */
 export function useCreateProviderAccount() {
   const queryClient = useQueryClient();
@@ -289,8 +382,8 @@ export function useCreateProviderAccount() {
  *
  * The server returns a per-item outcome, so a partial paste still lands the
  * accounts that were fine. Invalidation happens once, after the whole batch —
- * the old client-side loop invalidated per account, which is what made a large
- * paste re-fetch the account list dozens of times.
+ * invalidating per account would re-fetch the account list once per row in a
+ * large paste.
  */
 export function useCreateProviderAccountsBatch() {
   const queryClient = useQueryClient();
@@ -378,9 +471,9 @@ async function invalidateAccountHealthFamily(
 
 /**
  * Invalidates every cached query a provider-account mutation can stale: the
- * account list, the health-event family, and the provider list itself. Four
- * mutations used to spell this trio out separately, so a fifth could silently
- * forget one and leave a stale list on screen.
+ * account list, the health-event family, and the provider list itself. Every
+ * account mutation goes through this one helper, so none can silently forget
+ * one of the three and leave a stale list on screen.
  */
 async function invalidateProviderAccounts(
   queryClient: QueryClient,
@@ -420,6 +513,44 @@ export function useRecoverAccount() {
     },
     onError: (error) => {
       toast.error("Could not recover the account.", getErrorMessage(error));
+    },
+  });
+}
+
+/**
+ * Deletes one account's health & error log, from its own modal.
+ *
+ * The modal refetches on completion rather than waiting for the poll: rows the
+ * operator just told to leave must not survive one visible cycle. The settings
+ * disk-usage count invalidates too, so the management row stays honest about
+ * how many rows the global purge still holds.
+ */
+export function usePurgeAccountHealthEvents() {
+  const queryClient = useQueryClient();
+  return useMutation<
+    { deleted: number },
+    ApiErrorShape,
+    { providerId: string; accountId: string; title?: string }
+  >({
+    mutationFn: ({ providerId, accountId }) =>
+      consoleRequest<{ deleted: number }>(
+        `/providers/${encodeURIComponent(providerId)}/accounts/${encodeURIComponent(accountId)}/health-events`,
+        { method: "DELETE" },
+      ),
+    onSuccess: async (result, variables) => {
+      await Promise.all([
+        queryClient.invalidateQueries({
+          queryKey: queryKeys.providers.healthEvents(variables.providerId, variables.accountId),
+        }),
+        queryClient.invalidateQueries({ queryKey: queryKeys.settings.diskUsage }),
+      ]);
+      toast.success(
+        result.deleted === 0 ? "Health log was already empty" : `Purged ${result.deleted} health events`,
+        variables.title,
+      );
+    },
+    onError: (error) => {
+      toast.error("Could not purge the health log.", getErrorMessage(error));
     },
   });
 }

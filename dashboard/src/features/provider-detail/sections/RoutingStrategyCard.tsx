@@ -231,7 +231,7 @@ export function RoutingStrategyCard({
               )}
               <div className="text-badge text-text-tertiary mt-2">
                 {userAgentEditable
-                  ? "Sent when the provider has no identity of its own."
+                  ? "None sends the request as-is — whatever the runtime or egress sets, with no identity stamped by the gateway. A chosen value overrides it."
                   : "Set by the provider. It cannot be changed."}
               </div>
             </div>
@@ -250,7 +250,9 @@ export function RoutingStrategyCard({
                 </Inline>
               </label>
               <div className="text-badge text-text-tertiary mb-3">
-                Shared provider ceiling. One step past {SLIDER_MAX} is unlimited.
+                Per-account ceiling, not a provider-wide one: each account
+                enforces its own limit, so a full account spills to the next.
+                One step past {SLIDER_MAX} is unlimited.
               </div>
               <Inline gap="10px" className="mt-3">
                 <input

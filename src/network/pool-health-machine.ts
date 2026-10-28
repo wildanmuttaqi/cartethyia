@@ -1,3 +1,5 @@
+import { randomUUID } from "node:crypto";
+import { healthEventBuffer } from "../persistence/health-event-flush";
 import { and, desc, eq, inArray, isNotNull, lte, sql } from "drizzle-orm";
 import type { CartethyiaDatabase } from "../persistence/db-handle";
 import { healthEvents, networkPools } from "../persistence/schema";
@@ -123,17 +125,23 @@ export async function recordPoolDispatchOutcome(
     ...(input.succeeded && fromStatus !== "active" ? { lastRecoveredAt: now } : {}),
   }).where(eq(networkPools.id, poolId));
   if (statusChanged || (input.succeeded && pool.consecutiveFailures > 0)) {
-    await db.insert(healthEvents).values({
-      entityKind: "pool",
+    // Off the request path when a buffer is installed: this row is
+    // append-only and read by nobody in dispatch. The pool's own status write
+    // above stays synchronous, because pool selection reads it.
+    const buffer = healthEventBuffer();
+    const row = {
+      entityKind: "pool" as const,
       networkPoolId: poolId,
       fromStatus,
       toStatus: status,
-      reason: input.succeeded ? "Proxy dispatch succeeded — pool recovered" : lastError,
-      errorCategory: input.succeeded ? null : category,
+      reason: input.succeeded ? "Proxy dispatch succeeded — pool recovered" : (lastError ?? ""),
+      errorCategory: input.succeeded ? null : (category ?? null),
       // The pool's own cooldown deadline is when the state releases, so the log
       // shows a countdown; a recovery releases immediately.
       createdAt: now,
-    });
+    };
+    if (buffer !== undefined) buffer.enqueue(row);
+    else await db.insert(healthEvents).values({ id: randomUUID(), ...row } as never);
   }
   if (healthChanged) {
     publishPoolHealth({
@@ -191,6 +199,7 @@ export async function disablePoolForProxyHttpStatus(
   if (!updated[0]) return false;
 
   await db.insert(healthEvents).values({
+    id: randomUUID(),
     entityKind: "pool",
     networkPoolId: poolId,
     fromStatus: pool.status,
@@ -219,7 +228,7 @@ export async function recoverNetworkPool(db: CartethyiaDatabase, tenantId: strin
   if (!pool) return false;
   const now = new Date();
   await db.update(networkPools).set({ status: "active", consecutiveFailures: 0, cooldownUntil: null, lastRecoveredAt: now }).where(and(eq(networkPools.tenantId, tenantId), eq(networkPools.id, poolId)));
-  await db.insert(healthEvents).values({ entityKind: "pool", networkPoolId: poolId, fromStatus: pool.status, toStatus: "active", reason: "Manual operator recovery", errorCategory: null, createdAt: now });
+  await db.insert(healthEvents).values({ id: randomUUID(), entityKind: "pool", networkPoolId: poolId, fromStatus: pool.status, toStatus: "active", reason: "Manual operator recovery", errorCategory: null, createdAt: now });
   publishPoolHealth({ poolId, tenantId: pool.tenantId, status: "active", consecutiveFailures: 0 });
   return true;
 }
@@ -241,7 +250,7 @@ export async function sweepExpiredPoolCooldowns(db: CartethyiaDatabase): Promise
   const expired = await db.select({ id: networkPools.id, tenantId: networkPools.tenantId, status: networkPools.status }).from(networkPools).where(and(inArray(networkPools.status, ["cooldown"]), isNotNull(networkPools.cooldownUntil), lte(networkPools.cooldownUntil, now))).limit(POOL_COOLDOWN_RECOVERY_BATCH);
   if (expired.length === 0) return 0;
   await db.update(networkPools).set({ status: "active", consecutiveFailures: 0, cooldownUntil: null, lastRecoveredAt: now }).where(inArray(networkPools.id, expired.map((row) => row.id)));
-  await db.insert(healthEvents).values(expired.map((row) => ({ entityKind: "pool" as const, networkPoolId: row.id, fromStatus: row.status, toStatus: "active" as const, reason: "Cooldown elapsed — auto-recovered", errorCategory: null, createdAt: now })));
+  await db.insert(healthEvents).values(expired.map((row) => ({ id: randomUUID(), entityKind: "pool" as const, networkPoolId: row.id, fromStatus: row.status, toStatus: "active" as const, reason: "Cooldown elapsed — auto-recovered", errorCategory: null, createdAt: now })));
   for (const row of expired) publishPoolHealth({ poolId: row.id, tenantId: row.tenantId, status: "active", consecutiveFailures: 0 });
   return expired.length;
 }

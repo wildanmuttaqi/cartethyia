@@ -21,36 +21,50 @@
 import type { ImageGenerationOutcome, ProviderAdapter, ProviderDispatchTarget } from "../../providers/provider-contracts";
 import { GatewayError } from "../../protocol/gateway-error";
 import { resolveCredentialForAccount } from "../../providers/operations/provider-credential-service";
-import type { OAuthTokenRefresher, OAuthRefreshService } from "../../providers/authentication/oauth-refresh-service";
-import type { ValidatedNetworkBindingFactory } from "../../network/pool/resolver";
-import type { CartethyiaDatabase } from "../../persistence/db-handle";
-import type { RouteSnapshotService } from "../routing/route-model";
 import type { ServiceKind } from "../../protocol/canonical-model";
 import { metrics } from "../../observability/metrics";
-import type { NetworkPoolSelector } from "../../network/pool/selector";
-import type { TelemetryBatchBuffer } from "../../observability/telemetry-buffer";
 import type { ProxyRequestState } from "../request/state";
-import { ProxyRequestStateStore } from "../request/state";
-import { ProxyRequestPreparer } from "../request/preparer";
-import { completeAttempt, estimatedUsage } from "./attempt-finalize";
+import { completeAttempt, estimatedUsage, nativeCompletionBase } from "./attempt-finalize";
 import { runAttemptLoop } from "./attempt-loop";
+import { captureProviderRateLimit } from "./ratelimit-capture";
 
-export interface GenerationHandlerDeps {
-  readonly db: CartethyiaDatabase;
-  readonly providerAdapters: ReadonlyMap<string, ProviderAdapter>;
-  readonly resolveProviderAdapter?: (providerId: string) => Promise<ProviderAdapter | undefined>;
-  readonly proxyPreparer: ProxyRequestPreparer;
-  readonly stateStore: ProxyRequestStateStore;
-  readonly poolSelector?: NetworkPoolSelector;
-  readonly networkBindingFactory?: ValidatedNetworkBindingFactory;
-  readonly snapshotService?: RouteSnapshotService;
-  readonly telemetryBuffer?: TelemetryBatchBuffer;
-  readonly resolveOAuthRefresher?: (providerId: string) => Promise<OAuthTokenRefresher | undefined>;
-  readonly oauthRefreshService?: OAuthRefreshService;
-}
+import type { GatewayHandlerDeps } from "./handler-deps";
+
+export type GenerationHandlerDeps = GatewayHandlerDeps;
 
 /** Which surface a handler serves. Drives candidate filtering and error copy. */
 export type GenerationKind = Extract<ServiceKind, "imageGeneration" | "videoGeneration">;
+
+/**
+ * Surfaces the gateway routes but does not model.
+ *
+ * Embeddings and audio have no adapter method and no media shape — there is
+ * nothing for this repo to translate — so they exist purely so a caller can
+ * reach a compatible upstream through the normal pipeline. Opening the route
+ * is the whole feature: routing, admission, failover, and accounting still
+ * apply, and the upstream's own bytes come back untouched.
+ */
+export type PassthroughKind = Extract<ServiceKind, "embedding" | "audioTranscription" | "audioSpeech">;
+
+/** Error-copy noun per surface, so a refusal names what the caller asked for. */
+const SURFACE_NOUNS: Record<GenerationKind | PassthroughKind, string> = {
+  imageGeneration: "image",
+  videoGeneration: "video",
+  embedding: "embedding",
+  audioTranscription: "transcription",
+  audioSpeech: "speech",
+};
+
+/**
+ * Only the two media surfaces carry `prompt`/`n`.
+ *
+ * An embedding body is `{model, input}` and a transcription is multipart —
+ * neither has a prompt, so validating one here would reject every legitimate
+ * request to a surface the gateway just opened.
+ */
+function isMediaKind(kind: GenerationKind | PassthroughKind): kind is GenerationKind {
+  return kind === "imageGeneration" || kind === "videoGeneration";
+}
 
 /**
  * Maximum items one request may ask for.
@@ -94,24 +108,30 @@ async function passThrough(
   },
 ): Promise<Response> {
   const usage = estimatedUsage(0, 0);
+  // The CLI bucket comes back on every upstream response, so this is the free
+  // place to learn it: the quota surface then reads the stored value instead of
+  // spending a request of its own. Both the manual account test and automatic
+  // routing land here, so a captured reading follows real traffic.
+  captureProviderRateLimit(args.candidate.provider_id, args.candidate.provider_account_id, upstream.headers);
   await completeAttempt(state, {
     status: "completed",
-    providerId: args.candidate.provider_id,
-    ...(args.candidate.provider_account_id ? { accountId: args.candidate.provider_account_id } : {}),
-    ...(args.candidate.provider_account_label ? { accountLabel: args.candidate.provider_account_label } : {}),
-    ...(args.networkPoolId ? { networkPoolId: args.networkPoolId } : {}),
-    usage,
-    modelId: args.candidate.model_id,
-    lease: args.lease as never,
-    commitUsage: usage,
-    terminal: true,
-    tenantId: args.tenantId,
-    ingressBody: state.ingressBody,
+    ...nativeCompletionBase({
+      providerId: args.candidate.provider_id,
+      ...(args.candidate.provider_account_id ? { accountId: args.candidate.provider_account_id } : {}),
+      ...(args.candidate.provider_account_label ? { accountLabel: args.candidate.provider_account_label } : {}),
+      ...(args.networkPoolId ? { networkPoolId: args.networkPoolId } : {}),
+      usage,
+      modelId: args.candidate.model_id,
+      lease: args.lease as never,
+      commitUsage: usage,
+      tenantId: args.tenantId,
+      ingressBody: state.ingressBody,
+      providerCapture: args.providerCapture as never,
+      db: args.deps.db,
+      ...(args.deps.telemetryBuffer ? { telemetryBuffer: args.deps.telemetryBuffer } : {}),
+      ...(args.deps.snapshotService ? { snapshotService: args.deps.snapshotService } : {}),
+    }),
     responseBody: null,
-    providerCapture: args.providerCapture as never,
-    db: args.deps.db,
-    ...(args.deps.telemetryBuffer ? { telemetryBuffer: args.deps.telemetryBuffer } : {}),
-    ...(args.deps.snapshotService ? { snapshotService: args.deps.snapshotService } : {}),
   });
   metrics.proxy_requests_total.inc(1, { status: "completed" });
   return new Response(upstream.body, {
@@ -126,7 +146,15 @@ async function passThrough(
 
 /** Builds the handler for one generation surface. */
 export function createGenerationHandler(kind: GenerationKind, deps: GenerationHandlerDeps) {
-  const noun = kind === "videoGeneration" ? "video" : "image";
+  return createNativeSurfaceHandler(kind, deps);
+}
+
+/** Builds the handler for one routed surface, media or passthrough. */
+export function createNativeSurfaceHandler(
+  kind: GenerationKind | PassthroughKind,
+  deps: GenerationHandlerDeps,
+) {
+  const noun = SURFACE_NOUNS[kind];
   return async ({ request }: { request: Request }): Promise<Response> => {
     const state = deps.stateStore.require(request);
     const authorization = state.authorization;
@@ -151,19 +179,21 @@ export function createGenerationHandler(kind: GenerationKind, deps: GenerationHa
     }
     // Trust boundary only. Keep accepting `messages` for chat-backed providers
     // while native image/video endpoints can use the simpler `prompt` field.
-    const hasPrompt = typeof generation.prompt === "string" && generation.prompt.trim().length > 0;
-    const hasMessages = Array.isArray(generation.messages) && generation.messages.length > 0;
-    if (!hasPrompt && !hasMessages) {
-      throw new GatewayError("invalid_request", 400, "prompt is required");
-    }
-    if (generation.n !== undefined) {
-      const n = generation.n;
-      if (typeof n !== "number" || !Number.isInteger(n) || n < 1 || n > MAX_ITEMS_PER_REQUEST) {
-        throw new GatewayError(
-          "invalid_request",
-          400,
-          `n must be an integer between 1 and ${MAX_ITEMS_PER_REQUEST}`,
-        );
+    if (isMediaKind(kind)) {
+      const hasPrompt = typeof generation.prompt === "string" && generation.prompt.trim().length > 0;
+      const hasMessages = Array.isArray(generation.messages) && generation.messages.length > 0;
+      if (!hasPrompt && !hasMessages) {
+        throw new GatewayError("invalid_request", 400, "prompt is required");
+      }
+      if (generation.n !== undefined) {
+        const n = generation.n;
+        if (typeof n !== "number" || !Number.isInteger(n) || n < 1 || n > MAX_ITEMS_PER_REQUEST) {
+          throw new GatewayError(
+            "invalid_request",
+            400,
+            `n must be an integer between 1 and ${MAX_ITEMS_PER_REQUEST}`,
+          );
+        }
       }
     }
 
@@ -204,9 +234,7 @@ export function createGenerationHandler(kind: GenerationKind, deps: GenerationHa
               provider_id: candidate.provider_id as ProviderAdapter["provider_id"],
               credential_kind: "none" as const,
             };
-        const adapter = deps.resolveProviderAdapter
-          ? await deps.resolveProviderAdapter(candidate.provider_id)
-          : deps.providerAdapters.get(candidate.provider_id);
+        const adapter = await deps.resolveProviderAdapter?.(candidate.provider_id);
         if (!adapter) {
           throw new GatewayError(
             "capability_unsupported",
@@ -245,22 +273,23 @@ export function createGenerationHandler(kind: GenerationKind, deps: GenerationHa
           const usage = estimatedUsage(0, 0);
           await completeAttempt(state, {
             status: "completed",
-            providerId: candidate.provider_id,
-            ...(candidate.provider_account_id ? { accountId: candidate.provider_account_id } : {}),
-            ...(candidate.provider_account_label ? { accountLabel: candidate.provider_account_label } : {}),
-            ...(leases.proxySlot ? { networkPoolId: leases.proxySlot.poolId } : {}),
-            usage,
-            modelId: candidate.model_id,
-            lease: leases.lease,
-            commitUsage: usage,
-            terminal: true,
-            tenantId: prepared.authorization.tenantId,
-            ingressBody: state.ingressBody,
+            ...nativeCompletionBase({
+              providerId: candidate.provider_id,
+              ...(candidate.provider_account_id ? { accountId: candidate.provider_account_id } : {}),
+              ...(candidate.provider_account_label ? { accountLabel: candidate.provider_account_label } : {}),
+              ...(leases.proxySlot ? { networkPoolId: leases.proxySlot.poolId } : {}),
+              usage,
+              modelId: candidate.model_id,
+              lease: leases.lease,
+              commitUsage: usage,
+              tenantId: prepared.authorization.tenantId,
+              ingressBody: state.ingressBody,
+              providerCapture,
+              db: deps.db,
+              ...(deps.telemetryBuffer ? { telemetryBuffer: deps.telemetryBuffer } : {}),
+              ...(deps.snapshotService ? { snapshotService: deps.snapshotService } : {}),
+            }),
             responseBody: payload,
-            providerCapture,
-            db: deps.db,
-            ...(deps.telemetryBuffer ? { telemetryBuffer: deps.telemetryBuffer } : {}),
-            ...(deps.snapshotService ? { snapshotService: deps.snapshotService } : {}),
           });
           metrics.proxy_requests_total.inc(1, { status: "completed" });
           return jsonResponse(payload, 200, state.requestId);
@@ -293,14 +322,20 @@ export function createGenerationHandler(kind: GenerationKind, deps: GenerationHa
         // body to the candidate's endpoint through the adapter, which owns the
         // upstream base URL. Either way the gateway does not interpret the
         // media — it returns what the upstream produced.
+        //
+        // A passthrough surface has no media method to prefer: the whole point
+        // is that this repo does not model it, so it goes straight to the
+        // adapter's native dispatch, which is plain forwarding.
         const media =
-          kind === "videoGeneration"
-            ? typeof adapter.generateVideo === "function"
-              ? adapter.generateVideo(upstreamBody, target, mediaContext).then((outcome) => finish(outcome))
-              : undefined
-            : typeof adapter.generateImage === "function"
-              ? adapter.generateImage(upstreamBody, target, mediaContext).then((outcome) => finish(outcome))
-              : undefined;
+          !isMediaKind(kind)
+            ? undefined
+            : kind === "videoGeneration"
+              ? typeof adapter.generateVideo === "function"
+                ? adapter.generateVideo(upstreamBody, target, mediaContext).then((outcome) => finish(outcome))
+                : undefined
+              : typeof adapter.generateImage === "function"
+                ? adapter.generateImage(upstreamBody, target, mediaContext).then((outcome) => finish(outcome))
+                : undefined;
         const upstream =
           media !== undefined
             ? await media
@@ -347,4 +382,24 @@ export function createImageGenerationHandler(deps: GenerationHandlerDeps) {
 /** `POST /v1/videos/generations`. */
 export function createVideoGenerationHandler(deps: GenerationHandlerDeps) {
   return createGenerationHandler("videoGeneration", deps);
+}
+
+/**
+ * `POST /v1/embeddings`.
+ *
+ * Routed with no provider implementation behind it: a model row carrying the
+ * `embedding` kind is enough, and the adapter forwards the body as-is.
+ */
+export function createEmbeddingHandler(deps: GenerationHandlerDeps) {
+  return createNativeSurfaceHandler("embedding", deps);
+}
+
+/** `POST /v1/audio/transcriptions`. Same passthrough shape as embeddings. */
+export function createAudioTranscriptionHandler(deps: GenerationHandlerDeps) {
+  return createNativeSurfaceHandler("audioTranscription", deps);
+}
+
+/** `POST /v1/audio/speech`. Same passthrough shape as embeddings. */
+export function createAudioSpeechHandler(deps: GenerationHandlerDeps) {
+  return createNativeSurfaceHandler("audioSpeech", deps);
 }

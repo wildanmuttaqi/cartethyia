@@ -5,7 +5,9 @@ import {
   reasoningSummarySeparator,
   type ReasoningSummaryIdentity,
 } from "../reasoning-summary";
+import { reasoningTextOf } from "../../../protocol/reasoning-text";
 import {
+  argumentsFrom,
   createToolCallTracker,
   resetToolCallTracker,
   toolIdentityKey,
@@ -96,7 +98,7 @@ export class MessagesStreamEncoder extends SurfaceStreamEncoder<CanonicalEvent, 
     const index = existing ?? this.nextIndex++;
     this.tools.indexById.set(callId, index);
     const sent = this.emittedArguments.get(callId) ?? 0;
-    const pending = entry.arguments.slice(sent);
+    const pending = argumentsFrom(entry, sent);
     if (!this.openedToolCalls.has(callId)) {
       this.openedToolCalls.add(callId);
       out.push(...this.closeOpenBlock());
@@ -120,7 +122,7 @@ export class MessagesStreamEncoder extends SurfaceStreamEncoder<CanonicalEvent, 
         index,
         delta: { type: "input_json_delta", partial_json: pending },
       });
-      this.emittedArguments.set(callId, entry.arguments.length);
+      this.emittedArguments.set(callId, sent + pending.length);
     }
     return out;
   }
@@ -229,12 +231,7 @@ export class MessagesStreamEncoder extends SurfaceStreamEncoder<CanonicalEvent, 
       }
       if (part.kind === "reasoning") {
         const isRedacted = part.opaque === true;
-        const summary =
-          typeof part.summary === "string"
-            ? part.summary
-            : typeof part.payload === "string"
-              ? part.payload
-              : "";
+        const summary = reasoningTextOf(part) ?? "";
         const signature = typeof part.signature === "string" ? part.signature : "";
         // Nothing to render: an empty thinking delta must not open a block
         // (same fragmentation as the empty-text case above).

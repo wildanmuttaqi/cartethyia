@@ -5,8 +5,11 @@ or Responses requests to the gateway. Operators manage that gateway through the
 console, which the same process serves at `/console`.
 
 The production backend is `src/`. The browser app is `dashboard/src/`. The browser
-never imports the backend. It talks to `/console/api` and renders what that API
-returns.
+never imports Elysia, the database, or secrets. It talks to `/console/api` and
+renders what that API returns. It does re-export a handful of *pure* values from
+`src/` — dimension and scope lists, the release comparator, a thinking-suffix
+formatter — so an enum cannot drift between the two sides; those modules are
+dependency-free, and nothing runtime crosses with them.
 
 ## Process
 
@@ -62,9 +65,11 @@ sequenceDiagram
 The canonical model is the boundary between client wire and provider wire. A chat
 client can be served by a Responses or Messages provider because both sides are
 encoded from the same request. `src/protocol/registry.ts` is the switch, selected
-by the provider's `wire_family` (`src/protocol/canonical-model.ts:16`):
-`chat`, `responses`, `messages`, and `gemini` — Factory's native
-`generateContent` wire. There is no `native` family. A provider that frames its
+by the provider's `wire_family` (`src/protocol/canonical-model.ts:15`):
+`chat`, `responses`, and `messages`. `gemini` — Factory's native
+`generateContent` wire — is a member of the enum but is **not** a codec: it is
+dispatched by the Factory adapter's own native path, and `registry.ts` throws
+on it. There is no `native` family. A provider that frames its
 own wire says so on its metadata, not in the enum.
 
 ## Ownership
@@ -86,13 +91,15 @@ own wire says so on its metadata, not in the enum.
 `InMemoryRouteSnapshotService` builds one frozen snapshot: candidates, aliases,
 combos, provider routing, and pool routing. A console mutation calls `invalidate()`,
 which bumps the revision and drops the cache. The next request rebuilds. The
-mutation itself does not wait for seven database reads.
+mutation itself does not wait for the eleven database reads a rebuild issues
+(providers, models, accounts, aliases, combos, provider and pool routing
+settings, disabled models, and the two CLI mapping tables).
 
 `RoutingEngine` turns a requested model into a `RoutePlan`. A bare name matches
 `model_id`. A `provider/model` name matches both. Alias and combo lookup happen
 before candidate filtering; eligibility runs after it. Each of those has its own
-page: [routing aliases and combos](../features/routing-aliases-combos.md) for the
-name resolution itself, and [CLI model mapping](../features/cli-model-mapping.md)
+page: [routing aliases and combos](../features/02-routing-aliases-combos.md) for the
+name resolution itself, and [CLI model mapping](../features/01-cli-model-mapping.md)
 for the per-key slot table that merges into the same resolver.
 
 `EligibilityEvaluator` then drops candidates that cannot serve the request:
@@ -116,24 +123,43 @@ is set. Otherwise the slot is in-process.
 Quota eligibility is also evaluated per account before dispatch. A configured
 Usage floor excludes accounts whose known allowance is at or below the
 threshold; a missing reading remains unknown rather than exhausted. See
-[Usage floor](../features/usage-floor.md) for its accounting and cache behavior.
+[Usage floor](../features/04-usage-floor.md) for its accounting and cache behavior.
 
 ## Data
 
 ```mermaid
 flowchart LR
-  req["request"] --> file["data/telemetry-events/*.jsonl"]
-  req --> totals["telemetry_usage_totals"]
-  req --> payload["telemetry_payloads index"]
-  payload --> frames["payload frame files"]
-  console["console reads"] --> file
+  req[\"request\"] --> file[\"data/telemetry-events/<day>.events.jsonl\"]
+  file --> index[\"data/telemetry-events/<day>.index.json\"]
+  req --> totals[\"telemetry_usage_totals\"]
+  req --> payload[\"telemetry_payloads index\"]
+  payload --> frames[\"payload frame files\"]
+  console[\"usage, breakdown, chart\"] --> index
+  console[\"request list, detail\"] --> file
   console --> totals
 ```
 
-Per-request events are hourly JSONL files, not rows in `telemetry_events`. The
-database keeps lifetime totals and a short-lived payload index. Payload bodies
-are files. The index stores `storage`, `file`, `offset`, `length`, `checksum`,
-and `version`.
+Per-request events are appended to one file per UTC day —
+`<YYYY-MM-DD>.events.jsonl` — not rows in `telemetry_events`. The day file is
+append-only and is never rewritten while the day is open.
+
+Beside it, `<YYYY-MM-DD>.index.json` carries the running totals, the per-name
+breakdown sums, per-hour slots, and a byte watermark of how much of the event
+file has been folded in. Usage totals, the breakdown, and the traffic chart
+read **the index**; only the request list and the detail drawer read the event
+file, and they read backwards from its tail in blocks. A usage query therefore
+costs a few small JSON reads rather than a parse of the whole period, and its
+cost does not grow with traffic.
+
+Folding is incremental and idempotent, driven by the watermark rather than by
+comparing file names. An unterminated line — one the writer may still be
+appending to — is left for the next pass instead of counted.
+
+Retention deletes whole days, the event file and its index together.
+
+The database keeps lifetime totals and a short-lived payload index. Payload
+bodies are files. The payload index stores `storage`, `file`, `offset`,
+`length`, `checksum`, and `version`.
 
 Two database modes share one schema:
 
@@ -143,13 +169,15 @@ Two database modes share one schema:
 | Full | external PostgreSQL | Redis when `REDIS_URL` is set, else memory |
 
 The PostgreSQL baseline defines the foundational schema for a new database;
-Lite builds from its generated SQLite baseline. Numbered migrations bring
-both backends to the current schema and support compatible in-place upgrades.
+both backends to the current schema. **In-place upgrades are not supported.**
 An existing database with retired migration history, or
 tables without the current baseline ledger entry, is rejected at startup.
-Create a fresh database and restore a backup. Restore maps the retired
-`bypass_proxy` name, `bridge` pool kind, old provider User-Agent default, and
-legacy Cline/fusion values to the current schema.
+Create a fresh database and restore a backup. Restore maps retired names and
+values to the current schema: renamed provider ids (`opencodeft`/`opencodezen`/
+`opencodego`), the `bridge` pool kind to `https`, legacy Cline routing to
+`skip_proxy: true`, and `fusion` combos to `fallback`. Columns the current
+schema never had are dropped with a warning rather than failing the restore
+(`src/console/backup/validate.ts`).
 
 ## Console and dashboard
 

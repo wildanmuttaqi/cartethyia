@@ -1,3 +1,7 @@
+// dynamic-import-ok: lazy provider registry. Every entry is a
+// `() => await import("./integrations/<name>/...")` so loading a provider
+// pays only when the first request routes to it. Static imports here would
+// drag every integration into memory at process start.
 import {
   GENERIC_API_KEY_SPECS,
 } from "./configured-openai-providers";
@@ -12,6 +16,8 @@ import { createAnthropicCompatibleAdapter } from "./integrations/anthropic";
 import { defineModel } from "./provider-model-definition";
 import type { ProviderModelDiscovery } from "./discovery/discovery-types";
 import type { ProviderDispatchContext } from "./provider-contracts";
+import type { QoderRealm } from "./integrations/qoder/qoder-realm";
+import type { TraeRealm } from "./integrations/trae/trae-realm";
 import type { WireFamily } from "../protocol/canonical-model";
 import type { CanonicalRequest } from "../protocol/canonical-model";
 
@@ -24,6 +30,106 @@ function configuredProvider(
     ...(loadModels === undefined ? {} : { loadModels }),
   };
 }
+
+/**
+ * Qoder's live model list for one realm.
+ *
+ * The request has to be signed with the account's COSY identity and has to
+ * carry the body that was signed — a bare GET is refused — so discovery cannot
+ * use the generic bearer helper. It resolves the same identity dispatch uses
+ * (PAT exchange or the persisted OAuth state) and then lists against the
+ * realm's own gateway hosts.
+ */
+/**
+ * Trae model discovery for one realm.
+ *
+ * The listing is per account region: it answers on CN and on the intl region
+ * host that serves the account. This returns the static roster when the live
+ * call yields nothing, rather than raising, so one unsupported account cannot
+ * fail the whole catalog refresh.
+ */
+function traeDiscovery(
+  realm: TraeRealm,
+  providerId: string,
+): NonNullable<ProviderModuleCapabilities["loadModelDiscovery"]> {
+  return async () => async (request: Parameters<ProviderModelDiscovery>[0]) => {
+    const { discoverTraeModels } = await import("./integrations/trae/trae");
+    const { TRAE_INTL_MODELS, TRAE_CN_MODELS } = await import("./integrations/trae/trae-catalog");
+    const secret = request.credential.trim();
+    const fetcher = request.fetcher as unknown as typeof fetch | undefined;
+    if (secret.length === 0 || fetcher === undefined) {
+      return realm === "cn" ? TRAE_CN_MODELS : TRAE_INTL_MODELS;
+    }
+    let token = secret;
+    if (secret.startsWith("{")) {
+      try {
+        const parsed = JSON.parse(secret) as Record<string, unknown>;
+        const found = ["accessToken", "access_token", "token"].find(
+          (key) => typeof parsed[key] === "string" && (parsed[key] as string).length > 0,
+        );
+        if (found !== undefined) token = parsed[found] as string;
+      } catch {
+        // Use the raw secret as the token.
+      }
+    }
+    const region = request.authState?.["region"];
+    const rows = await discoverTraeModels({
+      realm,
+      token,
+      uid: request.authState?.["accountId"] as string | undefined ?? "",
+      fetcher,
+      providerId,
+      ...(typeof region === "string" ? { region } : {}),
+    });
+    if (rows.length === 0) return realm === "cn" ? TRAE_CN_MODELS : TRAE_INTL_MODELS;
+    const fallback = realm === "cn" ? TRAE_CN_MODELS : TRAE_INTL_MODELS;
+    const byId = new Map(fallback.map((model) => [model.modelId, model]));
+    return rows.map((row) => {
+      const existing = byId.get(row.id);
+      if (existing === undefined) {
+        // Discovered upstream but absent from the static roster: clone the
+        // realm's first row so a new model is routable with the shape this
+        // provider serves, carrying the window upstream reported.
+        const template = fallback[0];
+        if (template === undefined) return undefined;
+        return { ...template, modelId: row.id, contextLimit: row.ctx ?? null };
+      }
+      return row.ctx === undefined ? existing : { ...existing, contextLimit: row.ctx };
+    }).filter((model): model is NonNullable<typeof model> => model !== undefined);
+  };
+}
+
+function qoderDiscovery(
+  realm: QoderRealm,
+  providerId: string,
+): NonNullable<ProviderModuleCapabilities["loadModelDiscovery"]> {
+  return async () => async (request: Parameters<ProviderModelDiscovery>[0]) => {
+    const { discoverQoderModels } = await import("./integrations/qoder/qoder-catalog");
+    const { resolveQoderAuth, qoderSignerFor, qoderEncodeBody } = await import("./integrations/qoder/qoder");
+    const secret = request.credential.trim();
+    if (secret.length === 0) throw new Error("Qoder credential is required");
+    const fetcher = request.fetcher as unknown as typeof fetch | undefined;
+    // The discovery context carries only the secret plus the non-secret
+    // `authState` an OAuth login persisted; the account id lives there too, so
+    // an OAuth credential resolves to the same identity dispatch would use.
+    const auth = await resolveQoderAuth({
+      secret,
+      authState: request.authState,
+      signal: AbortSignal.timeout(15_000),
+      fetcher: (url: string, init: RequestInit) => (fetcher ?? globalThis.fetch)(url, init),
+    });
+    const signer = qoderSignerFor(auth);
+    return discoverQoderModels({
+      realm,
+      providerId,
+      credential: secret,
+      headers: (url: string, body: string) => Promise.resolve(signer(url, body)),
+      ...(fetcher === undefined ? {} : { fetcher }),
+      encode: qoderEncodeBody,
+    });
+  };
+}
+
 
 /**
  * Builds the `loadAdapter` + `loadModelDiscovery` pair every plain bearer
@@ -132,6 +238,11 @@ export const PROVIDER_CAPABILITIES = {
     loadModels: async () => (await import("./integrations/codex/codex")).CODEX_MODELS,
     loadAuthentication: oauthCapability(() => import("./integrations/codex/codex-oauth"), "codexOAuthClient", { withRefresher: true }),
     loadQuotaCollector: quotaCapability(() => import("./integrations/codex/codex-quota"), "fetchCodexQuota"),
+    loadModelDiscovery: async () => async ({ credential, fetcher }) =>
+      (await import("./integrations/codex/codex")).discoverCodexModels({
+        credential,
+        ...(fetcher === undefined ? {} : { fetcher }),
+      }),
   },
   grok: {
     loadAdapter: async () => (await import("./integrations/grok/grok")).grokAdapter,
@@ -201,6 +312,26 @@ export const PROVIDER_CAPABILITIES = {
     loadAuthentication: oauthCapability(() => import("./integrations/kimi/kimi-oauth"), "kimiCodeOAuthClient", { withRefresher: true }),
     loadQuotaCollector: quotaCapability(() => import("./integrations/kimi/kimi-quota"), "fetchKimiQuota"),
   },
+  cursor: {
+    // Cursor's Run is a Connect-RPC bidi stream on a *dynamically discovered*
+    // agent origin, not the API host the auth and catalog calls use. The path
+    // is pinned here so a probe verifies the endpoint dispatch actually calls;
+    // the origin itself is resolved per dispatch from GetServerConfig.
+    endpointPathsByWireFamily: { chat: "/agent.v1.AgentService/Run" },
+    loadAdapter: async () => (await import("./integrations/cursor/cursor")).cursorAdapter,
+    loadModels: async () => (await import("./integrations/cursor/cursor-catalog")).CURSOR_MODELS,
+    loadAuthentication: oauthCapability(() => import("./integrations/cursor/cursor-auth"), "cursorOAuthClient", {
+      withRefresher: true,
+    }),
+    loadQuotaCollector: quotaCapability(() => import("./integrations/cursor/cursor-quota"), "fetchCursorQuota"),
+    // The roster is per-account and per-plan, and Cursor declares each model's
+    // capabilities, so discovery is the catalog rather than a static list.
+    loadModelDiscovery: async () => async ({ credential, fetcher }) =>
+      (await import("./integrations/cursor/cursor-catalog")).discoverCursorModels({
+        credential,
+        ...(fetcher === undefined ? {} : { fetcher }),
+      }),
+  },
   cerebras: {
     endpointPathsByWireFamily: { chat: "/chat/completions" },
     loadAdapter: async () => createApiKeyAdapter((await import("./integrations/cerebras")).CEREBRAS_SPEC),
@@ -235,10 +366,11 @@ export const PROVIDER_CAPABILITIES = {
     // catalog row behind it.
     // Dispatch base, not the catalog base: `/zen/v1/models` publishes the
     // listing while `/inference/v1/models` answers 404, and a byte-exact replay
-    // against `/inference/v1` returned 200 where `/zen/v1` did not.
+    // against `/inference/v1` returned 200 where `/zen/v1` did not. The wire
+    // paths are the 2.1 family-segment shapes on the `/inference` origin.
     endpointPathsByWireFamily: {
-      chat: "/inference/v1/chat/completions",
-      responses: "/inference/v1/responses",
+      chat: "/inference/openai/v1/chat/completions",
+      responses: "/inference/openai/v1/responses",
     },
     loadAdapter: async () => createApiKeyAdapter((await import("./integrations/opencode/provider")).OPENCODE_FREE_SPEC),
     loadModels: async () => (await import("./integrations/opencode/provider")).OPENCODE_FREE_MODELS,
@@ -255,8 +387,8 @@ export const PROVIDER_CAPABILITIES = {
   },
   "opencode-zen": {
     endpointPathsByWireFamily: {
-      chat: "/inference/v1/chat/completions",
-      responses: "/inference/v1/responses",
+      chat: "/inference/openai/v1/chat/completions",
+      responses: "/inference/openai/v1/responses",
     },
     loadAdapter: async () => createApiKeyAdapter((await import("./integrations/opencode/provider")).OPENCODE_ZEN_SPEC),
     loadModels: async () => (await import("./integrations/opencode/provider")).OPENCODE_ZEN_MODELS,
@@ -274,6 +406,10 @@ export const PROVIDER_CAPABILITIES = {
     loadAdapter: async () => createApiKeyAdapter((await import("./integrations/opencode/provider")).OPENCODE_GO_SPEC),
     loadModels: async () => (await import("./integrations/opencode/provider")).OPENCODE_GO_MODELS,
     loadModelDiscovery: openAIModelDiscovery("opencode-go", { transformBaseUrl: (baseUrl) => `${baseUrl.replace(/\/+$/, "")}/zen/go/v1`, headers: (credential) => ({ authorization: `Bearer ${credential}` }) }),
+    // The Go plan publishes a real usage surface; the anonymous free tier has
+    // none (it is rate-limited by egress IP, not by a balance), so this is
+    // deliberately registered on the keyed tier only.
+    loadQuotaCollector: async () => (await import("./integrations/opencode/opencode-go-quota")).fetchOpenCodeGoQuota,
   },
   agentrouter: {
     loadAdapter: async () => (await import("./integrations/agentrouter/agentrouter")).createAgentRouterAdapter(),
@@ -320,7 +456,10 @@ export const PROVIDER_CAPABILITIES = {
   },
   kilo: {
     loadAdapter: async () => (await import("./integrations/kilo/kilo")).kiloAdapter,
-    loadModels: async () => (await import("./integrations/kilo/kilo")).KILO_MODELS,
+    loadModels: async () => {
+      const spec = await import("./integrations/kilo/kilo");
+      return [...spec.KILO_MODELS, ...spec.KILO_FREE_MODELS];
+    },
     // No `withRefresher`: Kilo Code has no refresh grant, so this client
     // declares no refresher and the stored token is used exactly as issued.
     // Registering one would make the 401 retry path call a method that always
@@ -335,6 +474,14 @@ export const PROVIDER_CAPABILITIES = {
   commandcode: {
     loadAdapter: async () => (await import("./integrations/commandcode/commandcode")).createCommandCodeAdapter(),
     loadModels: async () => (await import("./integrations/commandcode/commandcode")).COMMANDCODE_MODELS,
+    // The Provider API publishes the real roster with each model's wire, so the
+    // static seed above is the offline floor rather than the catalog.
+    loadModelDiscovery: async () => async (input) =>
+      (await import("./integrations/commandcode/discovery")).discoverCommandCodeModels(input),
+    loadQuotaCollector: quotaCapability(
+      () => import("./integrations/commandcode/quota"),
+      "fetchCommandCodeQuota",
+    ),
   },
   qoder: {
     loadAdapter: async () => (await import("./integrations/qoder/qoder")).createQoderAdapter(),
@@ -343,10 +490,55 @@ export const PROVIDER_CAPABILITIES = {
     // device flow, so the issued token is used exactly as issued until the
     // operator re-runs login — same shape as Kilo Code.
     loadAuthentication: oauthCapability(() => import("./integrations/qoder/qoder-oauth"), "qoderOAuthClient"),
+    loadQuotaCollector: quotaCapability(() => import("./integrations/qoder/qoder-quota"), "fetchQoderQuota"),
+    // Discovery signed by the account's own COSY identity: the model list is
+    // per-account and per-realm, and a GET without the signed body is 403.
+    loadModelDiscovery: qoderDiscovery("intl", "qoder"),
+  },
+  // Separate provider, not a region flag: a CN account has its own gateway
+  // host, OAuth client id, and model roster, and is refused by the global host.
+  qodercn: {
+    loadAdapter: async () => (await import("./integrations/qoder/qoder")).createQoderCnAdapter(),
+    loadModels: async () => (await import("./integrations/qoder/qoder-catalog")).QODER_CN_MODELS,
+    // The CN client, not the intl one: a device login opened on
+    // `qoder.com/device/selectAccounts` polled `openapi.qoder.sh`, which a CN
+    // account is refused by. `qoderCnOAuthClient` is the same class bound to
+    // `QODER_REALMS.cn` — its own login/token/userinfo hosts, client id, and
+    // native redirect.
+    loadAuthentication: oauthCapability(() => import("./integrations/qoder/qoder-oauth"), "qoderCnOAuthClient"),
+    loadQuotaCollector: quotaCapability(() => import("./integrations/qoder/qoder-quota"), "fetchQoderCnQuota"),
+    loadModelDiscovery: qoderDiscovery("cn", "qodercn"),
+  },
+  trae: {
+    loadAdapter: async () => (await import("./integrations/trae/trae")).createTraeAdapter(),
+    loadModels: async () => (await import("./integrations/trae/trae-catalog")).TRAE_INTL_MODELS,
+    // A Trae credential is an access/refresh pair and the refresh token is what
+    // keeps it alive, so the refresher is registered rather than optional:
+    // without it the account dies at first expiry.
+    loadAuthentication: oauthCapability(() => import("./integrations/trae/trae-oauth"), "traeOAuthClient", { withRefresher: true }),
+    loadQuotaCollector: quotaCapability(() => import("./integrations/trae/trae-quota"), "fetchTraeQuota"),
+    // Live model list is intl-unsupported: upstream answers `403 no schema
+    // found`, so discovery returning nothing is the truthful result and the
+    // static roster above stays authoritative.
+    loadModelDiscovery: traeDiscovery("intl", "trae"),
+  },
+  traecn: {
+    loadAdapter: async () => (await import("./integrations/trae/trae")).createTraeCnAdapter(),
+    loadModels: async () => (await import("./integrations/trae/trae-catalog")).TRAE_CN_MODELS,
+    // The CN client, not the intl one: the exchange runs on the CN account
+    // host, and a refresh posted to the intl host is refused.
+    loadAuthentication: oauthCapability(() => import("./integrations/trae/trae-oauth"), "traeCnOAuthClient", { withRefresher: true }),
+    loadQuotaCollector: quotaCapability(() => import("./integrations/trae/trae-quota"), "fetchTraeCnQuota"),
+    loadModelDiscovery: traeDiscovery("cn", "traecn"),
   },
   inferhub: {
     loadAdapter: async () => (await import("./integrations/inferhub")).createInferhubAdapter(),
+    // Live `/v1/models` is the primary source: the marketplace republishes its
+    // whole roster and it moves faster than a committed array can. The static
+    // list stays as the offline fallback when the fetch fails.
     loadModels: async () => (await import("./integrations/inferhub")).INFERHUB_MODELS,
+    loadModelDiscovery: async () =>
+      (await import("./integrations/inferhub")).inferhubModelDiscovery()(),
     loadQuotaCollector: quotaCapability(() => import("./integrations/inferhub"), "fetchInferhubQuota"),
   },
   hermes: {
@@ -362,6 +554,21 @@ export const PROVIDER_CAPABILITIES = {
         ...(fetcher === undefined ? {} : { fetcher }),
       });
     },
+  },
+  inception: {
+    // Chat only: Mercury 3 / 2.5 / 2 answer the OpenAI-compatible chat wire.
+    // The base is version-rooted (`/v1`), so the path is declared below it.
+    endpointPathsByWireFamily: { chat: "/chat/completions" },
+    loadAdapter: async () => createApiKeyAdapter((await import("./integrations/inception/provider")).INCEPTION_SPEC),
+    loadModels: async () => (await import("./integrations/inception/provider")).INCEPTION_MODELS,
+    // The listing is bearer-authenticated and the whole provider is pinned to
+    // its free allowance, so every fetched row is stamped free-tier.
+    loadModelDiscovery: async () => async ({ baseUrl, credential, fetcher }) =>
+      (await import("./integrations/inception/provider")).discoverInceptionFreeModels({
+        baseUrl,
+        ...(typeof credential === "string" && credential.length > 0 ? { credential } : {}),
+        ...(fetcher === undefined ? {} : { fetcher }),
+      }),
   },
   openrouter: {
     loadAdapter: async () => createApiKeyAdapter((await import("./integrations/openrouter/provider")).OPENROUTER_SPEC),

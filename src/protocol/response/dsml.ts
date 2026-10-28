@@ -1,47 +1,38 @@
 /**
- * DeepSeek sometimes emits its native tool markup as assistant text when the
- * structured tool channel was dropped in transit. A complete, well-formed block
- * becomes ordinary tool calls; anything incomplete stays text.
+ * CodeBuddy-family DeepSeek sometimes emits native tool markup as assistant text.
+ * Complete declared calls are recovered; incomplete and undeclared blocks stay text.
+ *
+ * The mechanics live in `../dsml` with the CodeBuddy dialect as default; this
+ * module keeps the historical public surface (`DsmlToolCallParser`,
+ * `parseDsmlToolCalls`) stable for this wire family.
  */
+import {
+  DsmlStreamParser,
+  type DsmlToolCall,
+} from "../dsml";
 
-const PIPE = "\uFF5C\uFF5C";
-const CALLS = new RegExp(`<${PIPE}DSML${PIPE}\\s+calls>([\\s\\S]*?)</${PIPE}DSML${PIPE}\\s+calls>`, "i");
-const INVOKE = new RegExp(`<${PIPE}DSML${PIPE}\\s+invoke\\s+name=["']([^"']+)["']>([\\s\\S]*?)</${PIPE}DSML${PIPE}\\s+invoke>`, "gi");
-const PARAMETER = new RegExp(`<${PIPE}DSML${PIPE}\\s+parameter\\s+name=["']([^"']+)["'][^>]*>([\\s\\S]*?)</${PIPE}DSML${PIPE}\\s+parameter>`, "gi");
-const TOOL_NAME = /^[A-Za-z0-9_][A-Za-z0-9_.:-]{0,63}$/;
-
-export interface DsmlToolCall {
-  readonly id: string;
-  readonly name: string;
-  readonly arguments: string;
-}
+export type { DsmlToolCall } from "../dsml";
 
 export interface DsmlRecovery {
   readonly text: string;
   readonly calls: readonly DsmlToolCall[];
 }
 
-export function parseDsmlToolCalls(text: string): DsmlRecovery | undefined {
-  if (!text.includes("DSML")) return undefined;
-  const block = CALLS.exec(text);
-  if (block === null || block[1] === undefined || block.index === undefined) return undefined;
-  const calls: DsmlToolCall[] = [];
-  for (const invoke of block[1].matchAll(INVOKE)) {
-    const name = invoke[1]?.trim() ?? "";
-    if (!TOOL_NAME.test(name)) return undefined;
-    const args: Record<string, string> = {};
-    for (const parameter of (invoke[2] ?? "").matchAll(PARAMETER)) {
-      const key = parameter[1]?.trim();
-      if (key === undefined || key.length === 0) return undefined;
-      args[key] = (parameter[2] ?? "").trim();
-    }
-    calls.push({
-      id: `call_dsml_${calls.length}_${name}`,
-      name,
-      arguments: JSON.stringify(args),
-    });
+/** Streaming strict-prefix parser with the CodeBuddy dialect defaults. */
+export class DsmlToolCallParser extends DsmlStreamParser {
+  constructor(allowedNames: ReadonlySet<string>) {
+    super({ allowedNames });
   }
-  if (calls.length === 0) return undefined;
-  const visible = `${text.slice(0, block.index)}${text.slice(block.index + block[0].length)}`.trim();
-  return { text: visible, calls };
+}
+
+export function parseDsmlToolCalls(
+  text: string,
+  allowedNames: ReadonlySet<string> = new Set(),
+): DsmlRecovery | undefined {
+  if (!text.includes("DSML")) return undefined;
+  const parser = new DsmlToolCallParser(allowedNames);
+  const first = parser.push(text);
+  const last = parser.flush();
+  const recovered = [...first.calls, ...last.calls];
+  return recovered.length === 0 ? undefined : { text: `${first.text}${last.text}`.trim(), calls: recovered };
 }

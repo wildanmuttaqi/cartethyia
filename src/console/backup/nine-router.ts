@@ -21,6 +21,7 @@
  */
 import type { BackupPayload, BackupRow } from "./contracts";
 import { BACKUP_APP, BACKUP_VERSION } from "./contracts";
+import { isRecord } from "../../protocol/codecs";
 import { hashSecret } from "../../security/crypto";
 import {
   AUTH_STATE_KEYS,
@@ -76,12 +77,47 @@ function isoDate(value: unknown, fallback: string): string {
 }
 
 /**
- * The credential on a connection row. The router writes it under one of
- * several keys depending on how the account was added, so all of them are
- * checked before the row is called credential-less.
+ * The credential and the kind to store it under.
+ *
+ * A router connection often carries both an `apiKey` and an OAuth access
+ * token for the same account. The two are not interchangeable: the api key
+ * is a bare bearer, while the access token has to be sent through the
+ * provider's OAuth-shaped envelope — Cline's chat path, for example,
+ * prepends `workos:` to anything it treats as OAuth. If we picked `apiKey`
+ * (the natural first choice because it is the longer-lived, bearer-ready
+ * secret) while persisting the kind as `oauth`, dispatch would wrap it as
+ * `Bearer workos:sk_...` and the upstream would answer "Unauthorized,
+ * re-authenticate".
+ *
+ * Resolution: when a connection carries an api key AND nothing explicitly
+ * says "treat this as OAuth", the api key is the credential and the kind
+ * is `api_key`. The caller still writes any refresh/client secret into
+ * `oauth_states` — the account can be rotated to OAuth later without
+ * losing it — but today's dispatch sends the key as a bare bearer and
+ * works. Only when `authType === "oauth"` is explicit, or when there is
+ * no api key at all, does the credential come from the OAuth bundle.
  */
-function credentialOf(entry: Row): string | null {
-  return text(entry.apiKey) ?? text(entry.accessToken) ?? text(entry.credential) ?? text(entry.token);
+interface ResolvedConnectionCredential {
+  readonly value: string;
+  readonly kind: "api_key" | "oauth";
+}
+function credentialOf(entry: Row, provider: string): ResolvedConnectionCredential | null {
+  const apiKey = text(entry.apiKey);
+  const accessToken = text(entry.accessToken);
+  const fallback = text(entry.credential) ?? text(entry.token);
+  const authType = text(entry.authType);
+  const oauthExplicit = authType === "oauth";
+  const apiKeyExplicit = authType === "apikey" || authType === "api_key";
+  if (apiKey !== null && !oauthExplicit) {
+    return { value: apiKey, kind: "api_key" };
+  }
+  if (accessToken !== null) {
+    return { value: accessToken, kind: apiKeyExplicit ? "api_key" : OAUTH_PROVIDERS.has(provider) ? "oauth" : "api_key" };
+  }
+  if (fallback !== null) {
+    return { value: fallback, kind: oauthExplicit ? "oauth" : apiKeyExplicit ? "api_key" : OAUTH_PROVIDERS.has(provider) ? "oauth" : "api_key" };
+  }
+  return null;
 }
 
 /** OAuth-backed providers store a refresh token rather than a static key. */
@@ -97,7 +133,7 @@ const OAUTH_PROVIDERS = new Set(["claude", "codex", "antigravity", "kimi", "clin
 
 /** The non-secret per-account config, as our `auth_state` bag. */
 function authStateOf(entry: Row): Record<string, unknown> {
-  const specific = isRecord(entry.providerSpecificData) ? entry.providerSpecificData : {};
+  const specific = isRecord(entry.providerSpecificData) ? entry.providerSpecificData as Row : {};
   const state: Record<string, unknown> = {};
   for (const key of AUTH_STATE_KEYS) {
     const value = specific[key];
@@ -109,10 +145,6 @@ function authStateOf(entry: Row): Record<string, unknown> {
 function emailOf(entry: Row): Record<string, unknown> {
   const email = text(entry.email);
   return email === null ? {} : { account_email: email };
-}
-
-function isRecord(value: unknown): value is Row {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 /**
@@ -235,14 +267,13 @@ export function convert9RouterBackup(input: unknown, tenantId: string): Conversi
       );
       return;
     }
-    const credential = credentialOf(entry);
+    const credential = credentialOf(entry, provider);
     if (credential === null) {
       skipped.push(`${label}: no credential on the row`);
       return;
     }
     const accountId = crypto.randomUUID();
-    const authType = text(entry.authType);
-    const kind = authType === "oauth" || OAUTH_PROVIDERS.has(provider) ? "oauth" : "api_key";
+    const kind = credential.kind;
     accounts.push({
       id: accountId,
       provider_id: provider,
@@ -252,7 +283,7 @@ export function convert9RouterBackup(input: unknown, tenantId: string): Conversi
       // `SEALED_COLUMNS`. The store re-seals it under this instance's key on the
       // way in; sealing it here would put ciphertext in a payload whose only
       // portable form is the plaintext, and the restore would drop it.
-      access_token: credential,
+      access_token: credential.value,
       credential_kind: kind,
       status: bool(entry.isActive, true) ? "active" : "disabled",
       consecutive_failures: 0,
