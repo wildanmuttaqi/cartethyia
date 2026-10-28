@@ -64,6 +64,21 @@ Run:
 bun test test/console/backup-sqlite-restore.test.ts
 ```
 
+## Cloudflare Tunnel Client IP
+
+The public share and per-IP guards need the visitor IP, not the Docker peer.
+In `docker-compose.yml`, pin Cloudflared to `CARTETHYIA_CLOUDFLARED_IP` and set
+the app's `TRUSTED_PROXY_CIDRS` to that exact `/32`. Keep the IPAM subnet and
+proxy IP consistent. Cartethyia then trusts the forwarding headers only from
+Cloudflared while direct requests keep using their TCP peer address. Do not
+trust the entire bridge subnet or `platform` mode for this self-hosted setup.
+If the default `172.30.0.0/24` overlaps a host network, override both Compose
+variables in `.env` with an unused subnet and an address inside it.
+
+Run `docker compose config --quiet` and `bun test test/unit/ip-boundary.test.ts`
+after changing this wiring. The client-address resolver prefers
+`CF-Connecting-IP`, which Cloudflare supplies to the tunneled origin.
+
 ## Deployment
 
 These are source changes. If Cartethyia runs from a Docker image, rebuild and deploy the updated image before expecting the fixes to take effect; updating source or this document alone does not update a running container.

@@ -16,6 +16,8 @@ services:
       DASHBOARD_DIST: /app/dist/dashboard
       CARTETHYIA_DATA_DIR: /app/data
       CARTETHYIA_DB_MODE: ${CARTETHYIA_DB_MODE:-full}
+      # Only accept client-IP headers from the Cloudflare Tunnel peer below.
+      TRUSTED_PROXY_CIDRS: ${CARTETHYIA_CLOUDFLARED_IP:-172.30.0.3}/32
       REDIS_URL: ${CARTETHYIA_REDIS_URL-redis://redis:6379}
     depends_on:
       - redis
@@ -33,7 +35,8 @@ services:
     command: tunnel --no-autoupdate run --token ${CLOUDFLARE_TUNNEL_TOKEN:-}
     restart: unless-stopped
     networks:
-      - cartethyia
+      cartethyia:
+        ipv4_address: ${CARTETHYIA_CLOUDFLARED_IP:-172.30.0.3}
 
   # Redis is bundled for Docker's default full capabilities. Set
   # CARTETHYIA_REDIS_URL empty for the in-memory backend. PostgreSQL is never
@@ -60,3 +63,6 @@ volumes:
 networks:
   cartethyia:
     driver: bridge
+    ipam:
+      config:
+        - subnet: ${CARTETHYIA_DOCKER_SUBNET:-172.30.0.0/24}
