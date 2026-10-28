@@ -48,3 +48,5 @@ export function lastModelCooldownAt(account: ModelCooldownSource): number | null
     .filter((time) => Number.isFinite(time));
   return times.length === 0 ? null : Math.max(...times);
 }
+
+

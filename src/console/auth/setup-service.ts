@@ -124,7 +124,44 @@ export class FirstBootSetupService {
       }
 
       await this.createConsoleUser(db, tenantId, password, username, displayName);
-      await ensureDefaultGatewayApiKey(db, tenantId);
+      const defaultApiKey = resolveDefaultGatewayApiKey();
+      // The gateway key is mandatory, not optional: routing keys every request
+      // off it, and the CLI reads it from there. When `CARTETHYIA_API_KEY` is
+      // unset the secret is generated here with the same strength as the
+      // encryption key, so an install that never touched the variable still
+      // boots with a usable key instead of failing later with
+      // "the default gateway API key is missing".
+      const generated = generateApiKeySecret();
+      const secret = defaultApiKey ?? generated.secret;
+      const keyHash = hashSecret(secret);
+      const existingApiKey = await db
+        .select({ id: apiKeys.id })
+        .from(apiKeys)
+        .where(and(eq(apiKeys.tenantId, tenantId), eq(apiKeys.isDefault, true)))
+        .limit(1);
+      if (existingApiKey.length === 0) {
+        await db.insert(apiKeys).values({
+          id: randomUUID(),
+          tenantId,
+          keyHash,
+          label: DEFAULT_API_KEY_LABEL,
+          scopes: TENANT_KEY_SCOPES,
+          // The generated prefix, not a slice of the secret: a slice assumed a
+          // fixed-width prefix, so a longer one would store a truncated value
+          // that no longer matches the key the operator was shown.
+          keyPrefix: defaultApiKey === undefined ? generated.prefix : secret.slice(0, 3),
+          keyEncrypted: encryptCredential(secret),
+          // Unset, not a number: a rate limit the operator never chose is a
+          // refusal they will meet without knowing where it came from. The
+          // gateway key is created at first boot and is the one every early
+          // request rides on, so seeding it with 240 made a ceiling out of a
+          // value nobody picked. Unset reads as unlimited in the UI and in
+          // admission, which is what an operator expects from a key they have
+          // not configured.
+          requestsPerMinute: null,
+          isDefault: true,
+        });
+      }
     };
 
     // First boot creates the default tenant, the platform-admin user, and the
@@ -194,7 +231,6 @@ export class FirstBootSetupService {
         verifyPassword: async () => false,
       });
       result = await backup.restoreFirstBoot(payload, tenantId);
-      await ensureDefaultGatewayApiKey(this.db, tenantId);
       // Inside the same guard as the restore: a failure to create the
       // administrator must leave no tenant behind, exactly as a failed restore
       // does, or the next attempt finds setup already completed and locked.
@@ -241,43 +277,6 @@ export class FirstBootSetupService {
     const insertedUser = await returningRows(userInsert);
     assertMutationApplied(insertedUser, "Administrator user");
   }
-}
-
-/** Shared seed operation; never replaces or re-enables an existing default key. */
-async function ensureDefaultGatewayApiKey(db: CartethyiaDatabase, tenantId: string): Promise<void> {
-  const existing = await db
-    .select({ id: apiKeys.id })
-    .from(apiKeys)
-    .where(and(eq(apiKeys.tenantId, tenantId), eq(apiKeys.isDefault, true)))
-    .limit(1);
-  if (existing.length > 0) return;
-
-  const configuredSecret = resolveDefaultGatewayApiKey();
-  const generated = generateApiKeySecret();
-  const secret = configuredSecret ?? generated.secret;
-  await db.insert(apiKeys).values({
-    id: randomUUID(),
-    tenantId,
-    keyHash: hashSecret(secret),
-    label: DEFAULT_API_KEY_LABEL,
-    scopes: TENANT_KEY_SCOPES,
-    keyPrefix: configuredSecret === undefined ? generated.prefix : secret.slice(0, 3),
-    keyEncrypted: encryptCredential(secret),
-    requestsPerMinute: 240,
-    isDefault: true,
-  });
-}
-
-/** Repairs initialized tenants that predate default-key recovery on startup. */
-export async function recoverMissingDefaultGatewayApiKeys(db: CartethyiaDatabase): Promise<void> {
-  await db.transaction(async (transaction) => {
-    await transaction.execute(firstBootSetupLock());
-    const scoped = transaction as unknown as CartethyiaDatabase;
-    const users = await scoped.select({ tenantId: consoleUsers.tenantId }).from(consoleUsers);
-    for (const tenantId of new Set(users.map((user) => user.tenantId))) {
-      if (tenantId !== null) await ensureDefaultGatewayApiKey(scoped, tenantId);
-    }
-  });
 }
 
 /** One privileged console mutation to record. */

@@ -97,6 +97,24 @@ describe("trae realms", () => {
     expect(TRAE_REGION_CORE_HOSTS["us"]).toBe("https://core-normal.traeapi.us");
   });
 
+  test("intl defaults to SG, with US still reachable", () => {
+    // The default is SG, not US. Region routing is a property of the account, so
+    // this decides only accounts whose region was never captured — and SG
+    // serves the wider international roster. US is demoted to a fallback rather
+    // than removed: a genuinely US-provisioned account with no stored region
+    // still needs somewhere to land.
+    expect(TRAE_REALMS.intl.core).toBe("https://coresg-normal.trae.ai");
+    expect(TRAE_REALMS.intl.core).toBe(TRAE_REGION_CORE_HOSTS["sg"] ?? "<missing>");
+    expect(traeCoreCandidates("intl")).toContain("https://core-normal.traeapi.us");
+  });
+
+  test("an intl account with no stored region is not sent to US first", () => {
+    // The behavior that actually changed: `traeCoreForAccount` falls through to
+    // the realm default when the account carries no region, so the empty-region
+    // case must resolve to SG.
+    expect(traeCoreCandidates("intl")[0]).toBe("https://coresg-normal.trae.ai");
+  });
+
   test("the realms do not share a core host", () => {
     // A shared host would mean one of them is dispatched to the wrong
     // deployment, which upstream refuses outright.
@@ -340,6 +358,26 @@ describe("buildTraeChatBody", () => {
   test("an empty model name is refused", () => {
     expect(() => buildTraeChatBody("", request(), "intl")).toThrow();
   });
+
+  test("a resolved session id is carried as session_id", () => {
+    const body = buildTraeChatBody("gpt-5.5", request(), "intl", "ses_abc123");
+    expect(body.session_id).toBe("ses_abc123");
+  });
+
+  test("the caller's session id wins over the resolved one", () => {
+    const body = buildTraeChatBody(
+      "gpt-5.5",
+      request({ session_id: "caller-ses" }),
+      "intl",
+      "resolved-ses",
+    );
+    expect(body.session_id).toBe("caller-ses");
+  });
+
+  test("no session id means no session_id field", () => {
+    const body = buildTraeChatBody("gpt-5.5", request(), "intl");
+    expect("session_id" in body).toBe(false);
+  });
 });
 
 describe("toTraeAgentBody", () => {
@@ -502,6 +540,44 @@ describe("trae Agent tool streams", () => {
       { event: "output", data: { chunk: { tool_calls: [{ id: "call-1", index: 0, function_call: { name: "read", arguments: "{}" } }] } } },
     ]);
     expect(events.some((event) => event.type === "tool_call_delta")).toBe(true);
+  });
+
+  test("the terminal event carries the assessed usage", async () => {
+    // Non-streaming dispatch reads usage off the terminal event; without it the
+    // request is reconciled to the estimate. The same session must hit the
+    // cache estimator, so a repeated prefix reports cached tokens.
+    const adapter = createTraeAdapter();
+    const frames = (usage: Record<string, unknown>) => [
+      { event: "output", data: { response: "hai" } },
+      { event: "token_usage", data: usage },
+    ];
+    const session = "ses-terminal-usage";
+    const requestWithSession = (content: string) =>
+      request({ session_id: session, messages: [{ role: "user", content: [{ kind: "text", text: content }] }] });
+
+    // First call: no history yet → cached unavailable, terminal usage present.
+    const first = [];
+    for await (const event of adapter.dispatch(
+      requestWithSession("halo"),
+      AGENT_TARGET,
+      dispatchContext(frames({ prompt_tokens: 45, completion_tokens: 10, total_tokens: 55 })),
+    )) first.push(event);
+    const t1 = first.find((e) => e.type === "terminal") as { usage?: { input_tokens: number } };
+    expect(t1?.usage?.input_tokens).toBe(45);
+    expect((t1?.usage as { cached_input_tokens?: number | string })?.cached_input_tokens).toBe("unavailable");
+
+    // Second call, identical prefix → cached estimate applies on the terminal.
+    const second = [];
+    for await (const event of adapter.dispatch(
+      requestWithSession("halo"),
+      AGENT_TARGET,
+      dispatchContext(frames({ prompt_tokens: 45, completion_tokens: 12, total_tokens: 57 })),
+    )) second.push(event);
+    const t2 = second.find((e) => e.type === "terminal") as {
+      usage?: { input_tokens: number; cached_input_tokens: number; uncached_input_tokens: number };
+    };
+    expect(t2?.usage?.cached_input_tokens).toBe(45);
+    expect(t2?.usage?.uncached_input_tokens).toBe(0);
   });
 
   test("tool ids from one request never resolve fragments in the next request", async () => {

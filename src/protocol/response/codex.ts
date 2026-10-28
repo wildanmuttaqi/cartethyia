@@ -271,9 +271,6 @@ type OpenItemEntry = {
   itemId?: string | undefined;
 };
 
-type OutputTextState = { emitted: string; finalText?: string };
-type ToolOutputState = { callId: string; name?: string; emittedArgs: string; bufferedArgs: string; started: boolean };
-
 /** Shared incremental parser for a single `response.*` frame. */
 export class CodexStreamFrameProcessor {
   #seq: number;
@@ -284,8 +281,6 @@ export class CodexStreamFrameProcessor {
   terminalEndTurn: boolean | undefined;
   terminalIncompleteDetails: unknown | undefined;
   readonly #reasoningDeltaIds = new Set<string>();
-  readonly #outputText = new Map<string, OutputTextState>();
-  readonly #toolOutput = new Map<string, ToolOutputState>();
   // output_index routing + `output_item.added` registration.
   readonly #openItems = new Map<string, OpenItemEntry>();
   readonly #openItemsByOutputIndex = new Map<number, OpenItemEntry>();
@@ -375,122 +370,6 @@ export class CodexStreamFrameProcessor {
     }
   }
 
-  #outputTextKeys(itemId: string | undefined, outputIndex: number | undefined, contentIndex: number): string[] {
-    return [
-      ...(itemId === undefined ? [] : [`item:${itemId}:${contentIndex}`]),
-      ...(outputIndex === undefined ? [] : [`output:${outputIndex}:${contentIndex}`]),
-    ];
-  }
-
-  #outputTextState(keys: readonly string[]): OutputTextState {
-    const state = keys.map((key) => this.#outputText.get(key)).find((entry) => entry !== undefined)
-      ?? { emitted: "" };
-    for (const key of keys) this.#outputText.set(key, state);
-    return state;
-  }
-
-  #emitFinalOutputText(
-    itemId: string | undefined,
-    outputIndex: number | undefined,
-    contentIndex: number,
-    text: string,
-  ): CanonicalEvent[] {
-    if (text.length === 0) return [];
-    const keys = this.#outputTextKeys(itemId, outputIndex, contentIndex);
-    if (keys.length === 0) {
-      return [{ type: "content_delta", sequence_number: this.#seq++, content: { kind: "text", text } }];
-    }
-    const state = this.#outputTextState(keys);
-    if (state.finalText !== undefined && !text.startsWith(state.finalText)) return [];
-    if (!text.startsWith(state.emitted)) {
-      state.finalText = text;
-      return [];
-    }
-    const remaining = text.slice(state.emitted.length);
-    state.emitted = text;
-    state.finalText = text;
-    return remaining.length === 0
-      ? []
-      : [{ type: "content_delta", sequence_number: this.#seq++, content: { kind: "text", text: remaining } }];
-  }
-
-  #emitMessageOutputText(item: unknown, outputIndex: number | undefined): CanonicalEvent[] {
-    if (!isRecord(item) || item["type"] !== "message" || !Array.isArray(item["content"])) return [];
-    const itemId = typeof item["id"] === "string" ? item["id"] : undefined;
-    const events: CanonicalEvent[] = [];
-    for (const [contentIndex, block] of item["content"].entries()) {
-      if (isRecord(block) && block["type"] === "output_text" && typeof block["text"] === "string") {
-        events.push(...this.#emitFinalOutputText(itemId, outputIndex, contentIndex, block["text"]));
-      }
-    }
-    return events;
-  }
-
-  #toolOutputKeys(json: Record<string, unknown>, callId: string): string[] {
-    const itemId = typeof json["item_id"] === "string" ? json["item_id"] : undefined;
-    const outputIndex = readOutputIndex(json);
-    return [
-      ...(itemId === undefined ? [] : [`item:${itemId}`]),
-      ...(outputIndex === undefined ? [] : [`output:${outputIndex}`]),
-      `call:${callId}`,
-    ];
-  }
-
-  #emitTool(json: Record<string, unknown>, text: string, final: boolean): CanonicalEvent[] {
-    const identity = this.#resolveToolIdentity(json);
-    const keys = this.#toolOutputKeys(json, identity.callId);
-    const state = keys.map((key) => this.#toolOutput.get(key)).find((entry) => entry !== undefined)
-      ?? { callId: identity.callId, emittedArgs: "", bufferedArgs: "", started: false };
-    if (!state.started) state.callId = identity.callId;
-    if (identity.name !== undefined) state.name = identity.name;
-    for (const key of keys) this.#toolOutput.set(key, state);
-    this.hasToolCall = true;
-
-    const fullArgs = final ? text : state.bufferedArgs + text;
-    state.bufferedArgs = final ? "" : fullArgs;
-    if (state.name === undefined) return [];
-
-    const events: CanonicalEvent[] = [];
-    if (!state.started) {
-      events.push({
-        type: "tool_call_delta",
-        sequence_number: this.#seq++,
-        call_id: state.callId,
-        name: state.name,
-        arguments_delta: "",
-      } as CanonicalEvent);
-      state.started = true;
-    }
-    const remaining = final
-      ? fullArgs.startsWith(state.emittedArgs) ? fullArgs.slice(state.emittedArgs.length) : ""
-      : text;
-    if (remaining.length > 0) {
-      events.push({
-        type: "tool_call_delta",
-        sequence_number: this.#seq++,
-        call_id: state.callId,
-        name: state.name,
-        arguments_delta: remaining,
-      } as CanonicalEvent);
-      state.emittedArgs += remaining;
-    }
-    return events;
-  }
-
-  #emitToolItem(item: unknown, outputIndex: number | undefined): CanonicalEvent[] {
-    if (!isRecord(item)) return [];
-    const type = item["type"];
-    if (type !== "function_call" && type !== "custom_tool_call" && type !== "computer_call") return [];
-    const value = type === "custom_tool_call" ? item["input"] : item["arguments"];
-    const args = type === "computer_call" ? JSON.stringify(item["action"] ?? {}) : typeof value === "string" ? value : "";
-    return this.#emitTool({
-      ...item,
-      item_id: item["id"],
-      output_index: outputIndex,
-      ...(type === "computer_call" ? { name: "computer" } : {}),
-    }, args, true);
-  }
-
   /** Returns true once a frame carrying the terminal status/type has been seen. */
   get isDone(): boolean {
     return this.terminalStatus !== undefined;
@@ -516,41 +395,18 @@ export class CodexStreamFrameProcessor {
       if (itemId !== undefined) this.#openItems.set(itemId, entry);
       if (outputIndex !== undefined)
         this.#openItemsByOutputIndex.set(outputIndex, entry);
-      if (
-        item?.["type"] === "function_call" ||
-        item?.["type"] === "custom_tool_call" ||
-        item?.["type"] === "computer_call"
-      ) {
-        events.push(...this.#emitTool({ ...item, item_id: itemId, output_index: outputIndex }, "", false));
-      }
+      // `function_call` items carry no state this decoder needs at `added`
+      // time; the arguments arrive through the `.delta`/`.done` events below.
     } else if (
       t === "response.output_text.delta" &&
       typeof json["delta"] === "string" &&
       json["delta"].length > 0
     ) {
-      const itemId = typeof json["item_id"] === "string" ? json["item_id"] : undefined;
-      const outputIndex = readOutputIndex(json);
-      const contentIndex =
-        typeof json["content_index"] === "number" && Number.isInteger(json["content_index"])
-          ? json["content_index"]
-          : 0;
-      const textState = this.#outputTextState(this.#outputTextKeys(itemId, outputIndex, contentIndex));
-      textState.emitted += json["delta"];
       events.push({
         type: "content_delta",
         sequence_number: this.#seq++,
         content: { kind: "text", text: json["delta"] as string },
       } as CanonicalEvent);
-    } else if (
-      t === "response.output_text.done" &&
-      typeof json["text"] === "string"
-    ) {
-      const itemId = typeof json["item_id"] === "string" ? json["item_id"] : undefined;
-      const contentIndex =
-        typeof json["content_index"] === "number" && Number.isInteger(json["content_index"])
-          ? json["content_index"]
-          : 0;
-      events.push(...this.#emitFinalOutputText(itemId, readOutputIndex(json), contentIndex, json["text"]));
     } else if (
       t === "response.refusal.delta" &&
       typeof json["delta"] === "string" &&
@@ -565,19 +421,35 @@ export class CodexStreamFrameProcessor {
       t === "response.function_call_arguments.delta" &&
       typeof json["delta"] === "string"
     ) {
-      const { callId } = this.#resolveToolIdentity(json);
+      const { callId, name } = this.#resolveToolIdentity(json);
       const itemId =
         typeof json["item_id"] === "string"
           ? (json["item_id"] as string)
           : undefined;
       const key = itemId ?? callId;
       this.#checkWhitespaceLoopGuard(key, json["delta"] as string);
-      events.push(...this.#emitTool(json, json["delta"] as string, false));
+      events.push({
+        type: "tool_call_delta",
+        sequence_number: this.#seq++,
+        call_id: callId,
+        name,
+        arguments_delta: json["delta"] as string,
+      } as CanonicalEvent);
+      this.hasToolCall = true;
     } else if (
       t === "response.custom_tool_call_input.delta" &&
       typeof json["delta"] === "string"
     ) {
-      events.push(...this.#emitTool(json, json["delta"] as string, false));
+      const { callId, name } = this.#resolveToolIdentity(json);
+
+      events.push({
+        type: "tool_call_delta",
+        sequence_number: this.#seq++,
+        call_id: callId,
+        name,
+        arguments_delta: json["delta"] as string,
+      } as CanonicalEvent);
+      this.hasToolCall = true;
     } else if (
       t === "response.reasoning_summary_text.delta" &&
       typeof json["delta"] === "string"
@@ -624,12 +496,13 @@ export class CodexStreamFrameProcessor {
         },
       });
     } else if (t === "response.function_call_arguments.done") {
-      if (typeof json["arguments"] === "string")
-        events.push(...this.#emitTool(json, json["arguments"] as string, true));
+      // The arguments themselves are emitted by the delta events above; the
+      // `.done` event only marks the call complete.
+
       this.hasToolCall = true;
     } else if (t === "response.custom_tool_call_input.done") {
-      if (typeof json["input"] === "string")
-        events.push(...this.#emitTool(json, json["input"] as string, true));
+      // As above: the input arrives as deltas, so `.done` only completes it.
+
       this.hasToolCall = true;
     } else if (t === "response.output_item.done") {
       const item = json["item"];
@@ -639,8 +512,6 @@ export class CodexStreamFrameProcessor {
           typeof outputItem["id"] === "string" ? outputItem["id"] : undefined;
         const outputIndex = readOutputIndex(json);
         const encrypted = outputItem["encrypted_content"];
-        events.push(...this.#emitMessageOutputText(outputItem, outputIndex));
-        events.push(...this.#emitToolItem(outputItem, outputIndex));
         if (
           this.#captureWebSearchCitations &&
           outputItem["type"] === "message" &&
@@ -728,15 +599,6 @@ export class CodexStreamFrameProcessor {
         const responseObj = response as Record<string, unknown>;
         if (typeof responseObj["status"] === "string")
           this.terminalStatus = responseObj["status"];
-        if (
-          (t === "response.completed" || t === "response.done") &&
-          Array.isArray(responseObj["output"])
-        ) {
-          for (const [outputIndex, item] of responseObj["output"].entries()) {
-            events.push(...this.#emitMessageOutputText(item, outputIndex));
-            events.push(...this.#emitToolItem(item, outputIndex));
-          }
-        }
         if (responseObj["usage"] && typeof responseObj["usage"] === "object") {
           this.terminalUsage = responseObj["usage"] as Record<string, unknown>;
         }
@@ -767,11 +629,23 @@ export class CodexStreamFrameProcessor {
       if (streamError !== undefined) throw streamError;
       this.terminalStatus = "failed";
     } else if (typeof json["delta"] === "string" && json["delta"].length > 0) {
+      // An unrecognized frame carrying a bare `delta` used to be forwarded as
+      // answer text. Reasoning frames that fall through the chain above — the
+      // last `else if` is the catch-all for every type this decoder does not
+      // name — then leaked into the answer verbatim. Keeping the payload
+      // visible as an extension part is the unknown-event convention the
+      // Responses stream already uses (`responses:<type>`), so the frame stays
+      // in telemetry without ever reaching the answer. Dropping it instead
+      // would silently discard real content.
       events.push({
         type: "content_delta",
         sequence_number: this.#seq++,
-        content: { kind: "text", text: json["delta"] as string },
-      } as unknown as CanonicalEvent);
+        content: {
+          kind: "extension",
+          name: "codex:untyped_delta",
+          payload: json["delta"] as string,
+        },
+      } as CanonicalEvent);
     } else {
       const choices = json["choices"] as
         | Array<Record<string, unknown>>
