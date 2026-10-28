@@ -5,7 +5,7 @@ Treat it as a porting checklist, not as a replacement for upstream files.
 
 ## Before Updating
 
-1. Preserve the current working tree or make a backup before replacing files.
+1. Preserve the current working tree or make a backup before replacing files. Keep `docker-compose.yml`, `nginx.conf`, `.env`, `data/`, and this `CODELOCK.md` out of upstream snapshot copies unless the operator explicitly asks to change them.
 2. Update Cartethyia, then inspect the current implementation and tests listed below.
 3. Check whether upstream already contains equivalent behavior. If it does, keep the upstream implementation and verify these cases instead of adding a duplicate patch.
 4. If behavior is missing, port the smallest change into the current code. Do not copy an old file over a newer upstream file.
@@ -16,6 +16,8 @@ Treat it as a porting checklist, not as a replacement for upstream files.
 **Symptom:** A Codex Responses stream can finish without sending any `response.output_text.delta`. If the decoder only forwards deltas, the model's final answer is lost and the client receives a blank response.
 
 **Required behavior:** In `src/protocol/response/codex.ts`, `CodexStreamFrameProcessor` must recover non-empty text from the final `response.output_text.done` frame or from `output_text` blocks in `response.output_item.done`. It must not echo final text when a delta for the same item/content has already been emitted, and it must not emit the same final text twice when both final frame types arrive. Preserve normal streaming deltas and terminal handling.
+
+When a final text snapshot is longer than the deltas already emitted, append only the missing suffix when the snapshot starts with the emitted text. Never discard a valid final suffix merely because an earlier delta was seen, and never replay an already-emitted prefix.
 
 The implementation may change across upstream versions; preserve the behavior, not the private field names or exact code shape.
 

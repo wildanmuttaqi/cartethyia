@@ -6,15 +6,8 @@
  * answer is a layered merge — operator overrides, the discovery module's own
  * definition, the provider's static catalog, then a generic default — and it
  * lives here so `probing-service.ts` owns orchestration rather than merge
- * precedence.
- *
- * This module used to carry its own `DISCOVERY_CONFIG_BY_PROVIDER` table of
- * endpoint paths. It was a byte-identical second copy of
- * `PROVIDER_CAPABILITIES[id].endpointPathsByWireFamily` in the provider
- * registry, and it had already drifted: `ollamacloud` was listed here with four
- * paths while the registry map was the only one the catalog service validated
- * against. `discoveryPathsFor` now reads the registry, so a provider declares
- * its endpoint paths once.
+ * precedence. Endpoint paths come from the provider registry, so a provider
+ * declares its endpoint paths once rather than in a second table here.
  */
 import type { WireFamily } from "../../protocol/canonical-model";
 import type { CompatibilityProfile } from "../provider-metadata";
@@ -172,17 +165,41 @@ export function staticEndpointForWire(
   return catalog.get(providerId)?.find((def) => def.wireFamily === wireFamily)?.endpointPath;
 }
 
+/**
+ * Compiled-pattern memo.
+ *
+ * `matchModelWireFamily` runs per model on every discovery pass and on every
+ * manual registration, so patterns are compiled once here instead of inside
+ * that loop — otherwise the same handful of patterns are recompiled once per
+ * model per pass. Keyed by the pattern source, which is exactly what
+ * `new RegExp(source)` derives from.
+ *
+ * A pattern that fails to compile is not memoized; the tolerance stays at read
+ * time because an invalid pattern is rejected at write time, and a stored one
+ * must not throw during a listing.
+ */
+const compiledPatternCache = new Map<string, RegExp>();
+
+function compilePattern(pattern: string): RegExp | undefined {
+  const cached = compiledPatternCache.get(pattern);
+  if (cached !== undefined) return cached;
+  try {
+    const compiled = new RegExp(pattern);
+    compiledPatternCache.set(pattern, compiled);
+    return compiled;
+  } catch {
+    return undefined;
+  }
+}
+
 function matchModelWireFamily(
   modelId: string,
   rules: ReadonlyArray<{ pattern: string; wire_family: WireFamily }> | undefined,
 ): WireFamily | undefined {
   if (!rules?.length) return undefined;
   for (const rule of rules) {
-    try {
-      if (new RegExp(rule.pattern).test(modelId)) return rule.wire_family as WireFamily;
-    } catch {
-      // Invalid pattern is rejected at write time; be tolerant at read time.
-    }
+    const pattern = compilePattern(rule.pattern);
+    if (pattern !== undefined && pattern.test(modelId)) return rule.wire_family as WireFamily;
   }
   return undefined;
 }

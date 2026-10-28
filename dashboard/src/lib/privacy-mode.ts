@@ -15,7 +15,15 @@ function useStoredFlag(key: string, event: string): { readonly enabled: boolean;
   }, []);
 
   const setEnabled = (next: boolean) => {
-    localStorage.setItem(key, next ? "1" : "0");
+    // Guarded like every other storage writer in the app: Safari private mode
+    // and a full quota both throw on `setItem`, and an uncaught throw here
+    // would propagate out of the toggle's click handler. The in-memory flag is
+    // set either way, so the toggle still works for this session.
+    try {
+      localStorage.setItem(key, next ? "1" : "0");
+    } catch {
+      // Nothing to recover: this session's own state is already correct.
+    }
     window.dispatchEvent(new Event(event));
   };
 
@@ -70,4 +78,13 @@ export function useMysteriousAccounts(providerId: string): { readonly enabled: b
 /** Hides egress addresses on the proxy page, independent of the name switch. */
 export function useMaskIp(): { readonly enabled: boolean; readonly setEnabled: (next: boolean) => void } {
   return useStoredFlag("cartethyia.mask-ip", "cartethyia:mask-ip");
+}
+
+/**
+ * Hides providers that have no account yet on the providers page. Providers
+ * that take no credential at all (`requiresAccount: false`) are never hidden —
+ * they have no account by design, not through omission.
+ */
+export function useHideUnconfiguredProviders(): { readonly enabled: boolean; readonly setEnabled: (next: boolean) => void } {
+  return useStoredFlag("cartethyia.hide-unconfigured-providers", "cartethyia:hide-unconfigured-providers");
 }

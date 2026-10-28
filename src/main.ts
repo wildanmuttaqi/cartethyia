@@ -1,3 +1,6 @@
+// Must run before any module that registers a route: it wires Elysia's TypeBox
+// bridge statically, which the source-run path needs under NODE_ENV=production.
+import "./boot/elysia-typebox-bridge";
 import { createGatewayApp, createGatewayShell } from "./boot/app";
 import { bootstrap } from "./boot/lifecycle";
 import type { CartethyiaBoot } from "./boot/lifecycle";
@@ -65,6 +68,16 @@ const app = boot
         admissionService: boot.deps.admissionService,
         modelStrikes: boot.deps.modelStrikes,
         readRoutingAccountInflight: boot.deps.readRoutingAccountInflight,
+        // The same three writers the shutdown coordinator drains, so a manual
+        // flush from the console does exactly what a graceful stop would do
+        // for the queues, minus the stop.
+        flushBuffers: {
+          flush: async () => {
+            await boot.deps.telemetryBuffer.flush();
+            await boot.deps.usageFlush.flush();
+            await boot.deps.healthEventFlush.flush();
+          },
+        },
       },
     })
   : createGatewayShell();

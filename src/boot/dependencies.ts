@@ -7,6 +7,7 @@ import type { RedisClient } from "../persistence/redis";
 import {
   bundledModelCatalog,
   liveProviderUpstreamHosts,
+  markCatalogSeeded,
   refreshActiveProviderCatalogs,
   registerByokProviders,
   retireUnbundledProviders,
@@ -31,7 +32,11 @@ import { RedisAdmissionCounterStore } from "../security/admission/redis-store";
 import { sweepLeases } from "../security/admission/lease-sweep";
 import { DrizzleApiKeyStore } from "../persistence/stores/api-key-store";
 import { UsageFlushBuffer } from "../persistence/usage-flush";
+import { setPendingUsageSource } from "../security/api-key-auth";
+import { HealthEventFlushBuffer, setHealthEventBuffer } from "../persistence/health-event-flush";
+import { subscribePeerSettingsRevisions } from "../persistence/settings-revision";
 import { deleteExpiredSessions } from "../console/auth/session-service";
+import { recoverMissingDefaultGatewayApiKeys } from "../console/auth/setup-service";
 import { InMemoryIpAbuseStore, IpAbuseProtectionService, RedisIpAbuseStore } from "../security/abuse";
 import {
   InMemoryModelAbuseStore,
@@ -48,6 +53,7 @@ import {
 import { NetworkPoolSelector } from "../network/pool/selector";
 import { ScheduledTaskRegistry } from "../workers/scheduler";
 import { quotaRefreshSweep } from "../workers/quota-refresh-sweep";
+import { markProviderApiKeyCredential } from "../console/quota/account-quota-shared";
 import { dailyCheckinEgressForPass } from "../workers/daily-checkin";
 import {
   buddyAdoptTask,
@@ -61,15 +67,19 @@ import {
 } from "../workers/buddy-growth-tasks";
 import { createAccountSecretResolver } from "../providers/operations/provider-credential-service";
 import { quotaCacheSize } from "../console/quota/cache";
+import { modelCatalogCacheSize } from "../providers/operations/model-catalog-cache";
 import { preferencesReaderFor } from "../persistence/tenant-preferences";
 import { sweepExpiredCooldowns } from "../providers/operations/account-health-service";
 import { DrizzleTelemetryStore } from "../persistence/stores/telemetry-store";
 import { TelemetryPayloadCapture } from "../observability/payload-capture";
+import { foldDayIndex, listEventDays } from "../observability/event-day-index";
+import { resolveTelemetryCompactIntervalMs } from "../config/telemetry";
 import { sweepExpiredPoolCooldowns } from "../network/pool-health-machine";
 import { TelemetryBatchBuffer } from "../observability/telemetry-buffer";
 import { RuntimeMetricsSampler } from "../observability/runtime-metrics";
 import {
   resolveIpRateLimit,
+  resolveModelBanMaxTtlMs,
   resolveModelBanTtlMs,
   resolveModelStrikeThreshold,
   resolveModelStrikeWindowMs,
@@ -84,7 +94,6 @@ import type { ByokUpstreamHost } from "../providers/operations/provider-catalog-
 import type { ReadinessCheckResult } from "../persistence/readiness";
 import { log } from "../observability/logger";
 import { refreshProviderClientVersions } from "../providers/operations/client-versions";
-import { recoverMissingDefaultGatewayApiKeys } from "../console/auth/setup-service";
 
 
 export interface ProductionDeps {
@@ -110,6 +119,7 @@ export interface ProductionDeps {
   poolSelector: NetworkPoolSelector;
   telemetryBuffer: TelemetryBatchBuffer;
   usageFlush: UsageFlushBuffer;
+  healthEventFlush: HealthEventFlushBuffer;
   trustedProxyBoundary: TrustedProxyBoundary;
   providerRegistry: ProviderRegistry;
   resolveOAuthRefresher: (providerId: string) => Promise<OAuthTokenRefresher | undefined>;
@@ -131,7 +141,9 @@ const OAUTH_REFRESH_INTER_ITEM_DELAY_MS = 1_500;
  * Client identities are refreshed out of band so provider dispatch never waits
  * on npm/provider version endpoints. Resolver TTLs deduplicate the sources.
  */
-const CLIENT_VERSION_MONITOR_INTERVAL_MS = 15 * 60_000;
+// Matched to the resolver's own 30 min cache TTL: a shorter interval makes
+// every second pass a pure cache read that cannot discover anything new.
+const CLIENT_VERSION_MONITOR_INTERVAL_MS = 30 * 60_000;
 const CLIENT_VERSION_INITIAL_DELAY_MS = 10_000;
 
 export async function buildProductionDeps(): Promise<ProductionDeps> {
@@ -168,6 +180,9 @@ export async function buildProductionDeps(): Promise<ProductionDeps> {
   await measureStartupPhase("bundled-model-seed", () =>
     seedBundledModels(db, bundledCatalog.modelsByProvider),
   );
+  // The boot seed above is unconditional, so record it: the snapshot builder's
+  // first rebuild would otherwise re-seed an identical catalog.
+  markCatalogSeeded();
   const snapshotService = new InMemoryRouteSnapshotService(
     createDatabaseSnapshotBuilder(db, () => refreshActiveProviderCatalogs(db, registry)),
   );
@@ -199,7 +214,21 @@ export async function buildProductionDeps(): Promise<ProductionDeps> {
     }
     return [...totals].map(([accountId, inflight]) => ({ accountId, inflight }));
   };
+  // Peer processes' settings mutations arrive here. Subscribed once for the
+  // process: the revision counter is process-global, and the handler only
+  // moves it forward.
+  subscribePeerSettingsRevisions();
   const usageFlush = new UsageFlushBuffer(db);
+  // Auth reads lifetime usage to seed the admission counter. The persisted
+  // value lags by up to one flush interval, so hand it the in-flight deltas
+  // too — otherwise the seed is systematically under what has actually been
+  // spent, worst exactly when the key is busiest.
+  setPendingUsageSource((apiKeyId) => usageFlush.pendingFor(apiKeyId));
+  // Health audit rows are append-only and read by nobody in dispatch, so they
+  // are buffered out of the request. The status write they accompany stays
+  // synchronous — routing reads it.
+  const healthEventFlush = new HealthEventFlushBuffer(db);
+  setHealthEventBuffer(healthEventFlush);
   const admissionStore = redis
     ? new RedisAdmissionCounterStore(redis)
     : new InMemoryAdmissionCounterStore();
@@ -249,6 +278,7 @@ export async function buildProductionDeps(): Promise<ProductionDeps> {
     threshold: resolveModelStrikeThreshold(),
     windowMs: resolveModelStrikeWindowMs(),
     banTtlMs: resolveModelBanTtlMs(),
+    maxBanTtlMs: resolveModelBanMaxTtlMs(),
   });
   const readiness = () => checkReadiness(db, redis, resolveRedisBackend(redis));
   // One list covers every periodic task: a small deployment can cut the
@@ -281,8 +311,31 @@ export async function buildProductionDeps(): Promise<ProductionDeps> {
     run: () => payloadCapture.cleanupExpired(),
   });
   scheduledTasks.register({
+    name: "telemetry-index-fold",
+    intervalMs: resolveTelemetryCompactIntervalMs(),
+    // Brings each day's index up to date with the bytes appended since the last
+    // pass, so a usage read is a small JSON read rather than a parse of the
+    // whole period. Folding is incremental and idempotent: a crash only leaves
+    // the watermark behind, and the next pass re-reads the tail.
+    run: async () => {
+      const days = await listEventDays();
+      let folded = 0;
+      for (const day of days) {
+        const result = await foldDayIndex(day).catch(() => ({ folded: 0 }));
+        folded += result.folded;
+      }
+      if (folded > 0) {
+        log.info(`[telemetry] indexed ${folded} event(s) across ${days.length} day(s)`);
+      }
+    },
+  });
+  scheduledTasks.register({
     name: "console-session-sweep",
-    intervalMs: 60 * 60_000,
+    // Sessions live 48 h, so an hourly sweep deleted nothing 47 times out of
+    // 48 — each pass a full scan of the session table for rows that cannot yet
+    // be expired. Half the session lifetime is the point where a pass can
+    // actually find work, and still leaves a full grace period after it.
+    intervalMs: 12 * 60 * 60_000,
     run: () => deleteExpiredSessions(db),
   });
   scheduledTasks.register({
@@ -311,6 +364,7 @@ export async function buildProductionDeps(): Promise<ProductionDeps> {
     routingRoundRobinEntries: () => routingEngine.roundRobinEntries(),
     ipAbuseKeys: () => (ipStore instanceof InMemoryIpAbuseStore ? ipStore.keyCount() : 0),
     quotaCacheEntries: () => quotaCacheSize(),
+    modelCatalogEntries: () => modelCatalogCacheSize(),
     // Late-bound via bindInFlight once the request state store exists.
     inFlight: () => 0,
   });
@@ -324,13 +378,17 @@ export async function buildProductionDeps(): Promise<ProductionDeps> {
   });
   scheduledTasks.register({
     name: "pool-agent-sweep",
-    intervalMs: 60_000,
+    // `resolveAgent` already self-sweeps every 30 s, so a 1 min timer adds a
+    // second pass that almost always finds nothing to release. 5 min is well
+    // inside the idle timeout this exists to enforce, and outside the path
+    // that already runs.
+    intervalMs: 5 * 60_000,
     run: () => poolAgentResolver.sweepIdleAgents(),
   });
   const oauthRefreshService = new OAuthRefreshService(db);
-  // Converge accounts an earlier build parked on a dead refresh grant: an
-  // account whose stored access token is still usable becomes a static token
-  // (and returns to rotation) instead of staying disabled for re-auth.
+  // Converge accounts parked on a dead refresh grant: an account whose stored
+  // access token is still usable becomes a static token (and returns to
+  // rotation) instead of staying disabled for re-auth.
   await measureStartupPhase("static-token-reconciliation", () =>
     reconcileStaticTokenAccounts(db),
   );
@@ -340,7 +398,12 @@ export async function buildProductionDeps(): Promise<ProductionDeps> {
   // credential — no upstream call — so it runs often and cheaply.
   scheduledTasks.register({
     name: "account-enrichment-sweep",
-    intervalMs: 30_000,
+    // Converges via `identity_checked_at`: once every stored credential has
+    // been parsed, the listing query returns nothing — a 30 s timer would run
+    // that empty query forever, two million times a year. 10 min is still
+    // instant for the case that matters (a batch import, where the label and
+    // email show up on the next tick) and costs nothing when idle.
+    intervalMs: 10 * 60_000,
     run: () => accountIdentitySweep({ db }),
   });
   scheduledTasks.register({
@@ -395,11 +458,10 @@ export async function buildProductionDeps(): Promise<ProductionDeps> {
   // the same pass (one attempt per account per day, guarded by a day
   // marker), so no second timer duplicates the credential resolution.
   //
-  // Registered in **every** mode, not only when Redis is present. It used to
-  // sit behind `if (redis)`, which quietly cost Lite two things: proactive
-  // quota warming, and the check-in ride-along above that claims the
-  // once-per-day WorkBuddy/CodeBuddy credit grant. The whole sweep chain
-  // already accepts `RedisClient | undefined` and falls back to the
+  // Registered in **every** mode, not only when Redis is present: gating it on
+  // Redis would cost Lite proactive quota warming and the check-in ride-along
+  // above that claims the once-per-day WorkBuddy/CodeBuddy credit grant. The
+  // whole sweep chain accepts `RedisClient | undefined` and falls back to the
   // in-process TTL cache and an in-process day marker, so Redis is an
   // optimization here rather than a precondition — which is exactly what
   // Lite is for.
@@ -416,6 +478,14 @@ export async function buildProductionDeps(): Promise<ProductionDeps> {
         providerRegistry: registry,
         resolveCredential: quotaResolveCredential,
         snapshotInvalidator: snapshotService,
+        // Without this the sweep hands each collector the raw stored secret.
+        // For `cline` that means an `sk_...` key reaching the OAuth branch,
+        // which prepends `workos:` and is refused with "please make sure
+        // you're using the latest version of Cline and re-authenticate" — so
+        // every sweep cools a working account with `quota_fetch_failed` while
+        // the same account refreshes fine from the console, which binds the
+        // same marker through `createQuotaRefreshDeps`.
+        markApiKeyCredential: markProviderApiKeyCredential,
         // Below the 60 s interval: a budget longer than the tick guarantees
         // skip/burst under load instead of steady progress.
         passBudgetMs: 45_000,
@@ -436,9 +506,11 @@ export async function buildProductionDeps(): Promise<ProductionDeps> {
   // an account unhealthy — a growth endpoint that 404s is a display miss, not a
   // dispatch failure.
   //
-  // Hourly, not minute-cadenced: each claim is once per account per day, and a
-  // task that ticks every minute would spend its whole budget re-reading the
-  // day marker.
+  // Daily, not hourly: each claim is once per account per day and is
+  // ledger-guarded, so at an hourly cadence 23 of every 24 passes are a full
+  // scan of active accounts plus a ledger read per account that resolves to
+  // nothing. Once a day is the shortest interval where a pass can still find
+  // work, which is the only reason to run at all.
   const buddyTaskDeps = {
     db,
     resolveCredential: quotaResolveCredential,
@@ -449,37 +521,37 @@ export async function buildProductionDeps(): Promise<ProductionDeps> {
   };
   scheduledTasks.register({
     name: "buddy-streak",
-    intervalMs: 60 * 60_000,
+    intervalMs: 24 * 60 * 60_000,
     initialDelayMs: 5 * 60_000,
     run: () => buddyStreakTask(buddyTaskDeps),
   });
   scheduledTasks.register({
     name: "buddy-redeem",
-    intervalMs: 60 * 60_000,
+    intervalMs: 24 * 60 * 60_000,
     initialDelayMs: 8 * 60_000,
     run: () => buddyRedeemTask(buddyTaskDeps),
   });
   scheduledTasks.register({
     name: "buddy-lottery",
-    intervalMs: 60 * 60_000,
+    intervalMs: 24 * 60 * 60_000,
     initialDelayMs: 11 * 60_000,
     run: () => buddyLotteryTask(buddyTaskDeps),
   });
   scheduledTasks.register({
     name: "buddy-travel",
-    intervalMs: 60 * 60_000,
+    intervalMs: 24 * 60 * 60_000,
     initialDelayMs: 14 * 60_000,
     run: () => buddyTravelTask(buddyTaskDeps),
   });
   scheduledTasks.register({
     name: "buddy-adopt",
-    intervalMs: 60 * 60_000,
+    intervalMs: 24 * 60 * 60_000,
     initialDelayMs: 17 * 60_000,
     run: () => buddyAdoptTask(buddyTaskDeps),
   });
   scheduledTasks.register({
     name: "buddy-trial",
-    intervalMs: 6 * 60 * 60_000,
+    intervalMs: 24 * 60 * 60_000,
     initialDelayMs: 20 * 60_000,
     run: () => buddyTrialTask(buddyTaskDeps),
   });
@@ -527,6 +599,7 @@ export async function buildProductionDeps(): Promise<ProductionDeps> {
     poolAgentResolver,
     telemetryBuffer,
     usageFlush,
+    healthEventFlush,
     poolSelector,
     admissionService,
     trustedProxyBoundary: resolveTrustedProxyBoundary(),

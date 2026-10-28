@@ -81,14 +81,30 @@ export function buddyConversationHeaders(
     "x-request-id": messageId,
     "x-root-request-id": conversationRequestId,
     "x-trace-id": traceId,
+    // W3C trace context alongside the B3 set below: the upstream reads both,
+    // and every reference request carries `traceparent`, so sending only the
+    // B3 half leaves a header the channel check expects absent.
+    traceparent: `00-${b3TraceId}-${messageId.slice(0, 16)}-01`,
     "x-b3-traceid": b3TraceId,
     "x-b3-spanid": messageId.slice(0, 16),
     "x-b3-sampled": "1",
   };
-  // Only when the client actually gave one: inventing a conversation id makes
-  // the upstream build a session the caller never had.
-  if (ids.conversationId !== undefined && ids.conversationId.trim().length > 0) {
-    headers["x-conversation-id"] = ids.conversationId.trim();
-  }
+  // Always sent, invented when the caller gave none.
+  //
+  // `x-conversation-id` is mandatory, and a chat request without it is refused
+  // with `400 · 11-128 "request illegal"` — an error that names neither the
+  // header nor the channel, and which reads like a block rather than a missing
+  // field. Isolated against the live API by removing one header at a time:
+  // only `x-conversation-id`, `x-conversation-request-id` and
+  // `x-conversation-message-id` are required; the B3/W3C trace set, the
+  // stainless set, the agent block and the IDE block are all optional.
+  //
+  // Inventing one when the caller has none is still the right default: the id
+  // is per-dispatch here, so a caller with no session is not claiming a session
+  // it never had — and withholding the header only guarantees a refusal.
+  headers["x-conversation-id"] =
+    ids.conversationId !== undefined && ids.conversationId.trim().length > 0
+      ? ids.conversationId.trim()
+      : newMessageId();
   return headers;
 }

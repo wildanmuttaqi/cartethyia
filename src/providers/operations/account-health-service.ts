@@ -1,5 +1,6 @@
+import { healthEventBuffer } from "../../persistence/health-event-flush";
 // Account health: error classification, failure/success recording, recovery and cooldown sweeps.
-import { and, desc, eq, inArray, isNotNull, lte, or, sql } from "drizzle-orm";
+import { and, count, desc, eq, inArray, isNotNull, lte, or, sql } from "drizzle-orm";
 import { affectedRows, pruneExpiredCooldowns } from "../../persistence/dialect";
 import type { CartethyiaDatabase } from "../../persistence/db-handle";
 import { isRecord } from "../../protocol/codecs";
@@ -215,6 +216,20 @@ export interface AccountErrorClassification {
   readonly retryAt: Date | null;
   readonly mutatesAccount: boolean;
   /**
+   * True when this write changed a field the routing snapshot actually reads.
+   *
+   * The snapshot projects `provider_accounts.status` and
+   * `.cooldownUntil` and nothing else (`route-catalog.ts:286-287`), so only a
+   * write that moves one of those has to drop it. Everything else a failure
+   * persists — the failure streak, the error text, the category, a
+   * model-scoped cooldown — is invisible to routing, and invalidating for it
+   * forced the next request to rebuild an 11-SELECT snapshot for no reason.
+   *
+   * That made a failure wave self-sustaining: N failed attempts produced N
+   * invalidations, and every following request paid the full rebuild.
+   */
+  readonly routesVisible: boolean;
+  /**
    * True when `cooldownMs` came from the provider's own statement — a parsed
    * `Retry-After`-family header, or a reset quoted in its message — rather than
    * from one of this module's fallback constants.
@@ -295,9 +310,9 @@ function latestDeadlineMs(...candidates: readonly (number | undefined | null)[])
  * {@link latestDeadlineMs} cannot express *no* deadline — it floors at 0 — and
  * the account-wide write has one state that needs it. With
  * `CARTETHYIA_ACCOUNT_DISABLED_RECOVERY_MS=0` an automatic disable is meant to
- * be terminal again, and the classifier correctly reports `retryAt: null`; the
- * write used to derive the deadline from `Date.now() + cooldownMs` anyway,
- * which stamps *now*. The recovery sweep then treats that elapsed deadline as
+ * be terminal again, and the classifier correctly reports `retryAt: null`.
+ * Deriving the deadline from `Date.now() + cooldownMs` instead stamps *now*.
+ * The recovery sweep then treats that elapsed deadline as
  * an automatic disable awaiting recovery and returns the row to rotation on its
  * next tick — the escape hatch enabled exactly the behavior it documents
  * itself as disabling.
@@ -390,6 +405,11 @@ export function classifyAccountError(
     reason: origin === "upstream" ? rawUpstreamResponse ?? message.slice(0, 160) : explanation,
     retryAt,
     mutatesAccount,
+    // Set below by the caller that knows which columns it wrote, not here:
+    // the same classification feeds both the account-wide path (status +
+    // cooldownUntil — routing-visible) and the model-scoped path (neither —
+    // invisible). Defaulting true keeps existing callers conservative.
+    routesVisible: true,
     providerStated,
     modelUnsupported,
   });
@@ -457,6 +477,16 @@ export function classifyAccountError(
     !priceRefusal &&
     !deploymentInfraError &&
     (statusCode === 402 ||
+      // Qoder answers an exhausted credit balance with
+      // `{"code":"112","message":"{\"pricingUrl\":...}"}` — the body points at
+      // the pricing page, i.e. "buy more", which is a balance verdict, not an
+      // auth one. It fell through to `auth_invalidated` and the console showed
+      // "Re-login required" on an account whose credential was fine, sending
+      // operators to re-authenticate instead of topping up.
+      // Recognising it here keeps it out of `auth_invalidated`; the branch
+      // below scopes the resulting cooldown to the model, because the account
+      // keeps serving its other models.
+      providerCode === "112" ||
       providerCode === "insufficient_quota" ||
       providerCode === "quota_exceeded" ||
       providerCode === "subscription:free-usage-exhausted" ||
@@ -485,11 +515,22 @@ export function classifyAccountError(
       lower.includes("free-usage") ||
       lower.includes("free usage") ||
       lower.includes("exceeded your current quota") ||
+      // Trae answers an exhausted quota with **HTTP 502** and the body `Your
+      // requests have exceeded the quota.` The status is what misled the
+      // classifier: 502 read as a gateway failure, so this fell through to
+      // `server_error` — a 30s cooldown that does not mutate the account, so
+      // the account stayed in rotation and every other model on it kept being
+      // invoked inside a window the provider had already closed. The body is
+      // the verdict; the 502 is incidental. Matched on the phrase, not on the
+      // status, which is why this sits in `quotaSignal` ahead of the 5xx arm.
+      lower.includes("have exceeded the quota") ||
       lower.includes("balance exhausted") ||
       lower.includes("insufficient balance") ||
       lower.includes("out of credits") ||
       lower.includes("credits exhausted") ||
-      lower.includes("spending limit"));
+      lower.includes("spending limit") ||
+      // Same Qoder family reached by body text when the code is not parsed out.
+      (lower.includes("pricingurl") && lower.includes("qoder.com/pricing")));
   // A deterministic content-policy rejection is NOT credential invalidation.
   // CodeBuddy returns HTTP 403 with provider code 11140 ("request illegal",
   // "did not pass the safety review") — refreshing the token cannot change
@@ -507,11 +548,12 @@ export function classifyAccountError(
     options?.providerId !== undefined &&
     BUDDY_PROVIDER_IDS.has(options.providerId.toLowerCase());
   if (policyBlock) {
+    const policyBlockMs = resolveAccountPolicyBlockCooldownMs();
     return result(
       "policy_blocked",
       "cooldown",
-      resolveAccountPolicyBlockCooldownMs(),
-      new Date(Date.now() + resolveAccountPolicyBlockCooldownMs()),
+      policyBlockMs,
+      new Date(Date.now() + policyBlockMs),
       reason("Provider content-policy block"),
       origin === "upstream",
     );
@@ -558,10 +600,10 @@ export function classifyAccountError(
   }
   // A channel rejection (`11128`) is the same shape: the upstream is refusing
   // the caller for this account, not this particular prompt, and it keeps
-  // refusing on every invocation. It used to fall through to `unknown` with
-  // `mutates=false`, so the account stayed in rotation and failed every
-  // request — and since every account failed the same way, the whole pool
-  // looked dead with nothing ever parked.
+  // refusing on every invocation. Classifying it as `unknown` with
+  // `mutates=false` would leave the account in rotation failing every request —
+  // and since every account fails the same way, the whole pool looks dead with
+  // nothing ever parked.
   const channelRejection =
     providerCode === "11128" || lower.includes("unapproved channel");
   const channelBlock =
@@ -569,11 +611,12 @@ export function classifyAccountError(
     options?.providerId !== undefined &&
     BUDDY_PROVIDER_IDS.has(options.providerId.toLowerCase());
   if (channelBlock) {
+    const channelBlockMs = resolveAccountPolicyBlockCooldownMs();
     return result(
       "policy_blocked",
       "cooldown",
-      resolveAccountPolicyBlockCooldownMs(),
-      new Date(Date.now() + resolveAccountPolicyBlockCooldownMs()),
+      channelBlockMs,
+      new Date(Date.now() + channelBlockMs),
       reason("Provider channel rejection"),
       origin === "upstream",
     );
@@ -605,11 +648,33 @@ export function classifyAccountError(
       lower.includes("no access to model") ||
       lower.includes("model_not_supported") ||
       lower.includes("not available in your region"));
+  /**
+   * The upstream accepted the request and put it in a queue behind other
+   * callers — it is busy, not rejecting the caller's credential.
+   *
+   * Qoder answers `403 {"code":"10605","message":"{\"isQueued\":true,
+   * \"modelKey\":\"dfmodel\",\"queueCount\":1395,...}"}`. The 403 is what made
+   * this misclassify: the generic `(401 || 403) && accountEvidence` arm claimed
+   * it as `auth_invalidated`, so a healthy account was parked as "Re-login
+   * required" purely because the provider was busy, and an operator was sent
+   * to re-authenticate a credential that was never rejected.
+   *
+   * Matched on the queue evidence rather than on the bare `10605`, so an
+   * unrelated 403 that happens to share the code is not swept in. The bodies
+   * are nested JSON, so the tell is the key, not a parse of the envelope.
+   */
+  const queuedUpstream =
+    providerCode === "10605" ||
+    lower.includes("isqueued") ||
+    lower.includes("queuecount") ||
+    lower.includes("queuetype") ||
+    (lower.includes("queue") && lower.includes("modelkey"));
   const authSignal =
     !quotaSignal &&
     !policyRejection &&
     !hostedToolFailure &&
     !modelEntitlementFailure &&
+    !queuedUpstream &&
     (providerCode === "authentication_failed" ||
       folded.includes("invalid api key") ||
       folded.includes("incorrect api key") ||
@@ -637,10 +702,11 @@ export function classifyAccountError(
     // rotated a moment ago, an edge answering before the credential loads) and
     // cools down instead.
     //
-    // This distinction is the whole fix. The generic `401`/`403` branch used to
-    // reach `disabled` too, which no sweep recovers, so one transient rejection
-    // removed the account from rotation until an operator noticed — the exact
-    // outcome the comment above says a static token must not suffer.
+    // This distinction is the whole fix. Reaching `disabled` from the generic
+    // `401`/`403` branch would be unrecoverable by any sweep, so one transient
+    // rejection would remove the account from rotation until an operator
+    // noticed — the exact outcome the comment above says a static token must
+    // not suffer.
     const revoked = revocationNamed;
     const recoverable = staticTokenRecovery || oauthRecovery || !revoked;
     // An automatic disable is **not** terminal any more, but the deadline is what
@@ -687,6 +753,31 @@ export function classifyAccountError(
   }
 
   if (quotaSignal) {
+    /**
+     * Qoder's `112` is a verdict on the (account, model) pair, not on the
+     * credential or the balance as a whole.
+     *
+     * The body is `{"code":"112","message":"{\"pricingUrl\":…}"}` — a link to
+     * the pricing page, i.e. "this model is not in your plan". Observed
+     * behaviour agrees: the account keeps serving every other model after the
+     * refusal. Parking the whole account therefore took healthy models down
+     * with the one that is not entitled, which is the same mistake the
+     * `model_unreachable` branch already avoids for Cursor and buddy.
+     */
+    const qoderPlanGated = providerCode === "112";
+    if (qoderPlanGated) {
+      const hits = Math.max(1, Math.floor(options?.modelBlockHits ?? 1));
+      const cooldownMs = unsupportedModelCooldownMs(hits);
+      return result(
+        "model_unreachable",
+        "cooldown",
+        cooldownMs,
+        new Date(Date.now() + cooldownMs),
+        reason("Model not included in this account's plan"),
+        origin === "upstream" && options?.modelId !== undefined,
+        true,
+      );
+    }
     // xAI Grok Build's free tier resets on a rolling window. Use a duration
     // stated by the provider when present; otherwise park for the conservative
     // 24-hour fallback.
@@ -748,6 +839,7 @@ export function classifyAccountError(
     statusCode === 503 ||
     statusCode === 529 ||
     providerCode === "model_capacity" ||
+    queuedUpstream ||
     lower.includes("model overloaded") ||
     lower.includes("capacity exceeded") ||
     lower.includes("temporarily unavailable");
@@ -838,13 +930,14 @@ export function classifyAccountError(
     // scoped to the account (an edge/WAF challenge answered to one account's
     // requests while its siblings on the same egress served fine) must cool
     // that account down, or it stays `active` and is re-dialled for as long as
-    // the block lasts. Provider-scoped 5xx keeps the old behavior: the upstream
-    // is indiscriminately failing and no single account is at fault.
+    // the block lasts. Provider-scoped 5xx does not: the upstream is
+    // indiscriminately failing and no single account is at fault.
+    const transientMs = TRANSIENT_ERROR_COOLDOWN_MS();
     return result(
       lower.includes("timeout") ? "timeout" : "server_error",
       "cooldown",
-      TRANSIENT_ERROR_COOLDOWN_MS(),
-      new Date(Date.now() + TRANSIENT_ERROR_COOLDOWN_MS()),
+      transientMs,
+      new Date(Date.now() + transientMs),
       reason(`Provider ${statusCode ?? "network"} failure`),
       canMutate,
     );
@@ -852,11 +945,12 @@ export function classifyAccountError(
 
   // Same reasoning as above, with the shortest backoff: an unmapped failure
   // must still be retried automatically rather than parked forever.
+  const unclassifiedMs = UNCLASSIFIED_COOLDOWN_MS();
   return result(
     "unknown",
     "cooldown",
-    UNCLASSIFIED_COOLDOWN_MS(),
-    new Date(Date.now() + UNCLASSIFIED_COOLDOWN_MS()),
+    unclassifiedMs,
+    new Date(Date.now() + unclassifiedMs),
     reason("Unclassified provider failure"),
     false,
   );
@@ -997,8 +1091,8 @@ export async function recordAccountFailure(
           lastErrorAt: now,
         })
         .where(eq(providerAccounts.id, accountId));
-      if (!alreadyCooling && typeof client.insert === "function") {
-        await client.insert(healthEvents).values({
+      if (!alreadyCooling) {
+        await writeHealthEvent(client, {
           entityKind: "account",
           accountId,
           // The account's own status, on both sides: a model-scoped throttle
@@ -1015,7 +1109,10 @@ export async function recordAccountFailure(
           createdAt: now,
         });
       }
-      return classification;
+      // `status` and `cooldownUntil` are untouched on this path — only the
+      // (account, model) pair backed off — so the snapshot is still accurate
+      // and must not be dropped.
+      return { ...classification, routesVisible: false };
     }
 
     await client
@@ -1042,8 +1139,8 @@ export async function recordAccountFailure(
       })
       .where(eq(providerAccounts.id, accountId));
 
-    if (typeof client.insert === "function") {
-      await client.insert(healthEvents).values({
+    {
+      await writeHealthEvent(client, {
         entityKind: "account",
         accountId,
         fromStatus: fromStatus as "active" | "cooldown" | "disabled",
@@ -1054,7 +1151,9 @@ export async function recordAccountFailure(
         createdAt: now,
       });
     }
-    return classification;
+    // This path wrote `status` and `cooldownUntil`, both of which the snapshot
+    // projects, so routing has to see it.
+    return { ...classification, routesVisible: true };
   };
 
   try {
@@ -1176,8 +1275,8 @@ export async function recoverAccount(
         lastErrorAt: null,
       })
       .where(eq(providerAccounts.id, accountId));
-    if (typeof client.insert === "function") {
-      await client.insert(healthEvents).values({
+    {
+      await writeHealthEvent(client, {
         entityKind: "account",
         accountId,
         fromStatus: fromStatus as "active" | "cooldown" | "disabled",
@@ -1218,8 +1317,8 @@ export async function sweepExpiredCooldowns(db: CartethyiaDatabase): Promise<num
             isNotNull(providerAccounts.cooldownUntil),
             lte(providerAccounts.cooldownUntil, now),
           ),
-          // An **automatic** disable, which used to be terminal. Selected only
-          // when it carries a deadline: an operator's disable leaves
+          // An **automatic** disable. Selected only when it carries a deadline:
+          // an operator's disable leaves
           // `cooldownUntil` null, so a human's decision still outranks the
           // machine and is never swept away. The deadline is written by the two
           // paths that disable on evidence — the classifier's revocation branch
@@ -1277,9 +1376,9 @@ export async function sweepExpiredCooldowns(db: CartethyiaDatabase): Promise<num
     // its locks for the whole pass. Recomputing the object in SQL does the same
     // work in one statement.
     //
-    // `jsonb_typeof(...) = 'object'` guards the shape the same way the old
-    // `typeof raw !== "object"` check did: a malformed value must not abort the
-    // whole sweep. `IS DISTINCT FROM` keeps the update from rewriting rows it
+    // `jsonb_typeof(...) = 'object'` guards the shape: a malformed value must
+    // not abort the whole sweep. `IS DISTINCT FROM` keeps the update from
+    // rewriting rows it
     // did not change, so the returned row count is the number of accounts whose
     // cooldown set actually shrank — the same thing the loop counted.
     const pruning = pruneExpiredCooldowns(sql`${providerAccounts.modelCooldowns}`, sql`${nowIso}`);
@@ -1314,6 +1413,36 @@ export interface AttemptHealthReport {
   readonly snapshotService?: { invalidate(): unknown };
 }
 
+/**
+ * Writes one health audit row, off the request path when a buffer is installed.
+ *
+ * `health_events` is append-only and read by nobody in the request path, so it
+ * does not need to land before the request finishes — unlike the
+ * `provider_accounts` UPDATE beside it, which routing reads and which therefore
+ * stays synchronous and transactional.
+ */
+async function writeHealthEvent(
+  client: CartethyiaDatabase,
+  row: {
+    readonly entityKind: "account";
+    readonly accountId: string;
+    readonly fromStatus: string;
+    readonly toStatus: string;
+    readonly reason: string;
+    readonly errorCategory: string | null;
+    readonly modelId?: string | null;
+    readonly createdAt: Date;
+  },
+): Promise<void> {
+  const buffer = healthEventBuffer();
+  if (buffer !== undefined) {
+    buffer.enqueue({ ...row, modelId: row.modelId ?? null });
+    return;
+  }
+  if (typeof client.insert !== "function") return;
+  await client.insert(healthEvents).values(row as never);
+}
+
 export async function reportAttemptOutcome(
   db: CartethyiaDatabase,
   report: AttemptHealthReport,
@@ -1328,7 +1457,12 @@ export async function reportAttemptOutcome(
     ...report.evidence,
     ...(report.modelId === undefined ? {} : { modelId: report.modelId }),
   }).catch(() => null);
-  if (classification?.mutatesAccount) await report.snapshotService?.invalidate();
+  // Gated on `routesVisible`, not on `mutatesAccount`: a failure that only
+  // cooled one (account, model) pair, or only advanced the streak, changed
+  // nothing routing reads. Invalidating for those rebuilt an 11-SELECT snapshot
+  // on the next request, and under a failure wave each rebuild fed the next
+  // invalidation.
+  if (classification?.routesVisible) await report.snapshotService?.invalidate();
 }
 
 export async function listAccountHealthEvents(
@@ -1357,4 +1491,38 @@ export async function listAccountHealthEvents(
   } catch {
     return [];
   }
+}
+
+/** Every stored row across accounts and pools — the size the purge offers to delete. */
+export async function countAllHealthEvents(db: CartethyiaDatabase): Promise<number> {
+  try {
+    const rows = await db.select({ total: count() }).from(healthEvents);
+    return rows[0]?.total ?? 0;
+  } catch {
+    return 0;
+  }
+}
+
+/**
+ * Deletes stored health & error rows.
+ *
+ * Unlike the read above, a failed delete surfaces: an operator who purged
+ * believes the trail is gone, so "it failed" must not read as "it succeeded
+ * with zero rows". Callers own the flush-buffer barrier (`drain`) so a queued
+ * write cannot land after these rows are gone.
+ */
+export async function deleteAccountHealthEvents(
+  db: CartethyiaDatabase,
+  accountId: string,
+): Promise<number> {
+  const rows = await db
+    .delete(healthEvents)
+    .where(and(eq(healthEvents.entityKind, "account"), eq(healthEvents.accountId, accountId)))
+    .returning({ id: healthEvents.id });
+  return rows.length;
+}
+
+export async function deleteAllHealthEvents(db: CartethyiaDatabase): Promise<number> {
+  const rows = await db.delete(healthEvents).returning({ id: healthEvents.id });
+  return rows.length;
 }

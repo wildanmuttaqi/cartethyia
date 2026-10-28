@@ -15,7 +15,11 @@ import { messagesAdapter } from "../surface/messages/adapter";
 import { completionAdapter } from "../surface/completion";
 import { forwardedRequestHeaders, proxySuccessHeaders, buildUpstreamDispatchContext, reportedModelFrom } from "./upstream";
 import { resolvePromptCacheKey } from "../../providers/operations/session-resolution";
-import { applyTenantPreferences } from "../request/tenant-preferences";
+import {
+  applyTenantPreferences,
+  applyTenantDeadlineOverride,
+  resolveTenantImageClampMaxBytes,
+} from "../request/tenant-preferences";
 import { metrics } from "../../observability/metrics";
 import type { NetworkPoolSelector } from "../../network/pool/selector";
 import type { TelemetryBatchBuffer } from "../../observability/telemetry-buffer";
@@ -28,12 +32,16 @@ import {
   completionContext,
   estimatedUsage,
   parseCapturedBody,
-  shouldCaptureProviderBody,
+  providerCaptureMaxBytes,
+  resolveCaptureDepthForRequest,
+  shouldCaptureProviderBodyForRequest,
   terminalFailure,
 } from "./attempt-finalize";
 import { runAttemptLoop } from "./attempt-loop";
 import { projectForRoute, routeCapabilitiesFor } from "../translation/capabilities";
 import { dispatchStreamingAttempt } from "./streaming/stream";
+import type { ProviderContinuationScope } from "../../providers/provider-contracts";
+import type { PreparedProxyRequest } from "../request/preparer";
 
 export interface ProviderProxyHandlerDeps {
   readonly db: CartethyiaDatabase;
@@ -50,6 +58,24 @@ export interface ProviderProxyHandlerDeps {
   readonly telemetryBuffer?: TelemetryBatchBuffer;
   readonly resolveOAuthRefresher?: (providerId: string) => Promise<OAuthTokenRefresher | undefined>;
   readonly oauthRefreshService?: OAuthRefreshService;
+}
+
+/**
+ * The continuation scope one dispatch carries.
+ *
+ * Present only for a route that has an account: a provider session held across
+ * requests is authorized by tenant + API key + provider + account, and a route
+ * with no account cannot be scoped — so it must not hold a session open at all.
+ */
+function continuationScopeFor(prepared: PreparedProxyRequest): ProviderContinuationScope | undefined {
+  const accountId = prepared.candidate.provider_account_id;
+  if (accountId === undefined) return undefined;
+  return {
+    tenantId: prepared.authorization.tenantId,
+    apiKeyId: prepared.authorization.id,
+    providerId: prepared.candidate.provider_id,
+    providerAccountId: accountId,
+  };
 }
 
 /**
@@ -106,6 +132,22 @@ export async function handleProviderProxyRequest(
   if (!prepared)
     throw new GatewayError("admission_unavailable", 503, "The request was not prepared, so no route can be dialed. Resend the request.");
   const canonicalRequest = await applyTenantPreferences(prepared, deps.db);
+  // Per-tenant timeout, applied as soon as the tenant is known. The deadline
+  // was armed at admission with the deployment default; this re-arms it.
+  await applyTenantDeadlineOverride(
+    prepared.authorization.snapshot.tenant_id,
+    deps.db,
+    (ms) => state.extendDeadline(ms),
+  );
+  // Memoized on the request: the ceiling is a tenant setting, so it cannot
+  // change between failover attempts, and each wire encoder that clamps an
+  // image reads it from here instead of paying for a preference read per
+  // attempt.
+  const imageClampMaxBytes = await resolveTenantImageClampMaxBytes(
+    deps.db,
+    prepared.authorization.snapshot.tenant_id,
+  );
+  if (imageClampMaxBytes !== undefined) state.imageClampMaxBytes = imageClampMaxBytes;
   const candidates =
     prepared.eligibleRouteCandidates.length > 0 ? prepared.eligibleRouteCandidates : [prepared.candidate];
   const attemptCandidates = candidates;
@@ -127,6 +169,9 @@ export async function handleProviderProxyRequest(
       estimatedInputTokens: prepared.estimatedInputTokens,
       estimatedOutputTokens: prepared.estimatedOutputTokens,
       authorizationSnapshot: prepared.authorization.snapshot,
+      // A continuation borrows the held Cursor Run: one upstream turn must not
+      // occupy two account/pool concurrency slots.
+      ...(prepared.continuationAffinity === undefined ? {} : { borrowsHeldSession: true }),
     },
     candidates: attemptCandidates,
     tenantId: prepared.authorization.tenantId,
@@ -175,6 +220,8 @@ export async function handleProviderProxyRequest(
       const lease = context.leases.lease;
       const reservation = context.leases.reservation;
       const proxySlot = context.leases.proxySlot;
+      const leaseOwnership = context.leases.ownership;
+      const continuationScope = continuationScopeFor(prepared);
       const providerRouteCandidate = {
         provider_id: candidate.provider_id,
         model_id: candidate.model_id,
@@ -199,6 +246,9 @@ export async function handleProviderProxyRequest(
         headers: inboundHeaders,
         requestId: state.requestId,
         requestIdentity: state,
+        ...(state.imageClampMaxBytes === undefined
+          ? {}
+          : { imageClampMaxBytes: state.imageClampMaxBytes }),
         ...(conversationAffinity ? { conversationAffinity } : {}),
         ...(candidate.user_agent === undefined ? {} : { userAgent: candidate.user_agent }),
         ...(deps.networkBindingFactory
@@ -209,13 +259,42 @@ export async function handleProviderProxyRequest(
                   prepared.authorization.snapshot.tenant_id,
                 ),
                 providerCapture,
-                await shouldCaptureProviderBody(deps.db, prepared.authorization.snapshot.tenant_id),
+                await shouldCaptureProviderBodyForRequest(
+                  deps.db,
+                  prepared.authorization.snapshot.tenant_id,
+                  state,
+                ),
+                providerCaptureMaxBytes(
+                  await resolveCaptureDepthForRequest(
+                    deps.db,
+                    prepared.authorization.snapshot.tenant_id,
+                    state,
+                  ),
+                ),
+              ),
+            }
+          : {}),
+        ...(deps.networkBindingFactory
+          ? {
+              outboundAttachmentFetch: deps.networkBindingFactory.fetch(
+                networkPoolId,
+                prepared.authorization.snapshot.tenant_id,
               ),
             }
           : {}),
         ...(deps.networkBindingFactory
           ? { outboundWebSocket: deps.networkBindingFactory.webSocket(networkPoolId, prepared.authorization.snapshot.tenant_id) }
           : {}),
+        ...(deps.networkBindingFactory
+          ? {
+              outboundHttp2: deps.networkBindingFactory.http2Bidi(
+                networkPoolId,
+                prepared.authorization.snapshot.tenant_id,
+              ),
+            }
+          : {}),
+        ...(leaseOwnership === undefined ? {} : { leaseOwnership }),
+        ...(continuationScope === undefined ? {} : { continuationScope }),
       });
       if (dispatchRequest.stream) {
         return dispatchStreamingAttempt({
@@ -237,6 +316,8 @@ export async function handleProviderProxyRequest(
           providerCapture,
           retainLeases: context.retainLeases,
           ttfbFields,
+          ...(leaseOwnership === undefined ? {} : { leaseOwnership }),
+          ...(continuationScope === undefined ? {} : { continuationScope }),
         });
       }
       // Pool slot ownership belongs to the candidate attempt: the slot was
@@ -269,6 +350,11 @@ export async function handleProviderProxyRequest(
       if (terminal === undefined) throw terminalFailure(undefined);
       const terminalError = terminalFailure(terminal);
       if (terminalError !== undefined) throw terminalError;
+      // An interim `tool_use` terminal defers usage: the provider's turn is not
+      // over, so its authoritative usage arrives with the *next* request that
+      // continues the same upstream turn. Charging an estimate here would bill
+      // the turn twice — the estimate now and the real usage later.
+      const deferredUsage = terminal.usage_deferred === true;
       const usage =
         terminal.usage ??
         estimatedUsage(prepared.estimatedInputTokens, prepared.estimatedOutputTokens);
@@ -316,7 +402,10 @@ export async function handleProviderProxyRequest(
           return reported === undefined ? {} : { reportedModel: reported };
         })(),
         usage: pricedUsage,
-        commitUsage: pricedUsage,
+        // Deferred: the request consumed upstream resources (it is mid-turn), so
+        // the *recorded* usage stays for the row, but nothing is committed —
+        // the Run's own `turn_ended` commits once, on the final response.
+        ...(deferredUsage ? {} : { commitUsage: pricedUsage }),
         // Decode once: `output.bytes` is a `Uint8Array`, which
         // `parseCapturedBody` returns untouched — the Server panel would store
         // a byte-index map (`{"0":123,…}`) after redaction instead of the

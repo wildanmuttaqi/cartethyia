@@ -1,5 +1,13 @@
 import type { healthStatus } from "../../../src/persistence/schema";
 import type { SessionStatusResponse } from "../../../src/console/auth/session";
+// Remote-support tunnel types come from the backend contract module, which is
+// free of Elysia and Node imports and therefore safe in the browser bundle.
+export type {
+  RemoteSupportStatus,
+  RemoteSupportStartResponse,
+  RemoteSupportTool,
+} from "../../../src/console/remote-support/contracts";
+export { REMOTE_SUPPORT_TOOLS } from "../../../src/console/remote-support/contracts";
 /**
  * Type-only projections of the console API contracts.
  *
@@ -144,6 +152,19 @@ export type {
   RuntimeSettingsResponse,
   UpdateRuntimeSettingsRequest,
 } from "../../../src/console/settings/contracts";
+
+// Derived from the backend rather than mirrored: the bucket ids and the
+// reclaim action names are what the route validates against, so a hand-written
+// copy would drift the first time either side added one.
+export type {
+  DiskUsageBucket,
+  DiskUsageResponse,
+  ReclaimAction,
+  ReclaimResponse,
+  PurgeTarget,
+  PurgeResponse,
+  FlushResponse,
+} from "../../../src/console/data-management/contracts";
 
 export type { RedisBackend } from "../../../src/persistence/redis";
 

@@ -1,8 +1,5 @@
 /**
  * Payload frames are gzipped on write and named `jsonl-file`.
- *
- * A frame written before compression existed is plain JSON named `jsonb-file`,
- * and the baseline accepts both storage names so older rows remain readable.
  */
 import { expect, test } from "bun:test";
 import { mkdtempSync } from "node:fs";
@@ -22,18 +19,25 @@ import {
   type PayloadFileReference,
 } from "../../src/observability/payload-store";
 
-const FRAME_HEADER_BYTES = 4;
-
 function payloadDir(): string {
   const dir = mkdtempSync(join(tmpdir(), "cartethyia-payload-"));
   process.env.CARTETHYIA_TELEMETRY_PAYLOAD_DIR = dir;
   return dir;
 }
 
-/** The stored body of one frame, header excluded. */
+/**
+ * The compressed bytes of one frame, out of its stored line.
+ *
+ * A line is base64 of the gzipped frame plus a newline, so the body is decoded
+ * rather than sliced past a binary length header.
+ */
 async function storedBody(reference: PayloadFileReference): Promise<Buffer> {
   const data = await readFile(join(payloadDirectory(), reference.file));
-  return data.subarray(reference.offset + FRAME_HEADER_BYTES, reference.offset + reference.length);
+  const line = data
+    .subarray(reference.offset, reference.offset + reference.length)
+    .toString("utf8")
+    .trim();
+  return Buffer.from(line, "base64");
 }
 
 test("a written frame is gzipped, smaller than its JSON, and reads back whole", async () => {
@@ -50,37 +54,6 @@ test("a written frame is gzipped, smaller than its JSON, and reads back whole", 
   // bounds the frame rather than the payload alone.
   const decompressed = gunzipSync(stored);
   expect(stored.byteLength).toBeLessThan(decompressed.byteLength / 5);
-  expect(await readPayloadFrame(reference)).toEqual(payload);
-});
-
-test("a frame written as plain JSON before compression still reads back", async () => {
-  const dir = payloadDir();
-  const payload = { request_id: "old-request", request_body: { prompt: "written before gzip" } };
-  const frame = Buffer.from(JSON.stringify({
-    version: 1,
-    id: "frame-1",
-    expiresAt: "2026-01-01T00:15:00.000Z",
-    payload,
-  }), "utf8");
-  const header = Buffer.alloc(FRAME_HEADER_BYTES);
-  header.writeUInt32BE(frame.byteLength, 0);
-  const file = "2026-01-01T00-legacy.jsonb";
-  await Bun.write(join(dir, file), Buffer.concat([header, frame]));
-
-  // The checksum the old writer recorded: FNV-1a over the plain JSON.
-  let hash = 2166136261;
-  for (let index = 0; index < frame.byteLength; index += 1) {
-    hash ^= frame[index]!;
-    hash = Math.imul(hash, 16777619);
-  }
-  const reference: PayloadFileReference = {
-    storage: "jsonb-file",
-    file,
-    offset: 0,
-    length: FRAME_HEADER_BYTES + frame.byteLength,
-    checksum: (hash >>> 0).toString(16).padStart(8, "0"),
-    version: 1,
-  };
   expect(await readPayloadFrame(reference)).toEqual(payload);
 });
 
@@ -102,7 +75,7 @@ test("a compressed frame still inside its window keeps the file", async () => {
   expect(deleted).toBe(0);
 });
 
-test("the baseline accepts old and compressed payload frame rows", async () => {
+test("the baseline accepts jsonl-file payload frame rows", async () => {
   const dir = mkdtempSync(join(tmpdir(), "cartethyia-migrate-"));
   const file = join(dir, "cartethyia.sqlite");
   const sqlite = createSqliteDatabase(file);
@@ -115,12 +88,10 @@ test("the baseline accepts old and compressed payload frame rows", async () => {
         `VALUES ('id-${storage}', 't1', '2026-01-01T00:00:00.000Z', '2026-01-01T00:15:00.000Z', '${storage}', 'f.jsonb', 0, 4, 'abcd', 1)`,
     );
   };
-  insert("jsonb-file");
   insert("jsonl-file");
   expect(() => insert("parquet")).toThrow();
 
-  // Nothing was lost or doubled: the rebuild keeps one row per insert.
   const count = sqlite.prepare("SELECT count(*) AS c FROM telemetry_payloads").get() as { c: number };
-  expect(count.c).toBe(2);
+  expect(count.c).toBe(1);
   sqlite.close();
 });

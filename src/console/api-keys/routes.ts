@@ -6,7 +6,7 @@ import { Elysia, t } from "elysia";
 import { randomBytes, randomUUID } from "node:crypto";
 import { decryptCredentialToString, encryptCredential } from "../../security/crypto";
 import { invalidateApiKeyCache } from "../../security/api-key-auth";
-import { hashShareToken } from "../../persistence/stores/share-store";
+import { generateShareSlug, hashShareToken } from "../../persistence/stores/share-store";
 import type { AccessDecision } from "../../security/access-control";
 import { ConsoleDomainError, errorResponse, requireTenantScope } from "../shared/errors";
 import { literalUnion } from "../shared/elysia-schema";
@@ -247,13 +247,13 @@ export function createApiKeyOperations(config: ApiKeyConfig) {
         ...(isDefaultGatewayApiKey(current) ? { isDefault: true } : {}),
         ...credentialPatch,
         ...(scopes === undefined ? {} : { scopes }),
-        // Rename. The label was accepted by the body schema and validated, but
-        // never copied into the patch — so "save" silently kept the old name and
-        // the key looked unrenamable. Blank falls back to the existing label
-        // rather than wiping it, since `label` is NOT NULL. The default key is
-        // renameable like any other (c2a93545); gating on `isDefault` dropped
-        // exactly the one patch that changes a name, and left the store with an
-        // empty `set(...)` that threw.
+        // Rename. The label must be copied into the patch explicitly — it is
+        // accepted and validated by the body schema but is not the credential,
+        // so omitting it here leaves the name unchanged. Blank falls back to the
+        // existing label rather than wiping it, since `label` is NOT NULL. The
+        // default key is renameable like any other (c2a93545); gating on
+        // `isDefault` would drop exactly the one patch that changes a name and
+        // leave the store with an empty `set(...)` that throws.
         ...(patchRequest.label === undefined
           ? {}
           : { label: patchRequest.label.trim() === "" ? current.label : patchRequest.label.trim() }),
@@ -329,7 +329,7 @@ export function createApiKeyOperations(config: ApiKeyConfig) {
         tightened(patchRequest.maxConcurrentRequests, current.maxConcurrentRequests);
       if (limitsChanged) {
         // Drop stale admission counters so a newly lowered one-time/recurring
-        // budget cannot be bypassed by a counter seeded under the old limit.
+        // budget cannot be bypassed by a counter seeded under the looser limit.
         // Share children admit under the parent id, so purge the parent too.
         await Promise.all([
           config.admissionService.purgeKey(keyId),
@@ -340,7 +340,8 @@ export function createApiKeyOperations(config: ApiKeyConfig) {
       // current bucket must not hand it a full fresh budget: seed the counter
       // from the spend already recorded, so the limit covers the whole bucket.
       // Only a *newly added* ceiling needs this — a lowered one was just
-      // purged above, and re-seeding there would restore the old baseline.
+      // purged above, and re-seeding there would restore the baseline the purge
+      // removed.
       const dailyAdded = isNewLimit(patchRequest.dailyTokenLimit, current.dailyTokenLimit);
       const monthlyAdded = isNewLimit(patchRequest.monthlyTokenLimit, current.monthlyTokenLimit);
       if ((dailyAdded || monthlyAdded) && config.bucketSpend && config.admissionService.seedBuckets) {
@@ -366,7 +367,7 @@ export function createApiKeyOperations(config: ApiKeyConfig) {
     async revokeKey(access: AccessDecision | undefined, keyId: string): Promise<{ success: true }> {
       const authorized = requireTenantScope(access, "dashboard:write");
       const target = await config.store.get(authorized.tenantId, keyId);
-      if (!target || target.revokedAt !== undefined)
+      if (!target)
         throw new ConsoleDomainError("key_not_found", 404, "Key not found");
       // The gateway routes every request off this key and the CLI reads it for
       // the CLI, so removing it would strand the installation with no way to
@@ -377,9 +378,9 @@ export function createApiKeyOperations(config: ApiKeyConfig) {
           409,
           "The default gateway API key cannot be deleted. Rotate it instead.",
         );
-      const revoked = await config.store.revoke(authorized.tenantId, keyId, new Date());
-      if (!revoked) throw new ConsoleDomainError("key_not_found", 404, "Key not found");
       const children = await config.store.listChildren(authorized.tenantId, keyId);
+      const removed = await config.store.remove(authorized.tenantId, keyId);
+      if (!removed) throw new ConsoleDomainError("key_not_found", 404, "Key not found");
       invalidateApiKeyCache(keyId);
       for (const child of children) invalidateApiKeyCache(child.id);
       await Promise.all([
@@ -457,6 +458,7 @@ export function createApiKeyOperations(config: ApiKeyConfig) {
         apiKeyId: keyId,
         tokenHash: hashShareToken(token),
         tokenEncrypted: encryptCredential(token),
+        slug: generateShareSlug(),
         kind,
         expiresAt,
         rotate: options.regenerate === true,
@@ -499,19 +501,27 @@ export function createApiKeyOperations(config: ApiKeyConfig) {
           "Only a top-level key can carry a handoff link",
         );
       const link = await shareStore.findTokenForApiKey(keyId);
-      if (link === null || link.tokenEncrypted === null) return null;
-      let token: string;
-      try {
-        token = decryptCredentialToString(link.tokenEncrypted);
-      } catch {
-        // A row written under a different key cannot be shown; the operator
-        // regenerates to establish a fresh link.
-        return null;
+      if (link === null) return null;
+      let token: string | null = null;
+      if (link.tokenEncrypted !== null) {
+        try {
+          token = decryptCredentialToString(link.tokenEncrypted);
+        } catch {
+          // A row written under a different encryption key cannot be shown.
+          // The page itself survives: the slug is held in the clear, so the
+          // address stays valid and the operator only loses the bearer half.
+          token = null;
+        }
       }
+      // Nothing to point at: neither the address nor the secret survived.
+      if (token === null && link.slug === null) return null;
       const origin = (options.origin ?? "").replace(/\/$/, "");
       return {
         id: link.id,
-        url: `${origin}/share/${token}`,
+        // The slug is the address; the token is the bearer half. Preferring the
+        // slug keeps a restored page reachable under the same URL even when the
+        // encryption key that sealed its token is gone.
+        url: `${origin}/share/${link.slug ?? token}`,
         token,
         kind: link.kind,
         expiresAt: link.expiresAt === null ? null : link.expiresAt.toISOString(),
@@ -560,6 +570,7 @@ export function createApiKeyOperations(config: ApiKeyConfig) {
           apiKeyId: keyId,
           tokenHash: hashShareToken(token),
           tokenEncrypted: encryptCredential(token),
+          slug: generateShareSlug(),
           kind: "handoff",
           expiresAt: null,
           rotate: true,

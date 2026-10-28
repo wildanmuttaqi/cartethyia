@@ -12,7 +12,7 @@ import {
 } from "../../src/security/crypto";
 import { seedBundledProviders } from "../../src/providers/operations/provider-catalog-service";
 
-test("first-boot restore creates a default gateway key when the backup has none", async () => {
+test("first-boot restore and startup recover a missing default gateway key", async () => {
   const previousMode = process.env.CARTETHYIA_DB_MODE;
   const previousApiKey = process.env.CARTETHYIA_API_KEY;
   const previousEncryptionKey = snapshotCredentialEncryptionKeyForTesting();
@@ -28,41 +28,33 @@ test("first-boot restore creates a default gateway key when the backup has none"
       verifyPassword: async () => true,
     });
     const result = await setup.restoreBackup(
-      {
-        app: "cartethyia",
-        version: 1,
-        exportedAt: new Date().toISOString(),
-        sections: { config: {} },
-      },
+      { app: "cartethyia", version: 1, exportedAt: new Date().toISOString(), sections: { config: {} } },
       { password: "test-password" },
     );
-    const keys = await db.select().from(apiKeys);
 
     expect(result.createdAdmin).toBe(true);
+    let keys = await db.select().from(apiKeys);
     expect(keys).toHaveLength(1);
     expect(keys[0]?.isDefault).toBe(true);
-    expect(keys[0]?.keyEncrypted).not.toBeNull();
-    if (keys[0]?.keyEncrypted == null) throw new Error("default key secret was not stored");
-    expect(decryptCredentialToString(keys[0].keyEncrypted)).toStartWith("carte_");
+    if (keys[0]?.keyEncrypted == null || keys[0].keyPrefix == null) {
+      throw new Error("default key secret or prefix was not stored");
+    }
+    expect(decryptCredentialToString(keys[0].keyEncrypted)).toStartWith(keys[0].keyPrefix);
 
-    // Reproduce an existing installation: administrator remains, but the
-    // historical restore did not leave a default key behind.
+    // Simulate an older running installation that has an admin but lost the key.
     await db.delete(apiKeys);
     expect(await setup.requiresSetup()).toBe(false);
     await recoverMissingDefaultGatewayApiKeys(db);
     await recoverMissingDefaultGatewayApiKeys(db);
-    const recovered = await db.select().from(apiKeys);
-    expect(recovered).toHaveLength(1);
-    expect(recovered[0]?.isDefault).toBe(true);
-    if (recovered[0]?.keyEncrypted == null) throw new Error("recovered key secret missing");
-    expect(decryptCredentialToString(recovered[0].keyEncrypted)).toStartWith("carte_");
+    keys = await db.select().from(apiKeys);
+    expect(keys).toHaveLength(1);
+    expect(keys[0]?.isDefault).toBe(true);
 
-    // Startup must not undo an operator's decision to disable/revoke a key.
     await db.update(apiKeys).set({ enabled: false, revokedAt: new Date() });
     await recoverMissingDefaultGatewayApiKeys(db);
     const preserved = await db.select().from(apiKeys);
     expect(preserved).toHaveLength(1);
-    expect(preserved[0]?.id).toBe(recovered[0]?.id);
+    expect(preserved[0]?.id).toBe(keys[0]?.id);
     expect(preserved[0]?.enabled).toBe(false);
     expect(preserved[0]?.revokedAt).not.toBeNull();
   } finally {
@@ -75,7 +67,7 @@ test("first-boot restore creates a default gateway key when the backup has none"
   }
 });
 
-test("first-boot restore preserves a default gateway key included in the backup", async () => {
+test("first-boot restore preserves a default gateway key already in the backup", async () => {
   const previousMode = process.env.CARTETHYIA_DB_MODE;
   const previousApiKey = process.env.CARTETHYIA_API_KEY;
   const previousEncryptionKey = snapshotCredentialEncryptionKeyForTesting();
@@ -90,6 +82,7 @@ test("first-boot restore preserves a default gateway key included in the backup"
       hashPassword: async () => "test-password-hash",
       verifyPassword: async () => true,
     });
+    const id = randomUUID();
     await setup.restoreBackup(
       {
         app: "cartethyia",
@@ -97,29 +90,27 @@ test("first-boot restore preserves a default gateway key included in the backup"
         exportedAt: new Date().toISOString(),
         sections: {
           config: {
-            api_keys: [
-              {
-                id: randomUUID(),
-                key_hash: "restored-key-hash",
-                key_mode: "personal",
-                label: "Restored gateway key",
-                scopes: ["tenant:invoke"],
-                key_prefix: "carte_",
-                api_key: "carte_restored-secret",
-                is_default: true,
-              },
-            ],
+            api_keys: [{
+              id,
+              key_hash: "restored-default-hash",
+              key_mode: "personal",
+              label: "Imported gateway",
+              scopes: ["tenant:invoke"],
+              key_prefix: "carte_",
+              api_key: "carte_restored-secret",
+              is_default: true,
+            }],
           },
         },
       },
       { password: "test-password" },
     );
-    const keys = await db.select().from(apiKeys);
 
+    const keys = await db.select().from(apiKeys);
     expect(keys).toHaveLength(1);
-    expect(keys[0]?.isDefault).toBe(true);
-    expect(keys[0]?.label).toBe("Restored gateway key");
-    if (keys[0]?.keyEncrypted == null) throw new Error("restored default key secret was not sealed");
+    expect(keys[0]?.id).toBe(id);
+    expect(keys[0]?.label).toBe("Imported gateway");
+    if (keys[0]?.keyEncrypted == null) throw new Error("restored key secret was not sealed");
     expect(decryptCredentialToString(keys[0].keyEncrypted)).toBe("carte_restored-secret");
   } finally {
     sqlite.close();

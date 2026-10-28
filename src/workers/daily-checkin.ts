@@ -120,9 +120,8 @@ export function ledgerKey(dayKey: string, accountId: string): string {
  * With Redis the `SET NX EX` is the cross-process guard (two gateway instances
  * cannot both attempt the same account). Without it the ledger *table* is the
  * guard, and its composite PK makes the insert atomic — so Lite records the
- * attempt it just made instead of silently returning `true`, which is what left
- * the console unable to answer "attempted today" and showing "Check-in due"
- * forever.
+ * attempt it just made instead of silently returning `true`, which leaves the
+ * console unable to answer "attempted today" and shows "Check-in due" forever.
  */
 async function reserveDaySlot(
   db: CartethyiaDatabase | undefined,
@@ -160,8 +159,8 @@ async function reserveDaySlot(
  * Releases today's slot for many accounts in one round-trip.
  *
  * The sweep reserves a slot per account as it walks the wave; releasing them
- * one at a time on the error path turned every failed pass into a Redis RTT per
- * failed account. A pass that budgets out with twenty failures paid twenty
+ * one at a time on the error path turns every failed pass into a Redis RTT per
+ * failed account. A pass that budgets out with twenty failures pays twenty
  * round-trips for bookkeeping that has no bearing on the claim itself.
  *
  * A pipeline is used when Redis is present (one `MULTI/DEL` for the whole
@@ -246,12 +245,74 @@ export async function markCheckinAttempted(args: {
  * The read belongs next to the writes because there are two places the marker
  * can live — the Redis key when Redis is present, the `daily_checkin_ledger`
  * row when it is not — and only this module knows which one its own writes
- * used. A caller that read the Redis key directly answered "not attempted" on
- * every Lite deployment, where the sweep had written the row.
+ * used. A caller that reads the Redis key directly answers "not attempted" on
+ * every Lite deployment, where the sweep writes the row.
  *
  * Absent or unreadable means unknown, never "not claimed": the sweep may
  * simply not have reached the account yet.
  */
+/**
+ * The same question as {@link checkinAttemptedToday}, asked once for many
+ * accounts.
+ *
+ * The console answers it for every account on the page, and doing that one
+ * account at a time cost a round trip per account — one `GET` to Redis, or one
+ * `SELECT` to Postgres — on the route the dashboard polls. This is one `MGET`
+ * when Redis is present, or one `SELECT ... WHERE day_key = ? AND account_id
+ * IN (...)` when it is not, which is the same shape the release path already
+ * uses.
+ *
+ * An account absent from the result was not attempted, matching the single
+ * read's "absent means unknown, never claimed".
+ */
+export async function checkinAttemptedTodayBatch(args: {
+  readonly db: CartethyiaDatabase | undefined;
+  readonly redis: RedisClient | undefined;
+  readonly accountIds: readonly string[];
+  readonly now?: () => Date;
+}): Promise<Map<string, boolean>> {
+  const attempted = new Map<string, boolean>();
+  if (args.accountIds.length === 0) return attempted;
+  const dayKey = checkinDayKey(args.now?.() ?? new Date());
+  // A client without MGET (the memory backend) takes the DB path below, or
+  // reports unknown when there is no DB either.
+  if (args.redis !== undefined && typeof args.redis.mget === "function") {
+    try {
+      // One command for every account: one key per account is small, and a
+      // single `MGET` keeps the cost flat instead of linear in the count.
+      const values = (await args.redis.mget(
+        ...args.accountIds.map((id) => ledgerKey(dayKey, id)),
+      )) as Array<string | null>;
+      args.accountIds.forEach((accountId, index) => {
+        attempted.set(accountId, values[index] != null);
+      });
+      return attempted;
+    } catch {
+      // Fall through: an unreadable ledger means unknown, and the DB path is
+      // the only other place the marker could be.
+    }
+  }
+  if (args.db === undefined) return attempted;
+  try {
+    const rows = await args.db
+      .select({ accountId: dailyCheckinLedger.accountId })
+      .from(dailyCheckinLedger)
+      .where(
+        and(
+          eq(dailyCheckinLedger.dayKey, dayKey),
+          inArray(dailyCheckinLedger.accountId, [...args.accountIds]),
+        ),
+      );
+    const present = new Set(rows.map((row) => row.accountId));
+    for (const accountId of args.accountIds) {
+      attempted.set(accountId, present.has(accountId));
+    }
+  } catch {
+    // Unknown, per account, as above.
+  }
+  return attempted;
+}
+
 export async function checkinAttemptedToday(args: {
   readonly db: CartethyiaDatabase | undefined;
   readonly redis: RedisClient | undefined;
@@ -293,9 +354,9 @@ export function supportsDailyCheckin(providerId: string): boolean {
  * Wraps a proxy-bound fetcher so a 403 falls back to a direct connection once.
  *
  * A proxy that answers 403 (auth, expired pool credential, a provider that
- * rejects the egress) used to fail the whole claim even though the account's
- * own credential was fine — the proxy was the only thing wrong. One direct
- * retry costs nothing when the proxy was healthy (the first attempt already
+ * rejects the egress) would fail the whole claim even though the account's own
+ * credential was fine — the proxy is the only thing wrong. One direct retry
+ * costs nothing when the proxy was healthy (the first attempt already
  * succeeded) and rescues the claim when it was not.
  *
  * The fallback only fires on 403, not on every error: a 401 means the account
@@ -313,15 +374,10 @@ export function withDirectFallback(fetcher: typeof fetch): typeof fetch {
   return wrapped;
 }
 /**
- * The outcome of one daily check-in pass: the claim alone.
- *
- * The growth-activity report is no longer part of this pass — it moved to its
- * own once-a-day growth task (`buddy-activity-report`) with its own ledger, so
-/**
- * Runs the full daily growth pass for one account, once per calendar day: the
- * check-in claim alone. The growth-activity report moved to its own once-a-day
- * growth task (`buddy-activity-report`) with its own ledger, so it is not
- * re-POSTed on every sweep. See `buddy-growth-tasks.ts`.
+ * The outcome of one daily check-in pass: the claim alone. The
+ * growth-activity report runs as its own once-a-day growth task
+ * (`buddy-activity-report`) with its own ledger, so it is not re-POSTed on
+ * every sweep. See `buddy-growth-tasks.ts`.
  */
 export type DailyGrowthPassResult = {
   readonly checkin: DailyCheckinResult;
@@ -386,10 +442,10 @@ export async function attemptDailyGrowthPass(args: {
 
   // Only a transient `error` releases the slot so a later pass today can retry
   // (network, 5xx). `unavailable` is the status probe answering that no
-  // activity is running — retrying that every pass spent the account's daily
-  // slot on a door the provider had closed, and releasing the marker was also
-  // what erased the evidence that anything had been attempted: the console then
-  // read "Check-in due" forever while the sweep retried once a minute.
+  // activity is running — retrying that every pass spends the account's daily
+  // slot on a door the provider has closed, and releasing the marker also
+  // erases the evidence that anything was attempted: the console then reads
+  // "Check-in due" forever while the sweep retries once a minute.
   // `already_claimed`, `not_eligible`, and `event_ended` are terminal for the
   // day and keep the slot.
   return { checkin };

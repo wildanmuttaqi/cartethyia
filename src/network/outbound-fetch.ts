@@ -35,6 +35,57 @@ function agentForTarget(
 }
 
 /**
+ * Keep-alive options for the direct (non-pool) egress agents.
+ *
+ * Matched to `network/pool/agent.ts`, which builds pool agents from
+ * `resolveProxyMaxSockets()` / `resolveProxyMaxFreeSockets()` and
+ * `PROXY_KEEP_ALIVE_TIMEOUT_MS`. Direct egress has no per-pool config to
+ * read, so it uses the documented defaults those resolvers return.
+ */
+const DIRECT_AGENT_OPTIONS = {
+  keepAlive: true,
+  maxSockets: 100,
+  maxFreeSockets: 20,
+  timeout: 60_000,
+} as const;
+
+/**
+ * An agent whose socket key includes the SSRF-validated address.
+ *
+ * The direct (non-pool) path pins egress by passing a `lookup` that returns the
+ * one validated address, but `Agent#getName` — the keep-alive socket key —
+ * hashes only host/port/localAddress/family. Two requests to the same
+ * `host:port` that validated to *different* addresses therefore share a pooled
+ * socket, and the second one silently egresses to the first one's address:
+ * the pin is bypassed without any error surfacing.
+ *
+ * Including the address in the key makes each validated address its own socket
+ * bucket, so a re-resolved address always dials fresh while the *same* address
+ * still reuses its socket (keep-alive is preserved, not defeated).
+ *
+ * This is a real gap, not a theoretical one: with no agent at all the request
+ * falls back to the global agent, which has the same key shape *and* is shared
+ * with unrelated traffic.
+ */
+class PinnedAddressAgent extends HttpAgent {
+  override getName(options: Record<string, unknown> = {}): string {
+    const base = super.getName(options as never);
+    const pinned = (options["lookup"] as { pinnedAddress?: string } | undefined)?.pinnedAddress;
+    return `${base}:${pinned ?? "-"}`;
+  }
+}
+class PinnedAddressHttpsAgent extends HttpsAgent {
+  override getName(options: Record<string, unknown> = {}): string {
+    const base = super.getName(options as never);
+    const pinned = (options["lookup"] as { pinnedAddress?: string } | undefined)?.pinnedAddress;
+    return `${base}:${pinned ?? "-"}`;
+  }
+}
+
+const DIRECT_HTTP_AGENT = new PinnedAddressAgent(DIRECT_AGENT_OPTIONS);
+const DIRECT_HTTPS_AGENT = new PinnedAddressHttpsAgent(DIRECT_AGENT_OPTIONS);
+
+/**
  * Builds the application-relay request used by hosted relay front doors.
  * These endpoints intentionally do not receive CONNECT: they accept the
  * target origin/path in headers and perform the upstream fetch themselves,
@@ -99,7 +150,8 @@ function decompressBody(
   return { stream: body.pipe(decoder), encoding: undefined };
 }
 
-async function pinnedFetch(  url: URL,
+async function pinnedFetch(
+  url: URL,
   init: RequestInit,
   resolvedAddress: string | undefined,
   agent?: HttpAgent | HttpsAgent,
@@ -126,27 +178,38 @@ async function pinnedFetch(  url: URL,
     outboundHeaders["content-length"] =
       typeof body === "string" ? String(Buffer.byteLength(body, "utf8")) : String(body.byteLength);
   }
-  const lookup = ((
-    _hostname: string,
-    options: { all?: boolean; family?: number } | number,
-    callback: (
-      error: Error | null,
-      address?: string | Array<{ address: string; family: number }>,
-      family?: number,
-    ) => void,
-  ): void => {
-    if (resolvedAddress === undefined) {
-      callback(new Error("no validated address available"));
-      return;
-    }
-    const opts = typeof options === "number" ? { family: options } : options;
-    const family = resolvedAddress.includes(":") ? 6 : 4;
-    if (opts?.all) {
-      callback(null, [{ address: resolvedAddress, family }] as never);
-      return;
-    }
-    callback(null, resolvedAddress, family);
-  }) as unknown as NonNullable<RequestOptions["lookup"]>;
+  const lookup = Object.assign(
+    (
+      _hostname: string,
+      options: { all?: boolean; family?: number } | number,
+      callback: (
+        error: Error | null,
+        address?: string | Array<{ address: string; family: number }>,
+        family?: number,
+      ) => void,
+    ): void => {
+      if (resolvedAddress === undefined) {
+        callback(new Error("no validated address available"));
+        return;
+      }
+      const opts = typeof options === "number" ? { family: options } : options;
+      const family = resolvedAddress.includes(":") ? 6 : 4;
+      if (opts?.all) {
+        callback(null, [{ address: resolvedAddress, family }] as never);
+        return;
+      }
+      callback(null, resolvedAddress, family);
+    },
+    // Read by `PinnedAddressAgent#getName` so the keep-alive socket key
+    // carries the validated address. See the class comment for why.
+    { pinnedAddress: resolvedAddress },
+  ) as unknown as NonNullable<RequestOptions["lookup"]>;
+  // Direct egress gets a dedicated agent as well as the pinning `lookup`.
+  // Passing only `lookup` left the request on the global agent, whose socket
+  // key ignores `lookup` — so a re-resolved address could reuse a socket
+  // dialed against an earlier one and egress past the SSRF check. The direct
+  // agent keys its sockets on the pinned address, so the pin holds.
+  const directAgent = url.protocol === "https:" ? DIRECT_HTTPS_AGENT : DIRECT_HTTP_AGENT;
   return new Promise<Response>((resolve, reject) => {
     const nodeRequest = request(
       {
@@ -157,7 +220,7 @@ async function pinnedFetch(  url: URL,
         method: init.method ?? "GET",
         headers: outboundHeaders,
         signal: init.signal ?? undefined,
-        ...(agent ? { agent } : { lookup }),
+        ...(agent ? { agent } : { agent: directAgent, lookup }),
         ...(url.protocol === "https:" ? { servername: url.hostname } : {}),
       },
       (response) => {
@@ -230,7 +293,7 @@ export function createValidatedFetch(options: ValidatedFetchOptions = {}): Valid
         // The egress dials the pool/relay, which resolves the target itself.
         // Counting these lets ops confirm how much traffic depends on
         // proxy-resolved DNS rather than the local system resolver.
-        metrics.cartethyia_proxy_dial_dns_fallback_total.inc();
+        metrics.cartethyia_proxy_dial_proxy_resolved_total.inc();
       }
       try {
         if (!poolDialsTarget) {

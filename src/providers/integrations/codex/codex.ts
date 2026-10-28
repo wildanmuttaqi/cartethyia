@@ -31,7 +31,11 @@ import { decodeSseEvents } from "../../../protocol/sse-decoder";
 import { imageCreatedSeconds, imagePrompt, responsesImageResult } from "../../../protocol/image-generation";
 import { isRecord, joinUrl } from "../../../protocol/codecs";
 import { postUpstreamJson } from "../../../protocol/upstream/post-json";
-import { parseUpstreamBackoff, sleep as defaultSleep } from "../../../transport/failure-policy";
+import {
+  MIN_RETRY_BUDGET_MS,
+  parseUpstreamBackoff,
+  sleep as defaultSleep,
+} from "../../../transport/failure-policy";
 
 /**
  * Sleep used by the 429 capacity-wait loop, overridable in tests.
@@ -276,13 +280,6 @@ const CODEX_429_MAX_WAIT_MS = 60_000;
 
 /** Zero-delay 429 guard. Grows from 50ms, doubling per wait. */
 const CODEX_429_MIN_WAIT_MS = 50;
-
-/**
- * The attempt-loop floor: a retry repeats the whole pre-dispatch phase, so it
- * needs at least this much budget left on top of the upstream call itself.
- * Mirrors `MIN_RETRY_BUDGET_MS` in `src/transport/dispatch/attempt-loop.ts`.
- */
-const MIN_RETRY_BUDGET_MS = 15_000;
 
 /** The `x-codex-*` window headers, in seconds or epoch seconds. */
 function codexWindowResetMs(res: Response): number | undefined {
@@ -554,8 +551,8 @@ export function createCodexAdapter(
   const subAgent = config.subagent;
   const installationOverride = config.installation_id_override;
 
-  // Per-session state for sticky routing (x-codex-turn-state / x-models-etag)
-  // and identity reuse. Bounded LRU + TTL: an unbounded map would leak
+  // Per-session state for sticky routing (x-codex-turn-state) and identity
+  // reuse. Bounded LRU + TTL: an unbounded map would leak
   // memory forever under a long-running process serving many distinct
   // Codex sessions.
   const sessionStates = new Map<
@@ -642,16 +639,13 @@ export function createCodexAdapter(
     const state = getSessionState(sessionId);
     if (state === undefined) return;
     let turnState: string | null = null;
-    let modelsEtag: string | null = null;
     if (headers instanceof Headers) {
       turnState = headers.get("x-codex-turn-state");
-      modelsEtag = headers.get("x-models-etag");
     } else if (typeof headers === "object") {
       const rec = headers as Record<string, string>;
       for (const [k, v] of Object.entries(rec)) {
         const lower = k.toLowerCase();
         if (lower === "x-codex-turn-state") turnState = v;
-        if (lower === "x-models-etag") modelsEtag = v;
       }
     }
     if (
@@ -660,9 +654,6 @@ export function createCodexAdapter(
       (state.turnState === undefined || state.turnState.length === 0)
     ) {
       state.turnState = turnState;
-    }
-    if (modelsEtag !== null && modelsEtag.length > 0) {
-      state.modelsEtag = modelsEtag;
     }
   }
 
@@ -703,13 +694,10 @@ export function createCodexAdapter(
           sessionId: identity.session_id,
           threadId: identity.thread_id,
           windowId: identity.window_id,
-          turnId: identity.turn_id,
-          installationId,
           turnMetadataJson,
           betaFeatures: betaRemoteCompaction
             ? "remote_compaction_v2"
             : undefined,
-          routingHint: `model=${body["model"] as string}`,
         }),
       };
       const { res, release } = await postUpstreamJson(
@@ -922,7 +910,6 @@ export function createCodexAdapter(
       let rawWindowId = nonEmpty(request.window_id);
       let rawTurnId = nonEmpty(request.turn_id);
       const rawParentTurnId = nonEmpty(request.parent_turn_id);
-      const rawConversationId = nonEmpty(request.conversation_id);
 
       const installationId = await getInstallationIdCached();
 
@@ -973,9 +960,6 @@ export function createCodexAdapter(
       const turnStartedAtUnixMs = Date.now();
       sessionState.turnStartedAtUnixMs = turnStartedAtUnixMs;
 
-      // If conversation_id not supplied, mirror session_id (reference behavior).
-      const conversationId = rawConversationId ?? effectiveSessionId;
-
       const token =
         context.credential.secret === undefined
           ? undefined
@@ -1001,12 +985,6 @@ export function createCodexAdapter(
       const betaFeatures = betaRemoteCompaction
         ? "remote_compaction_v2"
         : undefined;
-      // `x-codex-routing-hint` mirrors codex-rs (`codexRoutingHint`): the
-      // Codex adapter is OAuth-family only, so the hint is always emitted.
-      const serviceTier = request.generation_controls.service_tier;
-      const routingHint = serviceTier
-        ? `model=${request.model};tier=${serviceTier}`
-        : `model=${request.model}`;
 
       const headers: Record<string, string> = {
         "content-type": "application/json",
@@ -1023,19 +1001,11 @@ export function createCodexAdapter(
           sessionId: effectiveSessionId,
           threadId,
           windowId,
-          turnId,
-          ...(rawParentTurnId === undefined
-            ? {}
-            : { parentTurnId: rawParentTurnId }),
-          conversationId,
-          installationId,
           turnMetadataJson,
           betaFeatures,
           subAgent,
           responsesLite,
           turnState: sessionState.turnState,
-          modelsEtag: sessionState.modelsEtag,
-          routingHint,
         }),
       );
       const outboundFetch = context.outbound_fetch ?? fetchFn;

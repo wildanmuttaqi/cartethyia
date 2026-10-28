@@ -80,8 +80,9 @@ dbDescribe("gateway authentication", () => {
       });
       expect(response.status).toBe(400);
       const body = (await response.json()) as { error: { code: string; message: string } };
+      // Two credentials is a malformed request, not a failed login, so it
+      // stays `invalid_request`. Asserted on the contract, not the wording.
       expect(body.error.code).toBe("invalid_request");
-      // Asserted on the contract, not the wording.
       expect(body.error.message.length).toBeGreaterThan(0);
     });
 
@@ -121,7 +122,18 @@ dbDescribe("gateway authentication", () => {
       // existed. Asserted by comparing the two responses, not by matching the
       // wording — the message is operator-facing prose.
       const body = (await response.json()) as { error: { code: string; message: string } };
-      expect(body.error.code).toBe("invalid_request");
+      // `authentication_failed`, not `invalid_request`: a 401 named for the
+      // shape of the request sent callers hunting a malformed body, when the
+      // body was fine and the credential was the problem.
+      expect(body.error.code).toBe("authentication_failed");
+      // Not "Rotate": the rotate instruction was moved to the public model
+      // surface (`modelsListApiKeyError`), where the seeded default key is what
+      // normally fails. On a proxy request it was actively misleading — a
+      // revoked or mistyped *personal* key was answered with an instruction to
+      // rotate a key the operator was never using. What this path must say is
+      // how to send a working key, which is what it says.
+      expect(body.error.message).not.toContain("Rotate");
+      expect(body.error.message).toContain("Authorization: Bearer");
       // Compared against a key that really was revoked, so the assertion is on
       // the contract ("these two are indistinguishable") rather than on the
       // wording. Uses a throwaway key: revoking the shared world key would

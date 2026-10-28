@@ -15,6 +15,7 @@ import type { CanonicalRequest } from "../../../../protocol/canonical-model";
 import { providerBaseUrl } from "../../../provider-metadata";
 import {
   codebuddyAdapterConfig,
+  codebuddyHeaders,
 } from "./shared";
 import {
   BUDDY_SHARED_RAW,
@@ -109,8 +110,8 @@ export const CODEBUDDY_IMAGE_MODELS: readonly ModelDefinition[] = makeBuddyImage
 /**
  * CodeBuddy's video-generation rows (`seedance-2.5`).
  *
- * Reached through `/v1/videos/generations`, so the endpoint is the upstream
- * video path rather than a chat-completions path.
+ * Reached through `/videos/generations` on the `/v2` base, so the endpoint is
+ * the upstream video path rather than a chat-completions path.
  */
 export const CODEBUDDY_VIDEO_MODELS: readonly ModelDefinition[] = makeBuddyVideoModels(
   "cb",
@@ -162,11 +163,15 @@ export function createCodeBuddyAdapter(fetchImpl?: typeof fetch): ProviderAdapte
       providerId: CODEBUDDY_PROVIDER_ID,
       baseUrl: CODEBUDDY_BASE_URL,
       variant: "IDE",
+      cliIdentity: true,
       prePayload: codeBuddyIntlPrePayload,
       ...(fetchImpl ? { fetchImpl } : {}),
     }),
     {
       variant: "IDE",
+      // BuddyMediaConfig has no `cliIdentity`; the CLI identity is selected by
+      // supplying the builder that takes it.
+      buildHeaders: (context, request) => codebuddyHeaders("IDE", context, request, true),
       systemPrompt: CODEBUDDY_SYSTEM_PROMPT,
       baseUrl: CODEBUDDY_BASE_URL,
       imageGenerationPath: "/images/generations",

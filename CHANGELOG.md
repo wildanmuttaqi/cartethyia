@@ -8,6 +8,1528 @@ current baseline; an existing one applies the numbered files that followed it.
 
 The format follows [Keep a Changelog](https://keepachangelog.com/).
 
+## [2.5.10] - 2026-10-25
+
+### Fixed
+
+- **Trae Agent streams keep complete, isolated tool calls.** An opening tool
+  frame carrying both an id and arguments now emits both instead of dropping
+  the first arguments; the adapter also accepts `chunk.tool_calls`, and its
+  tool-id index is scoped to one stream so a later request cannot inherit an
+  earlier request's call id. Trae's portable Agent requests again carry the
+  donor's `x-ide-token` beside `Authorization: Cloud-IDE-JWT`, and an SSE
+  error with an empty message now reports its upstream numeric code.
+
+  The portable `llm_utils_chat` path remains the supported surface. Native
+  Solo task attribution and Max mode are not implemented. A live
+  `deepseek-v4-pro-0813` check streamed `OK` with usage using a synthetic
+  derived device identity, but returned upstream `4015` with the tested
+  account's original numeric device id; this release does not claim that
+  identity restriction is resolved.
+
+- **Remote Support runs on every host.** The service used to shell out to a
+  Windows-only `.cmd`/`.ps1` launcher pair, and if the npm tarball shipped
+  without them (or on macOS/Linux at all) every Overview card reported
+  "Launcher not found" or "Remote support is currently scripted for Windows
+  hosts only." The launcher pair is deleted; the service now spawns
+  `cloudflared` and `tailscale` directly with `child_process.spawn`,
+  detached from the gateway so a gateway restart cannot kill a live session.
+  State and logs live under the per-user config dir
+  (`<config>/remote-support/<tool>.{pid,url,log,err}`).
+
+- **`.env.example` no longer advertises defaults the gateway contradicts.** The
+  sampled `CARTETHYIA_UPSTREAM_TIMEOUT_MS` was `120000` and the sampled
+  `CARTETHYIA_ACCOUNT_UNCLASSIFIED_COOLDOWN_MS` was `60000`, but `CONFIG_SPEC`
+  shipped them as `75000` and `900000` with rationale comments explaining why
+  the lower / higher value matters (keeping the upstream deadline inside the
+  client's own budget; letting an unknown failure cool off instead of thrashing
+  through retries). An operator who copied `.env.example` wrote a configuration
+  the maintainers had explicitly documented as inferior. Both sample lines now
+  match the spec defaults and carry the one-line rationale inline.
+
+### Changed
+
+- **`compiledBinaryPath()` and the health checks live beside what ships.** The
+  helper the CLI launcher resolves the compiled binary from moved from
+  `scripts/build/compile.ts` into `src/config/package-paths.ts`, and the
+  health-check module moved from `scripts/health.ts` into
+  `scripts/cli/health.ts`. The `files` whitelist is back to its pre-2.5.6
+  shape (`scripts/cli/`, `src/`, `migrations/`, `dist/dashboard/`,
+  `.env.example`, `README.md`) — a shipped module no longer imports anything
+  outside the whitelist. Adapted from the proposal in risunCodex PR #3 by
+  @elliottophellia.
+
+- **Packaging regressions can no longer sneak past checkout tests.**
+  `test/cli/package-manifest.test.ts` asks `bun pm pack` what would publish,
+  walks every import of every shipped file, and fails on any relative import
+  that would dangle, any bare import that is a devDependency rather than a
+  runtime dependency, and any `bin`/install-lifecycle target that is not in
+  the tarball. Replaces the earlier hard-coded whitelist string-list guard.
+
+- **CLI menu leads with the version checker, tray drops its background check.**
+  The console menu now carries a dedicated `Version Checker:` line in the
+  header that reads `up to date`, `could not reach the registry`, or
+  `X.Y.Z → Y.Y.Z available`. When something newer is published an
+  `Update to X.Y.Z` row joins the menu and the arrow-key cursor lands on it
+  by default — Enter still has to be pressed, so a reflex keystroke cannot
+  install anything, but attention goes where it matters. Items reorder to
+  `Open Console / Hide to Tray / Backup / Reset / [Update] / Exit`. The tray
+  no longer polls the npm registry on open: the version row is a
+  non-background info label that opens the GitHub releases page on click,
+  because the previous behaviour surfaced a cue the operator did not ask for
+  and could not act on from inside the tray anyway.
+
+- **Primary GitHub repository is `risunCodex/Cartethyia`.** The original
+  `risunCode/Cartethyia` was hidden from public view by GitHub and is kept
+  as the historical `GITHUB_ALT_REPO` for operators who still have access.
+  Every public surface — the install script's default clone URL, the console
+  update-indicator fetch, the README's install block, the installation docs,
+  the tray's releases link — points at `risunCodex` now, so a fresh install
+  reaches a repository the public can actually see.
+
+- **Robustness guards: programmatic walkers replace trust-but-no-verify.** A
+  batch of CI-only tests captures the current legitimate exceptions as
+  inline-reason allowlists and fails on any new drift. There is no runtime
+  behavior change; these only make a future regression fail in CI rather
+  than ship.
+
+  - `test/config/spec-env-example-bijection.test.ts` loads `CONFIG_SPEC` and
+    `.env.example`, asserts the symmetric diff matches the allowlist, and
+    checks every shared key's spec default agrees with the sampled value.
+    This is the test that would have caught the two defaults fixed above
+    before shipping.
+  - `test/config/no-direct-env-reads.test.ts` walks `src/` for
+    `process.env.CARTETHYIA_*` reads that bypass the spec and fails on any
+    new one. Seven legitimate direct reads (boot-time, module-local
+    telemetry, deployment-injected paths) are named with their reason;
+    adding a knob now means declaring it in the spec or extending the
+    allowlist deliberately.
+  - `test/cli/no-dynamic-imports-in-shipped.test.ts` scans every shipped
+    `.ts` for `await import("<literal>")` and fails unless the file carries
+    a `// dynamic-import-ok:` banner (for lazy-registry files like
+    `default-registry.ts`, `buddy/capabilities.ts`, `cli/main.ts`,
+    `install/install.ts`) or the call has a `// dynamic-import: <reason>`
+    comment above it. Three incidental dynamic imports were converted to
+    static while writing the walker: a redundant `postUpstreamJson`
+    re-import in the GitHub adapter, a `readdir` import in the event-day
+    index, and `buildProviderProbeRequest` in the pool store.
+  - `test/providers/registry-integration-parity.test.ts` invokes every
+    declared loader on every provider in `PROVIDER_CAPABILITIES` and
+    asserts the imported module exposes the promised named export. Catches
+    the 2.5.8/2.5.9 shape of bug where an adapter loads but model-discovery
+    throws `TypeError` at first request because the registry referenced
+    the wrong export name. Also walks `src/providers/integrations/` and
+    reports any file nobody imports.
+  - `test/providers/registry-metadata-bijection.test.ts` asserts every
+    registry id has a `BUNDLED_PROVIDER_METADATA` row and vice versa, and
+    that every metadata row has a non-empty `baseUrl` and `displayName`.
+    A new provider cannot be added halfway anymore.
+  - `test/meta/no-real-fs-writes.test.ts` fails any test that references
+    `homedir()`, `USERPROFILE`, `AppData`, a `~/.<tool>` path, or imports
+    from `src/console/cli-tools/injectors/*` without also stubbing
+    `process.env.HOME`. Prevents the class of bug where a developer's own
+    `~/.codex/config.toml` is rewritten by `bun test`.
+
+## [2.5.9] - 2026-10-24
+
+### Fixed
+
+- **Imported Cline accounts stop asking to re-authenticate.** A 9router /
+  Omniroute export of a Cline connection carries both an `apiKey` (sk_...) and
+  an OAuth access/refresh bundle for the same account. The importer forced the
+  credential kind to `oauth` because Cline was in the OAuth-preferred set, so
+  dispatch wrapped the api key as `Bearer workos:sk_...` and Cline refused it
+  with "Unauthorized: please make sure you're using the latest version of
+  Cline and re-authenticate". The api key is now stored as `api_key`, dispatch
+  sends it as a bare `Bearer`, and the refresh token still travels so the
+  account can rotate to OAuth later without losing it. An explicit
+  `authType: "oauth"` still forces the oauth path.
+
+- **An OAuth account with no stored expiry refreshes on first use.** An OAuth
+  row whose `provider_oauth_states.expires_at` is `NULL` but which carries a
+  refresh token (hand-pasted bundles, migrated accounts) had its `dueAt` left
+  undefined, so dispatch sent the pasted access token untouched. If that token
+  had already expired on another install, the upstream answered "re-authenticate"
+  before the refresh grant was ever used. Dispatch now treats this shape as
+  due immediately. A failed refresh keeps the already-decrypted token in place
+  so the upstream's own 401 remains the authoritative verdict, not a
+  credential-less gateway error raised before the request leaves.
+
+### Changed
+
+- **Buddy catalogs tracked.** Added `kimi-k3.1-pro` and
+  `kimi-k3.1-pro-highspeed` to the shared WorkBuddy / CodeBuddy roster and the
+  CodeBuddy CN roster (1,000,000 ctx, 64,000 out). Highspeed is tagged
+  Pro-only on the international realm, matching every other `BUDDY_PRO_ONLY`
+  entry's shape. Removed `kimi-k3-1` from CodeBuddy CN, `deepseek-v4.1-pro`
+  and `deep-model` from the shared buddy roster, and `minimax/minimax-m3.1-flash:free`
+  from the OpenRouter-backed free roster (Cline, Kilo, OpenRouter).
+
+## [2.5.8] - 2026-10-24
+
+### Fixed
+
+- **The npm CLI finds its runtime modules.** `carte` imported
+  `scripts/build/compile.ts` and `scripts/health.ts`, both missing from the
+  2.5.7 tarball — so `carte` crashed with "Cannot find module '../build/compile'"
+  immediately after `cartethyia setup`. Both folders are now packaged.
+
+## [2.5.7] - 2026-10-24
+
+### Fixed
+
+- **The npm package installs again.** Cartethyia 2.5.6 accidentally registered
+  the source-checkout installer as an npm lifecycle script. That installer
+  requires an explicit deployment target and a `.git` checkout, neither of
+  which belongs to `npm install -g cartethyia`; its supporting directory was
+  also excluded from the tarball. The lifecycle hook is removed. The documented
+  flow is unchanged: install globally, run `cartethyia setup`, then run `carte`.
+
+## [2.5.6] - 2026-10-24
+
+### Added
+
+- **Remote support is a card on the Overview.** The Overview grows a Remote
+  Support card ahead of API Credentials, holding one row per publisher:
+  cloudflared and Tailscale. Each row carries the publisher's own logo, a
+  toggle, and the address it published.
+
+  Turning a publisher on launches it **detached**, so the tunnel is not a child
+  of the gateway: a gateway restart, a hot reload, or a Ctrl-C in the owning
+  terminal cannot kill a live support session. The launch waits for an address
+  and reports it in the card; until one arrives the row says
+  "Waiting for address…" beside a Cancel button.
+
+  The product never installs anything. A publisher that is not on PATH is
+  reported as missing with its own install hint, and installation is detected
+  once per process rather than re-probed on every poll.
+
+### Fixed
+
+- **Switching between thinking models no longer breaks WorkBuddy/CodeBuddy
+  history.** Clients that replace an earlier model's reasoning with an
+  unavailable placeholder could produce an empty assistant turn that the
+  upstream rejected with `11151 "history not found"`. Those bare turns are
+  now removed while tool calls and verifiable reasoning remain intact.
+
+- **A backup can restore into a fresh tenant.** Current exports deliberately
+  omit the tenant row, but the restore previously created it only when that
+  row was present in the file. Restoring could therefore fail on the
+  `api_keys` foreign key before any configuration was written. The receiving
+  tenant is now ensured before child rows are inserted; an existing tenant is
+  left unchanged.
+
+- **Restore failures retain the original bulk-insert error.** When both the
+  bulk write and the row-by-row diagnostic fail, the reported error now names
+  the bulk failure and retains the diagnostic error as its cause instead of
+  hiding a connection or transaction fault behind a derived row error.
+
+- **A revoked share link says so, and says what to do.** The gateway already
+  refused a revoked link, but the public page titled every refusal
+  "Link not available" — so a revoked key and a paused key read identically to
+  a recipient while asking for opposite things. The heading now names the cause
+  (`Key revoked`, `Key paused`, `Link expired`), and the revoked copy states
+  that a revoked key cannot be re-enabled and a new link is needed. A revoked
+  link also clears the key this browser kept, so a dead credential is not left
+  on screen.
+
+- **Tailscale's own setup step is surfaced.** Tailscale requires "serve" to be
+  enabled on the tailnet, and until it is, the launch fails with a message from
+  Tailscale itself. That message is now shown in the card as a setup notice,
+  with a link straight to the enable page, instead of a generic failure.
+
+- **Tailscale stop and status are detected from Tailscale.** Tailscale runs as
+  a system service, so the launcher's pid file could not describe it: stopping
+  left the tunnel serving, and status reported it stopped while it was up.
+  Stopping now resets the serve, and status asks Tailscale whether a serve is
+  live.
+
+- **The Remote Support toggle reflects the click, not just the poll.** The
+  toggle read server state alone, so turning a publisher off left it showing
+  "on" until the next poll landed. It now follows the click immediately and
+  falls back to the last server reading if the action fails.
+
+- **CodeBuddy tool calls written as markup are recovered.** A tool call
+  serialized as DSML markup instead of a native tool block reached the client
+  as literal text. It is parsed back into a real tool call; the tool-name
+  allowlist stays strict only when the caller supplied one.
+
+- **Encrypted reasoning is replayed under the id it was issued for.** Codex
+  rejected a turn whose reasoning item id had been re-derived
+  (`item_id did not match the target item id`). The id the payload arrived with
+  is now carried through unchanged, and a payload with no surviving id is
+  dropped rather than sent with a made-up one.
+
+- **A share link no longer clears the key's name.** Creating or rotating a
+  share link left the key list showing a key with no name. The list is now
+  refreshed after either action.
+
+### Changed
+
+- **Backup export and restore do less waiting.** Independent table reads run
+  concurrently, and restore groups compatible rows into bulk inserts with a
+  savepoint-protected per-row fallback for precise diagnostics.
+
+- **Model and account probes keep their concurrency windows full.** Workers
+  start the next probe as soon as one finishes rather than waiting for the
+  slowest member of a fixed batch. Both probe paths now run one sequential
+  warm-up first to prime credentials and connections before concurrent work.
+
+- **The QRIS support card is inline on the share page.** It used to open as a
+  modal; it is now a card on the page itself, image left and copy right, with a
+  download button, and it keeps its two-column layout on a narrow screen.
+
+- **The share page's kawaii styling is themed.** The leading and tracking steps
+  it needed as bracketed literals are named tokens now, which also clears the
+  styling ratchet's last two entries.
+
+## [2.5.5] - 2026-10-23
+
+### Added
+
+- **Payload retention is a per-tenant choice.** Captured bodies used to be kept
+  for 15 minutes for every tenant, in a resolver the configuration spec did not
+  even declare. Settings -> Privacy now offers 15 minutes, 30 minutes, 1 hour,
+  6 hours, 12 hours, 1 day, and 7 days, and the deployment variable
+  (`CARTETHYIA_TELEMETRY_PAYLOAD_RETENTION_MS`) becomes the default rather than
+  the only value. Seven days is the ceiling.
+
+  A longer window costs disk, and the panel says so from one hour up: every
+  captured request keeps a gzipped copy of up to four bodies, so a week of
+  retention is a week of bodies on disk.
+
+- **Model-abuse bans can be scoped and timed.** A ban used to be address-only
+  and always one duration. It is now keyed on the address **and** the API key
+  that was used, so banning one caller behind a shared address or a share link
+  leaves every other caller on that address working. Durations are 1 hour,
+  6 hours, 12 hours, 1 day, 7 days, and Permanent; the request-detail button
+  bans for one hour and the caret beside it opens the rest.
+
+  "Ban every key from this IP" is still available, and is now an explicit
+  choice rather than the only behaviour — which is what an operator wants when
+  the address, not the credential, is the problem. The ban list names the key
+  each ban is scoped to and says "This key only" or "All keys from this IP".
+
+  **One gap, stated rather than hidden:** a share key's children are issued per
+  recipient, so a banned recipient can enroll a new child key from the same
+  address and continue. Closing that would ban every recipient behind the same
+  NAT — the exact collateral this scoping exists to avoid.
+
+- **The request list updates as requests finish.** The Usage page request list
+  polls no more: each completed request pushes to the open dashboard over SSE
+  and the list refetches immediately.
+
+- **Usage cards open on millions.** The four token cards defaulted to raw
+  counts, which overflowed the card on a busy tenant. They now open on `M`, and
+  a value too small for the chosen unit falls back to its exact count instead of
+  reading `0M`.
+
+### Fixed
+
+- **`forceDisableCooldown` reaches hard cooldowns.** The override was stamping
+  the very flags the eligibility evaluator uses to exclude a hard cooldown, so
+  it only ever affected soft cooldowns — which were already eligible. An account
+  parked for a spent quota or a policy block is now reachable, which is the case
+  an operator actually wants to override.
+
+- **A saved setting takes effect immediately.** Two preferences are read on the
+  request path from the cached route snapshot, and a save did not invalidate it:
+  the row was correct while `/v1/*` kept using the revision built before the
+  save, so the toggle looked broken. Settings now invalidate on save.
+
+- **Cursor's exhausted accounts cool down.** `quota_exceeded` was wrapped as a
+  transport failure regardless of what Cursor put in `stop_details`, so the
+  classifier never saw it and an out-of-quota account was never parked. The
+  real code is now read and promoted, so quota and authentication failures cool
+  the account they came from.
+
+- **Share child keys get their own rate window.** RPM and concurrency ran on the
+  parent's counter, so one recipient hitting its limit cooled every other
+  recipient of the same link. Each child now has an independent window and
+  slot. Token budgets stay on the parent — that shared pool is the operator's
+  control.
+
+- **A captured body is no longer dropped on write.** The frame's key list named
+  four body surfaces while the record builds five, so the fifth was serialized
+  and then discarded: a capture whose client response sat in the legacy slot
+  came back with that panel empty.
+
+- **Disk housekeeping reports what is really there.** The panel counted payload
+  frames reclaimable after 15 minutes even when a tenant had chosen a longer
+  window, so it offered a reclaim that always reported nothing to reclaim. It
+  now judges against the longest retention a tenant may choose. The same bound
+  covers the prune pass, which could otherwise delete a file still holding
+  frames their rows addressed.
+
+- **Provider max-inflight and API-key concurrency no longer share an error
+  code.** Both rejections arrived as `capacity_exhausted`, so the two settings
+  that cause them were indistinguishable on the wire: an operator who raised
+  the provider's max-inflight saw no change when the ceiling that fired was the
+  API key's own `max_concurrent`, and the other way around. Routing exhaustion
+  is now `provider_capacity_exhausted`, and the key's message names the key
+  rather than the provider.
+
+  The routing error also carries `providerId`, `model`, `maxInflight`, and
+  `candidate_count`. A plan that held a single candidate now says so, because
+  that is a routing or eligibility fact — raising the ceiling does not fix it.
+
+- **Max inflight says what it bounds.** The routing card labelled the field
+  "Max inflight / account" and then described it as a "Shared provider
+  ceiling". It is per account: each account enforces its own limit, so a full
+  account spills to the next. The subtext now says that.
+
+- **A tunnel's forwarded client address is no longer thrown away.** With
+  `TRUSTED_PROXY_CIDRS` unset, a request arriving from a loopback peer
+  (`127.0.0.1`, `::1`, or the mapped `::ffff:127.0.0.1` Bun reports on Windows)
+  now has its forwarded client headers believed. That is the shape of
+  cloudflared, an SSH forward, and a local Caddy or Nginx — and when their
+  headers were ignored, every caller behind one was recorded as the loopback
+  address.
+
+  That collapse was the dangerous direction: per-IP abuse throttling and
+  model-abuse bans are keyed on this address, so one caller reaching the limit
+  banned every other caller behind the same tunnel. The audit trail also showed
+  one address for everyone.
+
+  A **public** peer's headers are still ignored, so a client cannot name its own
+  address. Setting `TRUSTED_PROXY_CIDRS` overrides the loopback arm entirely: a
+  configured boundary is `trusted` or `platform`, and neither reaches it.
+
+- **A misconfigured tunnel now says so.** A forwarded client header arriving from
+  a loopback peer that the boundary will not trust logs one warning naming the
+  fix and the shared-fate consequence, instead of silently degrading.
+
+- **Legacy tool parameter roots are accepted.** Some clients send a tool's
+  `parameters` as an empty root, or as a property-name → schema map with a
+  per-field boolean `required` flag and no `{"type":"object", …}` wrapper.
+  Upstreams reject both as `invalid_function_parameters` (CodeBuddy `11129`).
+  The root is now rewritten into an explicit object schema, with the legacy
+  flag hoisted into `required` — and a field the caller did not flag stays
+  optional. A root that already holds schema keywords is left untouched:
+  guessing there would rewrite a valid schema into a wrong one.
+
+- **A provider code hidden in an escaped envelope is found.** A provider may
+  embed its error object as a string rather than nesting it, so the code that
+  decides whether an account is cooled was invisible and a blocked account
+  stayed in rotation failing every request. Both the escaped and doubly-escaped
+  spellings are now read, as a fallback behind the real nested code.
+
+- **Escaped-underscore schema keys no longer collide away.** A `\_` in a
+  property name is stripped, which can collapse two distinct keys onto one; they
+  are now merged with `allOf` (which accepts boolean schemas, so neither
+  constraint is lost) instead of one silently overwriting the other.
+
+- **A queued upstream request is no longer reported as a refusal.** Qoder
+  answers `403` with `{"code":"10605","isQueued":true,"retryAfterSeconds":N}`
+  when it has accepted a request and is holding it until capacity frees up. The
+  status said "forbidden", so the gateway classified it as one and the client
+  ended its turn on a request that was only waiting. It is now
+  `upstream_queued` (503), carrying the interval the upstream stated, and it
+  fails over to another account first — one that is very likely not queued.
+
+  Recognized conservatively: an explicit queue flag, the `10605` code, or a
+  message that is *about* a queue. A body that merely mentions the word does
+  not qualify, so an unrelated failure is never turned into "wait and retry".
+
+- **Qoder accounts report whether they belong to an organization.** Read from
+  the userinfo profile with upstream's own precedence: an organization id or
+  name, a `userType` naming a team or enterprise, or a shared credit pool. Any
+  one is enough, because an enterprise account whose `userType` still reads
+  personal is enterprise as soon as it carries an organization. Both the
+  snake_case and camelCase spellings are read, since the OAuth and PAT login
+  paths do not agree on one.
+
+  This is the classification and the label; no console surface renders it yet.
+
+- **Buddy accounts send their enterprise identity.** An enterprise account is
+  billed from its organization's credit assignment rather than a personal
+  package, and the upstream reads that from the request: `X-Enterprise-Id` and
+  `X-Tenant-Id` name the organization, and `X-Private-Data` says the account is
+  not personal. Both were missing on chat — `X-Private-Data` was hardcoded to
+  `false`, which the code already flagged as unfinished.
+
+  The enterprise is resolved from `auth_state.enterpriseId` first, then from a
+  claim on the access token, so accounts authorized before this existed are
+  picked up too. An account with no evidence stays personal: claiming an
+  enterprise it does not belong to is the kind of mismatch that draws a channel
+  check, and personal is what the gateway already sent.
+
+  The token claim is read from a list of plausible spellings rather than one
+  name, because the upstream's token shape is not pinned anywhere this codebase
+  can verify.
+
+- **Error codes and messages are unambiguous.** A scan of every rejection site
+  found codes doing double duty, and messages a client could not act on:
+
+  - `model_abuse_banned` answered in Indonesian — the only non-English message
+    on a client-facing surface. It is now English, and names that the ban is
+    scoped to this address **with this key**.
+  - Two `/admin` and backup-export refusals answered `invalid_request` when
+    nothing was wrong with the body: a loopback-only endpoint refused a
+    well-formed request (`policy_rejected`), and a bad drain token is a
+    credential failure (`authentication_failed`).
+  - Z.AI authentication answered `400` where every other authentication
+    failure is `401`, sending clients to fix a body that was never the problem.
+  - Every IP-abuse refusal carried `details.reason: "admission-unavailable"`,
+    which is the label for an unreachable store — so a ban, a rate limit, and
+    an outage were indistinguishable. They are now `ip-banned` and
+    `ip-rate-limited`.
+  - Seventeen codes had no plain-English definition in the Usage page and fell
+    through to a mechanical underscore-to-space rendering. All are defined;
+    `quota_exceeded` now says which layers can produce it and points at
+    `details.reason` to tell them apart.
+
+  Two guards now hold this: a table asserting one code means one status, and a
+  scan of every public message for non-English text. Both read `src/` directly,
+  so a new inconsistent site is caught the day it is written rather than
+  whenever someone re-reads a hand-collected list.
+
+### Changed
+
+- **Compatibility shims are gone.** Backward-compat paths removed across the
+  board: the `jsonb-file` payload storage type and its binary length header,
+  the legacy backup rewrites (user-agent mapping, `bypass_proxy`,
+  `model_allowlist`/`model_denylist`, label-based default-key promotion), and
+  the resolver prefs behind the retired telemetry compaction. Two environment
+  variables (`CARTETHYIA_TELEMETRY_WINDOW_MINUTES`,
+  `CARTETHYIA_TELEMETRY_COMPACT_MAX_FILES`) are no longer accepted — they were
+  inert, so a deployment still setting them boots unchanged only if it drops
+  them.
+
+- **The disk panel's buckets are renamed to what the files are.** `Hourly
+  request files` and `Daily summaries` are now `Request event files` and `Day
+  indexes`, matching the per-day index. Event files were never individually
+  reclaimable; they go with their index at retention.
+
+- **The gateway's 401 no longer tells you to rotate.** Rotation moved to the
+  public model surface, where the seeded default key is what normally fails. On
+  a proxy request it sent operators to rotate a key they were never using.
+
+### Performance
+
+- **Environment resolvers are read once.** Ten cooldown resolvers read
+  `process.env` on every call, and several hot paths called them twice for one
+  value — including the classifier that runs on every failed upstream request.
+  Each now caches per process. The model catalog also fetches providers and
+  accounts in parallel instead of sequentially.
+
+### Documentation
+
+- **One index, one skill set.** The documentation is deduplicated onto single
+  owning pages, the skill folders are consolidated from twelve to nine with
+  their unique material folded into the pages that own it, and historical
+  narrative that had drifted from the code is pruned. `documentation/archive/`
+  is now marked off-limits and says why: those records were true when written
+  and are not kept in sync, so reading one as current is worse than reading
+  nothing.
+
+## [2.5.4] - 2026-10-22
+
+### Added
+
+- **LarRouter is a bundled provider.** An OpenAI-compatible reseller at
+  `https://larprouter.com/v1`. It is discovery-backed, so its 13 models and
+  their context windows come from its own `/v1/models` rather than from a
+  catalog row that would drift.
+
+- **Proxy lists can be pasted in.** Resellers hand out proxies in three shapes
+  — a JSON array, bare URIs, and `host:port:user:password` rows — and none is
+  what `POST /network/pools` takes. `POST /console/api/network/pools/import`
+  accepts all three, so an operator pastes the file instead of converting it.
+  Unparseable lines are reported per line rather than failing the import.
+
+- **`carte autostart` registers the tray with the OS.** The tray only runs
+  while someone starts it, which is not much use for a gateway meant to be
+  always-on. Windows gets a Run value, macOS a launch agent, Linux a desktop
+  entry — each in the user's own location, so nothing needs elevation. It is
+  opt-in and reversible: `carte autostart off` removes it, and
+  `carte autostart status` reports which entry exists.
+
+- **More providers report quota.** Cursor, Trae and Qoder gained endpoint
+  quota reads, so their accounts show remaining allowance in the console
+  instead of only failing at dispatch. Trae reads the account's provisioned
+  region host and authenticates its commercial surface with `Cloud-IDE-JWT`;
+  Grok reports both its rate-limit window and its request bucket.
+
+- **A language switch and a donation button in the console topbar.** The
+  language control is a placeholder: the locales are listed and the current
+  one is marked, but no translation catalogue is wired up yet, so the console
+  stays in English. Choosing a locale is not offered as a working feature.
+
+### Fixed — the Cursor tool loop
+
+- **A replayed Cursor conversation no longer dies on "tool call no longer
+  pending".** The Cursor tool loop spans two client requests: the model calls a
+  tool, the gateway holds the Run open, the client sends the result. When the
+  gateway restarts between those legs — or the idle Run is reaped — the client
+  resends its complete recorded transcript, and that resend used to fail with
+  a 400 telling the client to resend what it had just sent.
+
+  A replay whose every tool result is answered by a tool call present in the
+  same conversation — and whose call ids exist nowhere in the process — is now
+  rebased into a fresh Run from the recorded history instead of refused. The
+  refusals that protect other tenants stay: a tail-only continuation, a
+  request with no continuation scope, and a call id that is still live under
+  another tenant's session, which would mean adopting someone else's Run.
+
+- **Cursor's host tools execute on the client instead of being refused.**
+  Cursor's edge asks its local executor for native tools — shell, file write,
+  file read. This gateway answered those frames with an explicit error, so the
+  model saw "Cursor host tools are not executed by this gateway", circled, and
+  fell back to the MCP-channel equivalent only on a later try.
+
+  A host exec the client itself declared is now forwarded as a tool call: the
+  client runs its own `_bash` / `_write` / `_read`, and the Run receives the
+  variant's typed result frame (`shell_result` / `write_result` /
+  `read_result`) plus `stream_close` — the frames Cursor's own executor sends,
+  not the generic `mcp_result` that leaves the server unmatched. Argument
+  names follow the schema the client's tool declared, so a tool that rejects
+  unknown properties still accepts the forwarded call. Exec variants without a
+  faithful result frame (grep, ls, subagent, …) and host calls to tools the
+  client never declared keep the explicit refusal.
+
+### Fixed — usage telemetry
+
+- **The Usage page no longer reports zero, and no longer loses its history.**
+  Request events were written to a file per 15-minute window — 96 a day — and
+  a periodic job folded those into a per-day summary and deleted the source
+  files. Which of them was still being written was guessed by comparing file
+  names, and that guess was wrong often enough to fold and unlink a file the
+  writer was still appending to. Its requests never reached the summary, so an
+  install could show no traffic at all while serving it.
+
+  Events now append to one file per UTC day, `<day>.events.jsonl`, which is
+  never rewritten or removed while the day is open. Beside it,
+  `<day>.index.json` carries the totals, the per-name breakdown, per-hour
+  slots for the chart, and a byte watermark of how much of the event file has
+  been counted. Progress is tracked by that offset, not by name, so there is
+  nothing left to guess.
+
+- **Usage, breakdown, and the traffic chart read the index instead of the
+  requests.** A read used to parse every file in the period and filter in
+  memory, so its cost grew with traffic. It is now a few small JSON reads.
+  The request list and the detail drawer still read the events, and do so
+  backwards from the end of the file, so a page of the newest rows no longer
+  parses the whole day.
+
+  Totals are accumulated, never averaged — a period that reported 2B input
+  tokens still reports 2B. Folding runs on read as well as on schedule, so a
+  request made moments ago appears immediately; folding twice is harmless
+  because it is a sum.
+
+- **Costs are summed as numbers.** Costs arrive as strings from `numeric`
+  columns and from restored rows, and adding one to a number concatenates
+  instead of summing — three requests produced `000.0009660.0010320.001008`,
+  which the console rendered as an empty cost. Both accumulation points now
+  coerce.
+
+- **Per-key daily and monthly token limits read the current totals again.**
+  They were reading the old per-day summary format, which nothing writes any
+  more, so a key that had already spent was admitted as if it had spent
+  nothing. They read the index now.
+
+- **Retention deletes whole days**, taking the event file and its index
+  together. Removing one without the other was a trap: an index with no events
+  reports totals for requests that are gone, and events with no index are
+  invisible to every usage read.
+
+### Fixed — Cline quota refresh
+
+- **A Cline account on an API key is no longer cooled every minute.** The
+  scheduled quota sweep built its refresh dependencies without the
+  provider-specific credential envelope, so the collector received the raw
+  stored secret. An `sk_...` key with no envelope takes the OAuth branch, gets
+  `workos:` prepended, and Cline refuses it with "please make sure you're using
+  the latest version of Cline and re-authenticate".
+
+  The account was therefore marked `quota_fetch_failed` and cooled on every
+  sweep while refreshing cleanly from the console — which runs the same code
+  with that one field set. Confirmed against a live key: the unmarked
+  credential fails with exactly that message, the marked one returns no error.
+
+  Both paths now share one marker function, so a third caller cannot omit it.
+
+## [2.5.3] - 2026-10-21
+
+### Fixed — performance
+
+- **The usage list slowed down as an install aged, regardless of user count.**
+  Hourly telemetry files were never deleted, so every read scanned every file
+  ever written: the cost tracked total volume, not the number of users. An
+  install serving 20 users got slower purely by serving them longer — 122 ms at
+  42 files, 2.3 s at 720.
+
+  Telemetry is now compacted. Past `CARTETHYIA_TELEMETRY_COMPACT_AFTER_DAYS`
+  (default 7), hourly request files are folded into one per-day summary per API
+  key, and beyond `CARTETHYIA_TELEMETRY_RETENTION_DAYS` they are deleted. On a
+  30-day, 822 MB, 2.16M-request dataset: 30 files, 14 KB, and a 2.0 ms
+  aggregate read instead of 2,665 ms.
+
+  **Compaction is accumulation, not sampling.** A summary carries running sums,
+  so a period that reported 2B input tokens still reports 2B after its rows are
+  folded — verified exactly on the dataset above. Latency keeps an exact mean
+  and a bucketed (approximate) percentile.
+
+  **Request Detail is expected to stop working for compacted requests — this
+  is by design, not data loss.** Past the compaction age an individual request
+  no longer exists anywhere, so its detail returns 404. The message now says
+  so and names the knob to keep requests longer, rather than the bare "not
+  found" that reads like lost history. The four payload panels were already
+  short-lived independently of this: captured bodies expire 15 minutes after
+  capture, long before any compaction.
+
+  What is not preserved for a compacted window: the request list, per-request
+  filters (status, model, IP), and the detail drawer. Totals in Usage, per-key
+  spend, and quota accounting are unaffected.
+
+### Added — operational settings
+
+Three settings that were deployment-only env vars are now editable per tenant
+under **Settings → Operations**, without a restart.
+
+- **Force disable cooldown.** Routes to accounts that are cooling down,
+  including ones already parked. Off by default, and the page says why: a
+  cooled-down account was parked because the upstream refused it, so dialing it
+  anyway reproduces that refusal on every attempt — and if every candidate is
+  cooling, the request fails instead of waiting for a reset.
+
+  The override is **read-only**: the cooldown is still recorded, still shown in
+  Health, and still recovered by the sweep, so turning it back off needs no
+  cleanup. Per-(account, model) cooldowns are still enforced — those are
+  usually a named quota with a stated reset, where ignoring it only buys
+  repeated refusals. Shared accounts (no tenant of their own) are covered when
+  any tenant asks, since parking one stops everyone.
+
+- **Upstream timeout**, in seconds (5–600). Applied when the request is
+  dispatched, so it can only shorten a deadline that has already started.
+
+- **Max attachment size**, in MB (0.06–100), per image. An oversized inline
+  attachment is refused before send rather than after the upstream rejects it:
+  a block too large poisons every retry and every replayed turn, because the
+  upstream rejects the whole request rather than the one block. A refused block
+  becomes a visible placeholder, never a silent drop, so the model is not left
+  answering a question whose attachment vanished. Applies to the Messages and
+  Gemini wires.
+
+  Raising this asserts your upstreams accept more than the 10 MB default;
+  lowering it is the safer direction. It is per tenant precisely because it is
+  a promise about a provider, not a global resource bound — unlike the ingress
+  body limit below, which cannot be per tenant at all.
+
+- **Telemetry compaction age**, in days (1–365). Hourly files hold every tenant
+  together, so the largest age across all tenants wins: compacting later than
+  asked only costs disk, while compacting earlier would destroy rows someone
+  expected to keep.
+
+### Fixed
+
+- **Every Settings section is on the page at once.** Security, Privacy,
+  Operations, and Data render in one scroll instead of one at a time, so a
+  setting is found by looking rather than by knowing which heading concealed
+  it. The nested cards are gone too — the page rendered a card inside a card,
+  doubling borders and padding. Sections keep their ids, so a link to
+  `#operations` still lands in the right place.
+
+- **Upstream timeout, compaction age, and attachment size are dropdowns in a
+  grid** rather than free number fields. Each is a bounded value the backend
+  clamps anyway, so offering the reachable range says what is actually
+  available instead of accepting anything and correcting it out of sight. A
+  value already stored that is not among the offered choices is still listed,
+  because otherwise the control renders empty for a setting that is in force —
+  which reads as unset and invites changing something already correct.
+
+- **The backup size limit no longer claims 8 GiB the install cannot accept.**
+  It promised a ceiling far above the listener's own body cap, so the number
+  described a limit nothing could reach: an upload above the listener's cap was
+  cut off before that check ran, failing as a reset connection rather than the
+  413 the constant promised. The bound now follows
+  `CARTETHYIA_SERVER_MAX_BODY_BYTES`, so the message matches what happened and
+  raising that variable is what admits larger backups.
+
+### Not a setting: the request body limit
+
+`CARTETHYIA_SERVER_MAX_BODY_BYTES` (default 4 MB) stays a deployment variable,
+and that is deliberate. It is enforced at ingress — before authentication, when
+the tenant is not yet known — because it is what stops an oversized request
+before it is read into memory. A per-tenant override would require accepting
+and buffering the body first in order to learn whose limit applies, which is
+exactly what the limit exists to prevent.
+
+### Changed
+
+- **Grok reports both of its quota numbers, and they disagree.** The CLI plane
+  returns a token bucket on every response (`x-ratelimit-limit-tokens:
+  1000000`), but that figure is eventually consistent — it can still read full
+  right after a request — and it is not the one that binds. The real free
+  allowance is 600k per rolling 24 hours, and upstream states it only in the
+  body of a 429: `tokens (actual/limit): 603024/600000`.
+
+  The header is now read as the everyday indicator and listed first; the
+  authoritative figure from a refusal is appended beneath it. Neither replaces
+  the other, because a merged number would look precise and be neither. Reading
+  the bucket costs one cheap request (~360-480 tokens), since no quota endpoint
+  exists — `grok.com/rest/*` exposes none and `/v1/models` carries no headers.
+
+  A refusal is reported as a balance, not a read failure: an account that is
+  out of free usage was measured perfectly well, and calling that an error
+  would show a broken read on a healthy account.
+
+- **Cursor, Trae and Qoder report a quota balance.** All three had no
+  collector, so the console showed nothing — and no balance is indistinguishable
+  from no quota left to anything reading the account.
+
+  - **Cursor** reads `{base}/auth/usage` and `cursor.com/api/usage-summary`.
+    The summary wins when it answers: `/auth/usage` is the pre-usage-based-plans
+    request counter and reports a permanently-zero bucket on exactly the plans
+    that have a dollar cap. The legacy surface is still read, because it is the
+    only one an api-key account can reach.
+  - **Trae** reads `get_session_usage` on the core host and `ide_user_ent_usage`
+    on the pay host, per realm. The two are independent: a dead pay host does
+    not erase a readable meter, because "no quota" is what the router parks on.
+  - **Qoder** reads `/api/v2/quota/usage` on the openapi host, pooling the plan
+    allowance, granted credits and — for team accounts — the shared org pool.
+
+- **A Trae quota exhaustion that arrives as HTTP 502 is classified as quota.**
+  Trae answers an exhausted quota with status 502 and the body `Your requests
+  have exceeded the quota.` The status was what misled the classifier: 502 read
+  as a gateway failure, so it was recorded as `server_error` with a 30-second
+  cooldown that never touched the account. The account therefore stayed in
+  rotation and every other model on it kept being invoked inside a window the
+  provider had already closed. The body is the verdict, not the status, so this
+  is now read as `quota_exhausted` and flags account-wide.
+
+- **`nemotron-3-ultra-free`, `nemotron-3.5-lightning-free` and
+  `longcat-2.5-preview-free` are no longer catalogued for OpenCode.** The live
+  Zen roster no longer lists them. A row the provider's own roster has dropped
+  can vanish from the wire without notice, which makes it a stale row — one
+  that fails at dispatch with a 404 rather than at catalog load. Removed from
+  the free and Zen catalogs alike; `big-pickle` and the rest of the shared Zen
+  listing remain.
+
+- **An unclassified upstream failure cools the account down for 15 minutes.**
+  It was 60 seconds, which returned the account to rotation and re-dialled an
+  upstream that had just answered something this gateway does not understand,
+  so one unknown error was retried every minute. It is still a cooldown with a
+  deadline, never `disabled`, so nothing here can strand an account.
+
+- **The upstream request timeout is 75s, down from 120s.** Clients cap lower
+  than the old default, and a provider that has not answered within 75s is
+  queued or stuck — failing over to another account beats spending the
+  caller's whole budget on one attempt.
+
+- **A timeout is no longer counted as a gateway error.** `504` is a deadline
+  that expired, not a malfunction: the request deadline, the stream-stall
+  watchdog, an HTTP/2 read-idle or WebSocket receive timer. Timeout
+  requests are still recorded, still rendered, and still filterable — they
+  are simply not counted against the gateway's error rate, which otherwise
+  tracks provider latency rather than gateway health.
+
+### Added
+
+- **Restore can be narrowed to selected tables.** Picking a backup file now
+  opens a dialog listing every table it carries, with row counts and a
+  checklist that defaults to all of them. **Restore now** proceeds to the
+  password prompt; **Cancel** abandons it. A table left unchecked is left
+  exactly as it is — selection is a filter, not a rewrite, so "restore one
+  table" no longer overwrites the rest with the file's older copy.
+
+- **A Data Management section reports what the gateway keeps on disk.**
+  Hourly request files, daily summaries, and payload frames are each measured
+  separately, with how much is reclaimable right now. **Reclaim** drops files
+  the gateway no longer reads, and **Flush** drains queued telemetry, usage,
+  and health writes immediately rather than waiting for the interval.
+
+  Every action touches files only, never database rows. Hourly files are
+  refused: they are the only copy of their requests until compaction folds
+  them up, so deleting one would lose real history. The card says so instead
+  of offering a button that would fail. Payload frames go whole or not at all,
+  because frames are appended to a file — one is dropped only once nothing in
+  it is still live.
+
+### Fixed
+
+- **Remote Routing stayed off after being switched on.** The API-key update
+  path validated `scopes` and passed them to the store, but the store's update
+  allowlist never included the column, so a grant like `routing:cli_mapping`
+  was accepted and silently dropped. The toggle appeared to save and the badge
+  stayed "no CLI scope".
+
+- **The Force-disable-cooldown toggle could not be switched.** Its button sat
+  inside a `<label htmlFor>` pointing at that same button, so one click
+  activated the control twice — the label forwarded the activation and the
+  click reached the button as well. Both calls read the same state and both
+  asked to flip it, so it flipped twice and landed back where it started.
+
+- **Settings text no longer fights itself.** A field's label, its value, and
+  its help text were all 12px, so one field was three equal blocks with no
+  order; the label and value are 13px now. Backup headings were 18px while the
+  card above them was 14px, so "Backup" read larger than the card it sat
+  inside. And `text-subtitle` was in use where no such size exists, so those
+  headings fell back to the browser default — the class name looked right,
+  which is why it went unnoticed.
+
+- **Privacy settings are stacked rather than side by side.** Reading a field
+  two-up meant zig-zagging across for the label and back for the control.
+
+### Changed — payload frame storage
+
+- **Captured payload frames are stored as text lines instead of binary
+  records.** A frame used to be a 4-byte binary length header followed by gzip
+  bytes, which made it opaque: reading one meant decoding a big-endian length
+  and gunzipping exactly that many bytes, and the file could not be inspected
+  at all. A frame is now base64 of the same gzip bytes, newline-terminated, so
+  the file is a text file whose records are delimited by `\n`. It is still
+  compressed, so disk use is unchanged apart from base64's ~33% overhead.
+
+  Frames already on disk keep the old shape and are still read: their rows
+  point at them, and they expire on their own within the retention window, so
+  both shapes are tolerated rather than migrated. New files use `.jsonl`; the
+  prune pass recognises both extensions, because abandoning the old ones would
+  leave them on disk indefinitely.
+
+- **A Qoder model that declares `is_vl: false` is now excluded from image
+  routes.** The router's capability profile granted image support to every row
+  on a canonical-codec provider regardless of what the catalog declared, so
+  the declared modality never mattered and an image was forwarded to an
+  upstream that rejects it. An explicit declaration now wins; the codec grant
+  is the fallback for rows carrying no modality metadata.
+
+- **Request Detail's Provider Request and Provider Response panels were often
+  empty.** Two causes. The client response was stored twice — once under its
+  own key and once under the legacy alias — and the alias was charged against
+  the shared byte budget ahead of both provider panels, so a large request
+  consumed the whole budget before they were reached. And the provider tee was
+  hard-capped at 256 KiB at every capture depth, so raising the depth to
+  Maximum still produced a quarter-megabyte translated request. The alias is
+  now accounted last, and the tee follows the depth (256 KiB / 2 MiB / 4 MiB).
+
+- **A queued upstream is no longer reported as a dead credential.** Qoder
+  answers `403 {"code":"10605", ... "isQueued":true, "queueCount":1395}` when
+  it is busy. The generic 403 arm claimed it as `auth_invalidated`, so a
+  healthy account was parked as "Re-login required" purely because the
+  provider had a queue, and an operator was sent to re-authenticate a
+  credential that was never rejected. It is now a model-scoped capacity
+  cooldown. Real credential rejections are still recognised.
+
+- **WorkBuddy's User-Agent used the product brand instead of the wire token.**
+  It sent `WorkBuddy AI/<v>` where an official client sends
+  `workbuddy-ai/<v>`. The international gateway answers the branded spelling
+  with 403 code `11140`, the same refusal a wrong-brand header gets.
+
+- **Cline `api_key` accounts read their quota properly.** They were reported as
+  "Quota endpoint is not available" with no upstream call, because the key was
+  sent as `Bearer workos:sk_...`. Cline answers that with "make sure you're
+  using the latest version of Cline and re-authenticate" — a message that names
+  a version problem, so it read as the upstream refusing the client rather than
+  a misformed header. Verified against a live key: `/users/me` returns 200 with
+  a bare `Bearer sk_...` and 401 once `workos:` is prepended.
+
+  These accounts now use the same quota surface as OAuth, with the key as its
+  own bearer token. Two cases that used to look identical are now told apart:
+  a live key on an account with no plan reports no quota and no error, while a
+  rejected key reports a real failure. Account tests — per account or all at
+  once — go through this same path.
+
+- **Trae `gpt-5.4` reports a 1M context window.** It was filed at 272k.
+
+- **`deepseek-v4.1-flash` and `hy4-preview` are image-capable.** Corrected
+  across the Trae, CodeBuddy/WorkBuddy, OpenCode and TokenHarbor catalogs.
+
+### Changed — routing defaults
+
+- **Antigravity, Trae, Kilo Code, GitHub Copilot and Kiro now dispatch direct
+  by default**, joining Hermes, Cline and InferHub. Each is credential-keyed,
+  so a rotating egress address buys nothing. Not a hard lock: an explicit
+  routing row still wins, so any of them can be put behind a pool.
+
+## [2.5.2] - 2026-10-21
+
+### Breaking changes — manual step after upgrading
+
+- **The default API key may need rotating once.** The key format changed to
+  `pn-carte-`; keys minted before it carry the old `carte_` prefix. Old keys
+  keep working — lookup is by hash, never by prefix — so nothing is rejected
+  outright. The failure is quieter than that: a caller still holding a key
+  recorded under the old format (a CLI config, a client that saved it, a
+  `.env` written by an earlier version) keeps sending a credential that no
+  longer matches anything, and Model Lab reports only "Request failed".
+
+  If Model Lab or a client fails after upgrading, open **API Keys**, rotate
+  **Default Cartethyia API key**, and paste the new key where the old one was
+  used. The 401 now says so instead of "unknown, revoked, or expired".
+
+  **Fresh installs are unaffected** — they generate a key in the current
+  format at first boot. Only installs carried forward from an earlier version,
+  or ones that saved the key somewhere, need the step.
+
+### Changed
+
+- **A 401 for a bad key now says what to do.** It was `invalid_request`, a code
+  named after the shape of the request, which sent callers hunting for a
+  malformed body when the credential was the problem. It is
+  `authentication_failed` now, and the message names the rotate step above
+  instead of telling an operator to issue a new key — something that cannot be
+  done to the default key, which has no delete and only rotates.
+
+- **`.env.example` no longer suggests seeding `CARTETHYIA_API_KEY`.** The
+  console generates and shows the default key at first boot; putting it in the
+  environment means the secret sits in a file that gets copied around. The
+  variable still works, it is simply no longer offered as a default.
+
+### Fixed
+
+- **Kiro's `claude-haiku-5.5` reported the 4.5 limits.** It carried 200K/64K,
+  copied from the `claude-haiku-4.5` row directly above it, while every other
+  5.x model in the same file uses 1M/128K. Haiku moved to the million-token
+  window and the doubled output ceiling with the rest of its generation, so the
+  ceiling was half what the model accepts.
+
+- **Four more catalog rows carried a neighbour's limits.** `claude-sonnet-4.5`
+  claimed a 1M window in Kiro, Claude and Cloudflare while Opus 4.5 and Haiku
+  4.5, in the same files, were 200K — the 4.5 trio predates the million-token
+  window, which arrives with Opus 4.6. Inferhub's `cc/claude-sonnet-4-6`
+  claimed 64K while the Opus 4.6 row above it was 128K.
+
+- **Nine withdrawn free rows left the OpenRouter-backed catalog.** Gemma 4
+  (both rows), Nemotron 3 Super, both Laguna rows, both Inkling rows, Xing4.0
+  and `openrouter/auto` are gone from the shared free roster, so one removal
+  covers Cline, Kilo Code and OpenRouter. `openrouter/auto` published no
+  limits of its own anyway — a router's pricing is -1 — so the committed row
+  was a guess about a window decided at dispatch.
+
+- **Error and empty states are centered everywhere.** The shared primitives in
+  `ui/state.tsx` were already centered, so the ones that read as left-aligned
+  were the call sites not using them: Accounts rendered no empty branch at all
+  when a filter matched nothing, Studio's "No chats yet." was a bare `<p>` in a
+  column, and every state inside a dialog or scroll region reserved the
+  route-level 220px centering floor, turning a one-line message into a
+  scrollbar. Badges, toasts and inline form errors stay left-aligned, which is
+  correct for something sitting in a row.
+
+- **A Cursor quota refusal no longer reports the word "error".** Cursor delivers
+  `resource_exhausted` as a failed terminal event, not as a thrown error, and
+  the probe verdict read only the terminal's `stop_reason` — a canonical
+  one-word label. The toast's entire body was `error`. The verdict now reads
+  `stop_details`, which is where the adapter parks the upstream sentence and
+  where the live dispatch path already read it; the two paths disagreed about
+  the same provider response.
+
+  The same gap had a worse effect: `recordProbeHealth` only recorded a failure
+  when a dispatch error existed, so an exhausted account was **recovered** —
+  consecutive failures zeroed and its cooldown cleared. A failed terminal is
+  now routed through `terminalFailure`, the same function the live path uses,
+  so both classify it identically.
+
+- **A probe records all four payload stages.** The probe's capture passed only
+  the request and the client response, and built its exchange wrapper with body
+  capture off, so the provider-response tee always resolved to null. Every
+  probe row reported the middle two stages as absent — a constant, not a
+  measurement, which made the stage markers useless for the diagnosis they
+  exist for. Measured: the bitmask went from 9 to 15.
+
+  The client events were also passed as `responseBody`, the legacy alias, which
+  lit the client stage over a body that was never captured. They now go to the
+  dedicated client surface.
+
+- **A throttled account is no longer counted as healthy on the provider list.**
+  A model-scoped backoff leaves `status: "active"`, so a card built from status
+  alone read "1 Healthy · 1 Cooling" for a single account that could not serve
+  the model being asked for. Cooldown and Cooling are now one badge, and
+  neither is counted under Healthy — the counts are mutually exclusive and add
+  up to the account total.
+
+### Added
+
+- **The update badge opens a dialog instead of a release page.** Pointing it at
+  GitHub told an operator a release existed and left them to work out the
+  install themselves, on a page that does not mention it. The dialog shows what
+  is running against what is published, gives the command, and copies it.
+
+  A release alert in the notifications bell now opens the same dialog rather
+  than the release page; other alert kinds keep their link.
+
+  **It also opens on its own**, once per release. An operator on an old version
+  is the one least likely to go looking, so waiting for a click defeats the
+  point. But a dialog returning on every navigation punishes whoever already
+  decided not to upgrade, so dismissing records the version and the prompt stays
+  away until a newer one is published. The badge still opens it on demand.
+
+- **The dialog says why the console cannot just install it.** npm cannot replace
+  the package directory while a process is executing out of it — on Windows the
+  rename fails with `EBUSY` — so a button that tried would fail in a way that
+  looks like a gateway bug. The command is the honest offer, and the dialog
+  explains why.
+
+### Changed
+
+- The update command lives in one place (`NPM_UPDATE_COMMAND`) so the console,
+  the CLI's printed instructions, and the docs cannot disagree about the flag.
+
+## [2.5.1] - 2026-10-21
+
+Version housekeeping, plus one fix for the tray.
+
+### Fixed
+
+- **Closing the terminal no longer takes the gateway down with it.** "Hide to
+  tray" started the gateway attached to the tray process, so the gateway died
+  whenever the tray did — and the tray died with the terminal that launched it,
+  which is why the icon appeared and then nothing was serving. The gateway is
+  now started detached, so it outlives both.
+
+  Detaching it costs the exit path nothing: `stopGateway` drains over HTTP
+  before it ever reaches for `kill()`, so **Exit** in the tray still stops the
+  gateway. What detachment does remove is the ability to wait on the child's
+  exit, so the tray polls `/health` instead — measured: with the tray killed,
+  the gateway keeps answering.
+
+### Changed
+
+- **`dist/` is rebuilt**, so the bundled dashboard and binary match 2.5.0
+  rather than the 20 October build they were carrying. The provider icons, the
+  "Jinhsi" sidebar badge, and the corrected CPU tile were all in the tree but
+  not in the shipped artifacts.
+
+### Fixed
+
+- **The dashboard manifest carries the release version.** `dashboard/package.json`
+  was left at 2.5.0 when the root moved to 2.5.1. Nothing publishes that package,
+  so nothing broke — but a check asserts the two agree, and it would have failed
+  on the next bump.
+- **The styling-ratchet regeneration command in its own comment was wrong.** It
+  named a `--scope`/filter invocation the test runner does not accept, so
+  following it produced a usage error and no manifest. It now names the command
+  that actually runs, and records that a relative root silently truncates every
+  path key, which reads as a tree with no debt.
+
+## [2.5.0] "Jinhsi" - 2026-10-21
+
+Release preparation includes 69 commits since 2.4.6.
+
+### Added
+
+- **The Notifications bell streams gateway alerts.** While the console is
+  open, it samples gateway memory every 10 seconds and checks for new releases
+  every minute. It reports high RSS (85% of system RAM) and sustained RSS growth
+  (20% over a minute), plus available updates. These are live-only server
+  notifications; they are not persisted, and a stalled GitHub check does not
+  block memory sampling.
+
+- **The providers page can hide providers with no account.** A 73-row catalog
+  where an operator has connected three still meant scrolling past seventy
+  cards to reach their own, so a new toggle filters to configured providers.
+  Credential-less providers (OpenCode Free, Exa, Parallel) stay visible: they
+  have no account because none is usable, not because one was never added, so
+  hiding them would hide a working route. The preference is per browser
+  (localStorage) and shared across tabs, like the existing privacy toggles.
+
+- **Console JSON responses carry a strong `ETag` and answer `304`.** A dashboard
+  poll for an unchanged window now costs a conditional request instead of the
+  whole payload — roughly 200 bytes instead of 8.8 KiB to 150 KiB per poll. The
+  cached usage endpoints (summary, chart, by-dimension, cache, requests) and
+  `/console/api/system/health` all participate. Health is now cached on the same
+  10-second Redis read-through as its siblings; it previously re-parsed 24
+  hourly telemetry files on every page load.
+
+- **Dashboard assets are precompressed at build time.** `dashboard/vite.config.ts`
+  emits a `.gz` beside every built text asset (gzip level 9, paid once per
+  deploy) and writes `dist/dashboard/precompressed-assets.json`. The gateway
+  serves the `.gz` when the client offered gzip, with `vary: accept-encoding`
+  and the same immutable cache header; a build without them still serves the
+  plain file.
+
+- **Two indexes** for the tenant-scoped provider reads:
+  `providers_tenant_id_idx` (migration `0013`) and
+  `provider_accounts_tenant_id_idx` (migration `0014`), in both dialects.
+  Neither table had an index serving the bare `tenant_id IS NULL OR tenant_id
+  = ?` that the provider list and the account listing use.
+
+- **Buddy providers can present a real CLI identity.** The CLI identity this
+  gateway sent was a hybrid no official client produces: `X-IDE-Type: CLI`
+  alongside desktop browser transport, and with every CLI-only marker missing.
+  The complete CLI contract is now available — the `X-Agent-*` envelope,
+  `X-IDE-Version` (which CodeBuddy never sent at all), the eight
+  `x-stainless-*` fingerprints, `traceparent`, and b3's parent span — and
+  `x-product` is the official `SaaS` rather than an invented `WorkBuddy`.
+
+  **Nothing changes by default.** Identity is exactly the header a wrong value
+  can get an account blocked on, so a provider only flips when an account or an
+  operator opts in; unset leaves every header byte-identical to before.
+
+- **Cursor is a bundled provider.** It speaks Connect-RPC over protobuf on a
+  bidirectional HTTP/2 stream, so it is reached through validated HTTP/2 egress
+  rather than `fetch`, and its Run origin is resolved per dispatch from
+  `GetServerConfig` instead of being a configured base URL.
+
+  Its tool loop spans **two client requests on one upstream Run**: the first
+  returns a tool call and the second submits that tool's result on the same Run,
+  so the Run — and the account and pool slot it holds — outlive the request that
+  opened them. A continuation is authorized by server-recorded tenant, API key,
+  provider, and account, not by the call id alone; a mismatch is refused, and a
+  call that is no longer pending fails explicitly rather than starting a Run the
+  model is not waiting on. An unanswered Run expires on its own
+  (`RUN_IDLE_TTL_MS`) so a tool round the client never answered cannot hold a
+  stream and a slot indefinitely.
+
+  Only an `mcp_args` call whose namespace and function name match a tool the
+  request declared is executed. Cursor's own shell, filesystem, and workspace
+  tools are answered `rejected`, never run. Images are sniffed and size-checked
+  before the Run is dialed, and image URLs must be HTTPS and are not followed
+  through redirects. Unrecognized bytes are rejected even when labelled as a
+  supported image type.
+
+  There is no quota collector and no static catalog: no Cursor quota endpoint is
+  established, and the roster is per-account and per-plan. See
+  [Cursor provider](documentation/features/cursor-provider.md).
+
+- **Trae is a working provider, on both realms.** `trae` and `traecn` are two
+  providers, not one region flag: separate core, account, and pay hosts, and a
+  CN `Cloud-IDE-JWT` against an intl `Bearer` plus a live client version — the
+  CN host answers 4015 without it. Login is the browser PKCE flow the login page
+  actually runs (login host resolved via `GetLoginGuidance`, callback path
+  `/authorize`, `AuthCode` redeemed through `public/oauth/ExchangeToken`),
+  refresh is rotation-aware, and a personal access token imports as a
+  refreshable credential. A port collision during login is now a 409
+  `oauth_callback_port_unavailable` instead of a hang; `CARTETHYIA_OAUTH_CALLBACK_PORT`
+  (default `59653`) moves it.
+
+  Dispatch selects the region host per account — an SG token is refused by the
+  US core with 1001 — and follows the row's own endpoint, which matters because
+  Trae serves two **disjoint** surfaces: chat
+  (`/api/ide/v1/llm_raw_chat`, keyed by `model_name`) and agent
+  (`/api/agent/v3/llm_utils_chat`, keyed by `config_name` plus `config_source`).
+  The picker's models live only on the agent surface, so the intl catalog is
+  agent-only. Tool calling works there: `parameters` is a JSON *string* upstream,
+  responses nest under `function_call`, and fragmented deltas are reassembled by
+  index.
+
+- **Qoder publishes names you can call.** Upstream keys are opaque slots
+  (`dfmodel`, `cmodel`), so the catalog now publishes caller-facing names
+  (`deepseek-v4.1-flash`, `cantus`) and dispatch translates them back; a slot
+  with a known name appears under that one id only. A second realm, `qodercn`,
+  has its own gateway host, OAuth client, roster, and icon. The roster reads the
+  **selectable** context maximum rather than the active one — 180k was being
+  published where 1M is selectable — and the live list is cached 300 s per realm.
+
+- **`/v1/embeddings`, `/v1/audio/transcriptions`, and `/v1/audio/speech`** are
+  open as **passthrough** surfaces. The gateway routes them, applies admission,
+  leasing, failover, and accounting, and forwards the body untouched — no
+  bundled adapter implements them, because there is no wire here to translate.
+  They are useful against a compatible upstream you configure yourself, and a
+  model row carrying the matching service kind is all that is needed. These
+  three had previously been listed in the route table with no handler behind
+  them, so they advertised a surface that 404d; a test pinned that absence, and
+  both are updated.
+
+  A **custom** provider is read as able to serve every service kind, so all
+  three are reachable without touching the manifest. The widening is taken from
+  the canonical tuple rather than a second list, so a surface added later is
+  reachable immediately instead of silently excluded.
+
+- **`/v1/images/generations` and `/v1/videos/generations`** are exposed on the
+  gateway. Both take an opaque body and let the provider's own adapter shape it,
+  so what a model accepts is what that provider accepts. Images are served by
+  Gemini, Antigravity, Codex, and the Buddy family. Video is declared only by
+  CodeBuddy and WorkBuddy, via `seedance-2.5`, submitted as an async task the
+  adapter polls to completion rather than returning a clip inline. A **custom**
+  provider is not limited to either list — `providerServiceKinds` grants an
+  unregistered upstream all three kinds, so any OpenAI-compatible host you point
+  at can serve both routes, and a remote that lacks them answers with its own
+  error rather than a gateway refusal.
+
+- **`models.free_tier`** (migration `0019`, both dialects): whether the provider
+  publishes a model as free. Nullable and three-valued — `true` free, `false`
+  billed, `NULL` unstated — because Qoder omits `is_free` on several rows and
+  collapsing that absence into `false` would assert a fact nobody measured. The
+  dashboard shows it as a tier badge, and the badge never moves a row between
+  catalog groups.
+
+- **An L2 cache with cross-process invalidation.** `src/persistence/shared-cache.ts`
+  adds `readShared`/`writeShared` for small values and
+  `publishInvalidation`/`subscribe` for large derived ones — the route snapshot
+  costs 11 SELECTs, so a console write now broadcasts instead of every process
+  re-deriving it. Wired into auth (keyed by token hash), the settings revision,
+  and the route snapshot. Inert without Redis: `REDIS_URL` is what makes it
+  cross-process, and without it behavior is exactly today's in-process caching.
+
+### Changed
+
+- **Copilot Luna Auto now exposes one canonical efficient model id.**
+  `gpt-6-luna` selects the `efficiency` tier. The separate
+  `gpt-6-luna-low`, `gpt-6-luna-medium`, and `gpt-6-luna-high` catalog entries
+  are removed; the latter two no longer appear from account discovery either.
+
+- **Chat decoding recovers tool calls when an upstream emits the captured
+  `<tool_calls:…>` envelope as assistant text.** Previously the XML-like call
+  and argument tags appeared in the answer and no tool ran. Complete envelopes
+  are now recovered across SSE chunk boundaries; only names declared by the
+  request can become calls, and the same markup in the reasoning channel is
+  removed without executing it. An incomplete envelope is neither run nor
+  surfaced.
+
+- **gzip now applies only where it said it did.** The compression wrapper is
+  scoped by a path allowlist (`/console/api/` and `/metrics`) inside
+  `gzipResponse`. Elysia merges a child instance's `hoc` into the root app, so
+  the wrapper was running for every route in the process — `/v1/models` was
+  being compressed as a side effect, contradicting the module's own docstring.
+  `/v1/*` is now left alone. Responses with no body, and bodies over a new
+  1 MiB ceiling, are also passed through: the ceiling bounds the synchronous
+  `gzipSync` stall on a multi-megabyte backup export.
+
+- **Background work is less frequent.** Measured on an idle gateway with no
+  traffic, PostgreSQL transactions per 5 minutes fell from **138 to 56** (about
+  28/min to 11/min). Six buddy growth tasks move from hourly
+  to daily (each is a once-per-day claim, already ledger-guarded, so 23 of 24
+  passes found nothing); `buddy-trial` 6 h → 24 h; `account-enrichment-sweep`
+  30 s → 10 min; `console-session-sweep` 1 h → 12 h (sessions live 48 h);
+  `client-version-monitor` 15 min → 30 min, matching its own resolver cache
+  TTL; `pool-agent-sweep` 1 min → 5 min. `quota-refresh-sweep` refreshes
+  entries at least 8 minutes old instead of 4 — half the 15-minute cache TTL,
+  so an account is refreshed about twice per window rather than three times.
+
+- **The share stats rollup is cached for 10 s, not 2 s**, and the share SSE tick
+  moves to 10 s to match. At 2 s the cache expired on every tick, so every push
+  re-parsed the retained telemetry window.
+
+- **The catalog re-seed is gated on a revision signal.** Every snapshot rebuild
+  used to re-run the bundled catalog seed — a `DELETE` per provider plus a full
+  upsert — and `account-health-sweep` invalidates the snapshot on any cooldown
+  recovery, so a 30-second timer could push that onto the next proxy request.
+  The re-seed now runs only when a provider was registered, edited, or retired.
+
+- **The dashboard reuses cached data more aggressively.** The default
+  `staleTime` rises from 10 s to 60 s, and to 5 minutes for the CLI tool
+  registry and runtime settings. Hover prefetch now targets what each
+  destination renders (settings and keys, providers, pools) rather than
+  `system.health`, which none of those pages display.
+
+  settings. Account, credential, key, share, audit, quota, and payload reads are
+  never persisted, so the snapshot holds no unmasked values at rest. Logout and
+  401/403 clear the persisted snapshot alongside the in-memory cache.
+
+- **Five dependencies nothing imported are gone.** `@bufbuild/protobuf`,
+  `@electric-sql/pglite`, `impit`, `exact-mirror`, and `undici` had zero real
+  imports anywhere: every `protobuf` hit was prose in a comment, the grok quota
+  decoder is hand-rolled, lite mode already used `bun:sqlite`, and `impit`
+  alone carried eight platform-specific optional binaries. `exact-mirror` still
+  installs because elysia declares it a required peer — that is elysia asking,
+  not this project.
+
+- **Buddy model discovery asks `/v3/config` first.** Both reference gateways
+  treat it as the primary catalog and the personal-models path as the narrower
+  fallback; this gateway only ever called the latter. The old path still
+  answers whenever the new one does not, so a host serving only it behaves
+  exactly as before. The live model list will move — the last snapshot lists
+  `gpt-6-astra`, which the bundled catalog omits today.
+
+- **`workbuddycn` probes the CN directory path.** It was asking a CN host for
+  the international path, which the CN edge answers with 500 rather than 404 —
+  so the failure read as an upstream outage instead of a wrong path. CN billing
+  also moves to `www.codebuddy.cn`, the host the reference bills that realm on,
+  while `X-Domain` stays the domain recorded at login.
+
+- **Qoder output ceilings are per model, not one clamp.** A hardcoded 32k
+  applied to every row alike, which is what made the whole catalog look capped
+  at a single number. Upstream states no output limit at all, so the ceiling now
+  comes from the row: 384k for DeepSeek-V4, 512k for MiniMax-M3, 131k for GLM.
+
+- **API keys are `pn-carte-` and share keys `sh-carte-`, both with a 16-character
+  tail.** Personal keys were `carte_` and share keys `sh-carte_`, each with a
+  12-character tail. The separator is now a hyphen and the tail is 16
+  characters — 12 bytes base64url-encoded, which is exactly 16 with no padding.
+  Keys already issued keep the prefix they were created with: nothing resolves a
+  key by its prefix, so no stored credential stops working, and regeneration is
+  what moves a row to the new form.
+
+- **Qoder's plan refusal is scoped per model.** Code `112` was treated as
+  `auth_invalidated`, which cooled the whole account for what is a statement
+  about one model on one account. It now enters the model-scoped unreachable
+  ladder (6 h, doubling, capped at 24 h). An insufficient-quota refusal still
+  cools the account, because that one really is about the account.
+
+- **Cursor's client version is discovered, not pinned.** `x-cursor-client-version`
+  is `cli-<version>-<sha7>`, and both halves come from the official download API
+  — the only source that returns them together. The constant that was previously
+  hardcoded is now only what a cold process sends before the first fetch.
+
+- **Health writes no longer invalidate the whole route snapshot.**
+  Classification carries whether a write is visible to routing, and the
+  model-scoped path — which touches neither `status` nor `cooldownUntil` —
+  reports false. OAuth credentials are also cached with a TTL bound to token
+  expiry, removing a SELECT plus a decrypt from every attempt.
+
+- **Claude caching anchors on the last system block.** The breakpoint moved from
+  the first block to the last, so a stable prefix actually stays stable. Expect
+  one cache-miss wave on upgrade as fingerprints change.
+
+- **Hermes egress and identity.** The egress pool is skipped by default
+  (Cloudflare answers 403 for pool addresses) and the Client-identity control is
+  locked to the adapter's own User-Agent. `stepfun/step-5-preview:free` is
+  removed — retired upstream, now a 404 — and `poolside/laguna-xs-2.1:free`
+  drops from 131072 to 32768 output tokens.
+
+### Fixed
+
+- **Console recovery clears stale login lockouts.** The local `carte` reset
+  previously removed console users but left the per-login failure buckets in
+  `console_lockouts`; recreating the account from the same IP therefore stayed
+  temporarily blocked. The reset now clears both in one transaction.
+
+- **A probe no longer retires an egress on the first connection failure.**
+  `bun run probe:egress` reported "fails the first time, works on retry"
+  because one dead socket ended the probe: a cold dial has to resolve the
+  proxy, open the CONNECT tunnel, and finish a TLS handshake, and any of those
+  can be refused or reset once and then accepted on the very next attempt.
+  Transport failures are now retried up to three times.
+
+  A real refusal is *not* retried — a `403 FreeTierError` is an answer about
+  the address, not a failure, so a blocked egress still reports immediately
+  instead of spending three attempts proving it. Our own deadline is not
+  retried either, so a slow address is reported slow rather than consuming the
+  whole budget re-dialling it. Measured against a dead endpoint: 53 ms and one
+  attempt before, 1271 ms and three attempts now; a genuine 403 still answers
+  in 888 ms with a single attempt.
+
+- **`GET /console/api/backup/export?compressed=1` is no longer double-encoded.**
+  The route declares an opt-out instead of `content-encoding: gzip`: the bytes
+  are base64 of a gzip stream, and a client told "this is gzip" tried to inflate
+  the base64 text and failed. The compressed download works again.
+- `/console/api/system/usage/requests` now honours `limit` on every page, not
+  only the first: a cursor page used to fetch the whole retention window.
+- Single-event detail reads no longer parse the retention window to find one row.
+- The per-account check-in marker is read in one batch (`MGET`, or one
+  `WHERE account_id IN (...)`) instead of one round trip per account.
+- Provider deletion bumps the catalog revision, so the next snapshot rebuild
+  prunes the deleted provider's models.
+- **Two streaming-contract tests no longer hang.** They waited for the provider
+  generator to advance before issuing the read that would let it advance: the
+  stream is demand-driven, so the generator parks after each chunk until the
+  next pull. Both now keep a second read outstanding — still never cancelled,
+  which is the property under test — and each passes in about a second instead
+  of timing out at 15 s. No production code changed; the deadlock was in the
+  test.
+- **Built assets are now recognised as hashed, so they cache correctly.** The
+  filename check only matched the old `app.a1b2c3d4.js` spelling and never the
+  hyphenated `app-BCnqn3N3.js` that Vite actually emits — measured against a
+  real build it matched **0 of 288 files**. Every bundle was therefore served
+  with a one-hour revalidating header instead of `immutable`, so the browser
+  re-downloaded the whole dashboard after every deploy, and no asset was served
+  from its precompressed sibling. Both separators are now matched, with a
+  generated-looking check so plain words like `console-backgrounds.jpg` are
+  still excluded.
+
+- **Cursor responses are no longer discarded.** `decodeServerMessages` was
+  dropping the final frame because Cursor sets `END_STREAM` on the frame that
+  carries the answer — every response was thrown away and the Run looked like a
+  heartbeat deadlock. Refusals arrive as Connect JSON envelopes inside a 200
+  stream and are now raised as `quota_exceeded`/502 instead of being read as
+  success, and a Run with a pending tool call is no longer torn down before the
+  result comes back. Separately, `grok-4.6` is no longer rewritten to
+  `cursor-grok-4.6` upstream; that rewrite made every Grok Run answer
+  "AI Model Not Found".
+
+- **A failed credential lookup no longer leaks, and no longer 500s.** The log
+  line carried the SQL statement **and the API key hash** at request rate. It is
+  now a sanitized message, a 503 `accounts_unavailable` instead of a 500, a 1 s
+  short-circuit so a degraded store does not stampede, and a flush backoff.
+
+- **A single `apiKey: sk-…` credential line is stored as a key.** It was
+  previously saved as the literal `key: value` line, so the key was lost and
+  every dispatch using it failed auth.
+
+- **Discovery reads what the provider states.** Output limits were falling back
+  to 64,192 on a 384k model because `max_completion_tokens` was not read;
+  `capabilities.input` and declared `reasoning`/`tool_call` were pinned instead
+  of parsed. All three now come from the upstream row.
+
+- **"None" in Client identity now sticks.** Selecting it fell back to the
+  previous value because an empty emission was rejected unconditionally; it is
+  now accepted only when the caller published a labelled empty option, which is
+  what the identity dropdown does. The API-format dropdown keeps the old rule.
+
+- **"Test all" reports progress, not a verdict.** It showed pass/fail per
+  account while still running, so a partial sweep read as a result. It now shows
+  `Tested N/M`.
+
+- **The memory watcher reads memory that is actually current.** The
+  notifications feed sampled RSS through `health`, which is cached for 10 s —
+  and it samples on that exact cadence, so consecutive samples could be the same
+  cached bytes. A growth trend over identical samples cannot fire, and a spike
+  could be reported up to 10 s late with a value from before it. It now reads
+  process memory directly, which costs nothing and is never stale. The cached
+  `health` read is unchanged for the dashboard tile, which is what the cache is
+  for.
+
+- **CPU load no longer reports a fake 0.0% on Windows.** `loadavg()` is
+  `[0, 0, 0]` on every Windows build — there is no such syscall and Node returns
+  a zeroed tuple rather than failing — so divided by cores it produced a
+  confident "0.0%" on a busy gateway, which reads as idle. Reported as
+  unavailable instead, and the tile says load average is not reported on this
+  platform.
+
+## [2.4.6] — 2026-10-18
+
+### Changed
+
+- **`scripts/` is grouped by what ships.** `scripts/cli/` is now the only
+  directory in the npm package's `files` array, so the boundary between "runs on
+  the operator's machine" and "runs in the repository" is visible in the tree
+  instead of in a hand-maintained list. The list had already drifted: it shipped
+  `scripts/operations/restart.ts`, which imports `scripts/build/binary.ts` — a
+  directory that was not shipped, so the file was broken in every published
+  tarball. `tray-assets/` moved into `scripts/cli/tray/assets/` for the same
+  reason: only the CLI ever read it.
+
+- **`scripts/cli/cli.ts` is nine files.** It had grown to 743 lines and twelve
+  functions covering dispatch, the gateway lifecycle, the menu, the tray, and
+  the admin calls, with `startMenu` alone at 203 lines. Dispatch is `main.ts`;
+  one file per subcommand under `command/`; the gateway lifecycle under
+  `gateway/`; the enquirer prompts, wordmark, and background spawn under `ui/`;
+  and the helpers under `support/`.
+
+- **`scripts/shared/env.ts` is four files.** It held the dotenv reader, the TCP
+  probe, the Bun version check, the PostgreSQL detector, and the per-OS hints in
+  one 269-line module, so `doctor` pulled in the dotenv parser to ask a question
+  about a socket. Now `support/env.ts`, `support/services.ts`, `support/bun.ts`,
+  and `support/platform.ts`.
+
+- **Directory names say what they hold.** `build/` and the two operations that
+  run the compiled artifact are `binary/`; the browser automation under `dev/`
+  is `qa/`, leaving `dev/` for the dev server; `test/` is `ci/`, which stops it
+  from reading as the repository's own `test/` directory. `build/binary.ts` is
+  `binary/compile.ts`, which is what it does.
+
+### Added
+
+- **`cartethyia doctor`.** `doctor.ts` shipped in the package but no `case` in
+  the dispatcher reached it, so the command answered "Unknown command". It is
+  wired now, and `bun run doctor` still works.
+
+### Fixed
+
+- **`carte --tray` reports success instead of timing out.** The tray is spawned
+  detached with no stdio, so it reports readiness through a one-shot signal
+  file the launcher polls. Nothing wrote that file: the 2.4.3 tray refactor
+  dropped the call while keeping the waiter, so every `carte --tray` waited out
+  its 60 s deadline and then reported that the tray had failed — while the tray
+  was running.
+
+- **The tray is spawned with no console window.** The launcher still used
+  `cmd /c start "" /b`, and `cmd` is a console application: it allocated the
+  console the whole change was meant to avoid, and it also exited immediately
+  with code 0, which the launcher read as "the tray died". It now goes through
+  `wscript.exe` and the same hidden-window VBS that "Hide to tray" uses.
+
+- **`carte` exits in 640 ms instead of 30.7 s.** The graceful-drain wait in
+  `gateway/stop.ts` arms a 30 s timeout and never clears it, so the event loop
+  stayed alive for the full 30 s after the gateway was already gone.
+
+- **The launcher resolves the package root and Bun correctly from `bin/`.**
+  Moving the launchers one level deeper left `packageRoot` pointing at
+  `scripts/`, and the launcher runs under Node, so `process.execPath` is
+  `node.exe` rather than the Bun the child needs. Bun is now resolved from
+  `PATH` (or `CARTETHYIA_BUN`).
+
 ## [2.4.5] — 2026-10-18
 
 ### Fixed

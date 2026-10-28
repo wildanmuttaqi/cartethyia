@@ -1,25 +1,30 @@
 # OpenCode free tier (`opencode`)
 
-Two different things refuse a free-tier dispatch, and confusing them costs
-hours. **Read this section before changing any header.**
+Two different classes can refuse a free-tier dispatch, and confusing them costs
+hours. **Read this section before changing any header.** Measurements below
+are dated upstream observations, not a permanent contract; revalidate before
+changing current behavior.
 
 | Symptom | Cause | What to change |
 |---|---|---|
 | 403 `FreeTierError` from **every** header permutation, and the official client fails too | **Egress IP is blocked** | Nothing in the request. Change the egress IP. |
 | 403 `FreeTierError` on one shape, 200 on another | Request shape (tools/stream/wire) | The request, per the sections below |
 
-**The first check is always: does the official client work from this host?**
+**The first check is: does the official client work from this host?**
 Run `opencode run -m opencode/big-pickle "reply PONG"` with the real config
 directory. If it also returns 403 `FreeTierError`, the block is at the IP
-level and no header, tool, session, version, or credential change will help.
+level for that tested path; further request-shape edits are not the next
+experiment. Confirm with a controlled alternate egress before acting.
 Confirmed 2026-10-17: the same byte-identical request returns **403 direct** and
 **200 through a proxy** (exit `193.202.12.2`). `Bearer public` was valid the
 whole time; only the egress IP differed.
 
-Corollary for deployments: a datacenter IP (Railway and similar) is blocked.
-`opencode` cannot be fixed in `provider.ts` — it needs an egress proxy.
+Corollary for deployments: the observed datacenter egress was blocked. When
+the same controlled test fails direct and succeeds through another exit,
+changing `provider.ts` headers is not the remedy; use an authorized egress
+path.
 
-## Wire shape (verified 200)
+## Wire shape (observed 200 on 2026-10-17/18; revalidate)
 
 - Base: `https://opencode.ai/inference/v1`; endpoint
   `/chat/completions` for free ids.
@@ -45,8 +50,8 @@ Corollary for deployments: a datacenter IP (Railway and similar) is blocked.
   `FreeUsageLimitError`** on 2026-10-18 — rate-limited, not refused. Treat it as
   a fallback whose quota is unknown, not as a dead lane.
 
-Full measured contract with the correction history:
-`documentation/archive/opencode-free-tier.md`.
+These measurements describe the observed window, not a permanent upstream
+contract. The superseded investigation is no longer in the tree.
 
 Absent the fingerprint, a free-model request is refused:
 
@@ -117,13 +122,14 @@ like an unreachable host.
 - Live ids: `GET https://opencode.ai/zen/v1/models` (open, no credential).
   Limits and status: `https://models.opencode.ai/api.json` — a `status:
   "deprecated"` row is on its way out; do not guess either.
-- Known-good real-client capture:
-  `documentation/archive/opencode-freetier-capture.log`. Its `user-agent` is
-  stale — add the version segment before replaying it.
+- A known-good real-client capture lived alongside the superseded
+  investigation and was dropped with it; re-capture from a real client rather
+  than trusting a stale one, and note its `user-agent` needs the version
+  segment before replaying.
 
-## What does NOT matter
+## What did not affect the observed result
 
-Verified by replay, so do not spend time here:
+Observed by replay, so check these only when current evidence points to them:
 
 | Suspect | Verdict |
 |---|---|

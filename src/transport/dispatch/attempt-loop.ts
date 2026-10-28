@@ -10,7 +10,13 @@
  */
 import { GatewayError } from "../../protocol/gateway-error";
 import type { ResolvedCredential } from "../../providers/provider-contracts";
-import { classifyTerminalOutcome, fallbackRetryDelayMs, isRetryableFailure, sleep } from "../failure-policy";
+import {
+  classifyTerminalOutcome,
+  fallbackRetryDelayMs,
+  isRetryableFailure,
+  MIN_RETRY_BUDGET_MS,
+  sleep,
+} from "../failure-policy";
 import { resolveRouteMaxAttempts } from "../../config/timeouts";
 import type { OAuthTokenRefresher } from "../../providers/authentication/oauth-refresh-service";
 import type { OAuthRefreshService } from "../../providers/authentication/oauth-refresh-service";
@@ -21,6 +27,7 @@ import type { RouteCandidate, Reservation, RouteSnapshotService } from "../routi
 import type { CartethyiaDatabase } from "../../persistence/db-handle";
 import { acquireAttemptLeases, releaseAttemptLeases } from "./leases";
 import type { AttemptLeaseSource, AttemptLeases } from "./leases";
+import type { AttemptLeaseOwnership } from "./leases";
 import { metrics } from "../../observability/metrics";
 import type { NetworkPoolSelector } from "../../network/pool/selector";
 import type { ProxyRequestState } from "../request/state";
@@ -101,6 +108,14 @@ interface AttemptContext<TAdapter> {
   readonly attemptIndex: number;
   readonly providerCapture: ProviderExchangeCapture;
   /**
+   * Ownership of this attempt's account/network-pool release, when the route
+   * acquired a pool slot. A provider session that outlives this request (a
+   * Cursor Run held open for the client's tool result) calls
+   * `transferToProviderSession()` and takes it over; otherwise the request
+   * releases it through `releaseByResponse()`.
+   */
+  readonly leaseOwnership?: AttemptLeaseOwnership | undefined;
+  /**
    * Hands lease ownership to the value this attempt returns (a streaming
    * response releases its own lease on stream completion/cancel). Without it
    * the loop releases the leases in `finally`.
@@ -178,12 +193,8 @@ export async function runAttemptLoop<TResult, TAdapter>(
   const perMemberCap =
     memberCount > 1 ? Math.max(1, Math.ceil(maxAttempts / memberCount)) : maxAttempts;
   const attemptsByMember = new Map<string, number>();
-  // Minimum wall-clock left before a follow-on attempt is worth starting. A
-  // retry repeats the whole pre-dispatch phase (credential, admission, pool
-  // slot, prepare), so it needs at least that much budget on top of whatever
-  // the upstream itself takes. Below this, the attempt would be killed by the
-  // deadline before it could return anything the client could use.
-  const MIN_RETRY_BUDGET_MS = 15_000;
+  // The budget itself is owned by failure-policy, so this loop, the
+  // empty-stream replay, and the Codex retry budget cannot drift apart.
   let index = 0;
   let attempts = 0;
   while (index < candidates.length && attempts < maxAttempts) {
@@ -252,6 +263,7 @@ export async function runAttemptLoop<TResult, TAdapter>(
     let reservation: Reservation | undefined;
     let proxySlot: { poolId: string; release: () => void } | undefined;
     let networkPoolId: string | undefined;
+    let leaseOwnership: AttemptLeaseOwnership | undefined;
     let bindingEstablished = false;
     let leasesRetained = false;
     let retryDelayMs = 0;
@@ -278,6 +290,7 @@ export async function runAttemptLoop<TResult, TAdapter>(
       reservation = attemptLeases.reservation;
       proxySlot = attemptLeases.proxySlot;
       networkPoolId = attemptLeases.networkPoolId;
+      leaseOwnership = attemptLeases.ownership;
       // Downstream error paths gate `commitUsage(estimated)` on this flag so
       // the estimate is only charged once the request truly consumed
       // upstream resources; the lease and reservation are held from here on.
@@ -290,6 +303,7 @@ export async function runAttemptLoop<TResult, TAdapter>(
         leases: attemptLeases,
         attemptIndex: index,
         providerCapture,
+        ...(leaseOwnership === undefined ? {} : { leaseOwnership }),
         retainLeases: () => {
           leasesRetained = true;
         },
@@ -305,7 +319,7 @@ export async function runAttemptLoop<TResult, TAdapter>(
       // A drain is a *server* close, not a client cancel: it must be recorded
       // as a failure with the shutdown code, and it is never retryable.
       // Status, category, and origin come from one classifier so they cannot
-      // disagree (a `cancelled` row used to carry `transport_unavailable`/502).
+      // disagree and mark a `cancelled` row `transport_unavailable`/502.
       const terminal = classifyTerminalOutcome(error, state.abortController.signal);
       const cancelled = terminal.status === "cancelled";
       // A failure the *pool* caused retires that pool, not the candidate: the
@@ -450,7 +464,10 @@ export async function runAttemptLoop<TResult, TAdapter>(
       retryDelayMs = fallbackRetryDelayMs(attempts);
     } finally {
       if (!leasesRetained)
-        await releaseAttemptLeases({ lease, reservation, proxySlot }, leaseSource.routingEngine);
+        await releaseAttemptLeases(
+          { lease, reservation, proxySlot, ...(leaseOwnership === undefined ? {} : { ownership: leaseOwnership }) },
+          leaseSource.routingEngine,
+        );
     }
     attempts += 1;
     // Charged to the member that spent it, so one member's own attempts are
@@ -460,20 +477,21 @@ export async function runAttemptLoop<TResult, TAdapter>(
       try {
         await sleep(retryDelayMs, state.abortController.signal);
       } catch {
-        // Abort during backoff used to escape as the sleep's own error with
-        // no counter increment: attempts already recorded their telemetry,
-        // but `proxy_requests_total` missed the request. Fail with the last
-        // attempt's error so the client sees the real cause, counted once.
+        // Fail with the last attempt's error so the client sees the real cause,
+        // counted once: attempts already recorded their telemetry, but escaping
+        // as the sleep's own error would leave `proxy_requests_total` missing
+        // the request.
         metrics.proxy_requests_total.inc(1, { status: "cancelled" });
         throw lastError;
       }
     }
   }
   // The loop can fall out with a retryable error still in hand (every attempt
-  // was retryable, so the terminal branch in the catch never fired). That used
-  // to throw with no completion: no telemetry row, no payload capture, and
-  // `state.completed` left clear — so a request that genuinely exhausted its
-  // attempts was invisible in Request Detail. Record it as terminal here.
+  // was retryable, so the terminal branch in the catch never fired). Throwing
+  // here instead of recording it would leave no telemetry row, no payload
+  // capture, and `state.completed` clear — so a request that genuinely
+  // exhausted its attempts would be invisible in Request Detail. Record it as
+  // terminal here.
   if (!state.completed) {
     const terminal = classifyTerminalOutcome(lastError, state.abortController.signal);
     const lastCandidate = candidates[Math.min(index, candidates.length - 1)];

@@ -4,12 +4,7 @@ import { randomUUID } from "node:crypto";
 import { gunzipSync, gzipSync } from "node:zlib";
 
 export interface PayloadFileReference {
-  /**
-   * `jsonb-file` is a frame written before compression existed: plain JSON.
-   * New frames are `jsonl-file`: the same JSON, gzipped. The row names its
-   * encoding, so a reader never guesses and an old row still resolves.
-   */
-  readonly storage: "jsonb-file" | "jsonl-file";
+  readonly storage: "jsonl-file";
   readonly file: string;
   readonly offset: number;
   readonly length: number;
@@ -28,7 +23,7 @@ export function isPayloadFileReference(value: unknown): value is PayloadFileRefe
   if (typeof value !== "object" || value === null) return false;
   const record = value as Record<string, unknown>;
   return (
-    (record["storage"] === "jsonb-file" || record["storage"] === "jsonl-file") &&
+    record["storage"] === "jsonl-file" &&
     typeof record["file"] === "string" &&
     typeof record["offset"] === "number" &&
     typeof record["length"] === "number" &&
@@ -62,7 +57,13 @@ export function payloadReferenceFromRow(row: {
   return isPayloadFileReference(candidate) ? candidate : undefined;
 }
 
-const FRAME_HEADER_BYTES = 4;
+/** Extension for frame files. */
+const FRAME_FILE_SUFFIX = ".jsonl";
+
+function isFrameFileName(name: string): boolean {
+  return name.endsWith(FRAME_FILE_SUFFIX);
+}
+
 const MAX_FRAME_BYTES = 256 * 1024 * 1024;
 const DEFAULT_MAX_FILE_BYTES = 64 * 1024 * 1024;
 const DEFAULT_DIRECTORY = "./data/telemetry-payloads";
@@ -96,7 +97,7 @@ function checksum(value: Buffer | readonly Buffer[]): string {
 }
 
 function fileName(now = new Date()): string {
-  return `${now.toISOString().slice(0, 13).replaceAll(":", "-")}-${process.pid}.jsonb`;
+  return `${now.toISOString().slice(0, 13).replaceAll(":", "-")}-${process.pid}${FRAME_FILE_SUFFIX}`;
 }
 
 /**
@@ -115,34 +116,50 @@ function compressFrame(parts: readonly Buffer[]): Buffer {
 async function appendFrame(frame: PayloadFrame, parts?: readonly Buffer[]): Promise<PayloadFileReference> {
   const directory = payloadDirectory();
   await mkdir(directory, { recursive: true });
-  parts ??= [Buffer.from(JSON.stringify(frame), "utf8")];
-  const encoded = compressFrame(parts);
-  if (encoded.byteLength > MAX_FRAME_BYTES) throw new Error("telemetry payload frame exceeds limit");
+  // Encoded as a line here rather than at the write, so the cap, the checksum,
+  // and the reference all describe the same bytes that land on disk — the
+  // prebuilt-parts path and the plain one cannot disagree about the shape.
+  const json = parts === undefined
+    ? Buffer.from(JSON.stringify(frame), "utf8")
+    : Buffer.concat(parts);
+  const compressed = compressFrame([json]);
+  if (compressed.byteLength > MAX_FRAME_BYTES) throw new Error("telemetry payload frame exceeds limit");
+  const encoded = toLine(compressed);
   const file = fileName();
   const path = join(directory, file);
   const currentSize = await stat(path).then((value) => value.size).catch(() => 0);
   const offset = currentSize;
-  if (offset + FRAME_HEADER_BYTES + encoded.byteLength > maxFileBytes()) {
-    const rotated = `${Date.now()}-${randomUUID()}.jsonb`;
-    return appendFrameToPath(frame, join(directory, rotated), basename(rotated), undefined, encoded);
+  if (offset + encoded.byteLength > maxFileBytes()) {
+    const rotated = `${Date.now()}-${randomUUID()}${FRAME_FILE_SUFFIX}`;
+    return appendFrameToPath(join(directory, rotated), encoded, basename(rotated));
   }
-  return appendFrameToPath(frame, path, file, offset, encoded);
+  return appendFrameToPath(path, encoded, file, offset);
+}
+
+/**
+ * One frame as a stored line: base64 of the gzipped JSON, newline-terminated.
+ *
+ * A newline is the frame delimiter, so the file is a text file of base64 lines
+ * and a frame's extent is found by reading to the next `\n` — a binary length
+ * header would make every frame opaque, unreadable without first decoding a
+ * big-endian length and then gunzipping exactly that many bytes.
+ *
+ * base64 rather than raw gzip bytes because gzip contains newlines, which
+ * would make the delimiter ambiguous.
+ */
+function toLine(compressed: Buffer): Buffer {
+  return Buffer.from(`${compressed.toString("base64")}\n`, "utf8");
 }
 
 async function appendFrameToPath(
-  frame: PayloadFrame,
   path: string,
+  encoded: Buffer,
   knownFile = basename(path),
   knownOffset?: number,
-  knownEncoded?: Buffer,
 ): Promise<PayloadFileReference> {
-  const encoded = knownEncoded ?? compressFrame([Buffer.from(JSON.stringify(frame), "utf8")]);
   const offset = knownOffset ?? await stat(path).then((value) => value.size).catch(() => 0);
-  const header = Buffer.alloc(FRAME_HEADER_BYTES);
-  header.writeUInt32BE(encoded.byteLength, 0);
   const handle = await open(path, "a");
   try {
-    await handle.write(header);
     await handle.write(encoded);
   } finally {
     await handle.close();
@@ -151,18 +168,33 @@ async function appendFrameToPath(
     storage: "jsonl-file",
     file: knownFile,
     offset,
-    length: FRAME_HEADER_BYTES + encoded.byteLength,
+    length: encoded.byteLength,
     checksum: checksum(encoded),
     version: 1,
   };
 }
 
+/**
+ * The frame's body keys, in the same order `buildPayloadRecord` serializes
+ * them.
+ *
+ * The record hands the writer one string per body already serialized, so the
+ * two orders must agree or every body lands under the wrong key. The order is
+ * drawer order with the legacy `response_body` alias last, for the same reason
+ * the record accounts it last: it names no panel of its own and must not
+ * spend the shared byte budget ahead of the provider stages.
+ *
+ * There are five, not four. `buildPayloadRecord` builds one string per surface
+ * and `response_body` is the fifth — dropping it here wrote the frame with the
+ * first four bodies and silently discarded the last, so a capture whose client
+ * response was in the legacy slot came back with that panel empty.
+ */
 const FRAME_BODY_KEYS = [
   "request_body",
-  "response_body",
-  "client_response_body",
   "provider_request_body",
   "provider_response_body",
+  "client_response_body",
+  "response_body",
 ] as const;
 
 /**
@@ -230,14 +262,7 @@ export async function readPayloadFrame(reference: PayloadFileReference): Promise
     await handle.close();
   }
   const frame = data;
-  const length = frame.readUInt32BE(0);
-  if (length <= 0 || length + FRAME_HEADER_BYTES !== frame.byteLength) return undefined;
-  const stored = frame.subarray(FRAME_HEADER_BYTES);
-  if (checksum(stored) !== reference.checksum) return undefined;
-  // The row says which encoding it wrote. A compressed row that does not
-  // decompress is a damaged frame, reported as absent like any other
-  // unreadable frame, never thrown into the request that asked for it.
-  const json = reference.storage === "jsonl-file" ? gunzipFrame(stored) : stored;
+  const json = frameJsonFromSlice(frame);
   if (json === undefined) return undefined;
   const parsed = JSON.parse(json.toString("utf8")) as PayloadFrame;
   return parsed.version === 1 ? parsed.payload : undefined;
@@ -253,6 +278,24 @@ function gunzipFrame(stored: Buffer): Buffer | undefined {
 }
 
 /**
+ * The JSON of one frame read out of a file.
+ *
+ * A frame is a base64 line — base64 because gzip contains newlines, which would
+ * make the newline delimiter ambiguous. The bytes are gunzipped only if they
+ * are gzip; `gunzipFrame` returning `undefined` is what marks a slice as not a
+ * frame.
+ */
+function frameJsonFromSlice(
+  slice: Buffer,
+): Buffer | undefined {
+  // Frames are a base64 line. The trailing newline is not part of the payload.
+  const text = slice.toString("utf8").trim();
+  if (text.length === 0) return undefined;
+  const gzipped = Buffer.from(text, "base64");
+  return gunzipFrame(gzipped);
+}
+
+/**
  * What a whole file's parseable frames say about reclaiming it.
  *
  * `live` — at least one frame is still inside its retention window.
@@ -262,40 +305,25 @@ function gunzipFrame(stored: Buffer): Buffer | undefined {
  */
 type FrameLiveness = "live" | "none" | "unknown";
 
-/**
- * The JSON of one stored frame, whichever encoding wrote it.
- *
- * A frame names no encoding of its own — the row does — and this pass reads
- * files, not rows. gzip bytes start with the 0x1f 0x8b magic and plain JSON
- * starts with `{`, so the encoding is read off the bytes. Anything else is
- * corrupt and falls through to the caller's parse, which reports the file
- * unreadable rather than empty.
- */
-function frameJson(stored: Buffer): Buffer {
-  if (stored.byteLength >= 2 && stored[0] === 0x1f && stored[1] === 0x8b) {
-    return gunzipSync(stored);
-  }
-  return stored;
-}
-
-
 function frameLiveness(data: Buffer, before: Date): FrameLiveness {
   let offset = 0;
-  while (offset + FRAME_HEADER_BYTES <= data.byteLength) {
-    const length = data.readUInt32BE(offset);
-    const end = offset + FRAME_HEADER_BYTES + length;
-    // A length that runs past the file is a half-written tail, not a frame.
-    if (length <= 0 || end > data.byteLength) return "unknown";
+  while (offset < data.byteLength) {
+    const newline = data.indexOf(0x0a, offset);
+    if (newline <= 0) return "unknown";
+    const end = newline + 1;
+    const slice = data.subarray(offset, end);
+    const json = frameJsonFromSlice(slice);
+    if (json === undefined) return "unknown";
     let frame: PayloadFrame;
     try {
-      frame = JSON.parse(frameJson(data.subarray(offset + FRAME_HEADER_BYTES, end)).toString("utf8")) as PayloadFrame;
+      frame = JSON.parse(json.toString("utf8")) as PayloadFrame;
     } catch {
       return "unknown";
     }
     if (new Date(frame.expiresAt).getTime() >= before.getTime()) return "live";
     offset = end;
   }
-  // Bytes left over that are too short to hold a header are an unreadable tail.
+  // Bytes left over that are too short to hold a frame are an unreadable tail.
   return offset === data.byteLength ? "none" : "unknown";
 }
 
@@ -317,10 +345,11 @@ function frameLiveness(data: Buffer, before: Date): FrameLiveness {
  * supply that bound leaves the default, which keeps damaged files rather than
  * risk dropping a frame a row still addresses.
  *
- * One damaged file must not abort the pass. A single corrupt frame used to
- * throw straight out of the loop, so every other expired file stayed on disk
- * forever and the volume only grew — and because a container restart is the
- * usual way a half-written tail appears, the failure looked Docker-specific.
+ * One damaged file must not abort the pass. If a single corrupt frame threw
+ * straight out of the loop, every other expired file would stay on disk
+ * forever and the volume would only grow — and because a container restart is
+ * the usual way a half-written tail appears, the failure would look
+ * Docker-specific.
  */
 export async function prunePayloadFrames(
   before: Date,
@@ -330,7 +359,7 @@ export async function prunePayloadFrames(
   const entries = await readdir(directory, { withFileTypes: true }).catch(() => []);
   let deleted = 0;
   for (const entry of entries) {
-    if (!entry.isFile() || !entry.name.endsWith(".jsonb")) continue;
+    if (!entry.isFile() || !isFrameFileName(entry.name)) continue;
     const path = join(directory, entry.name);
     try {
       if (await fileReclaimable(path, before, unparseableWrittenBefore)) {
@@ -357,7 +386,9 @@ async function fileReclaimable(
   unparseableWrittenBefore: Date,
 ): Promise<boolean> {
   const data = await readFile(path);
-  if (data.byteLength < FRAME_HEADER_BYTES) return true;
+  // Nothing written yet, so nothing to lose. A real frame is far longer than
+  // any header this format could carry.
+  if (data.byteLength === 0) return true;
   const liveness = frameLiveness(data, before);
   if (liveness === "live") return false;
   if (liveness === "none") return true;

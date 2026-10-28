@@ -15,7 +15,6 @@ import { hashSecret, encryptCredential } from "../../security/crypto";
 import type { CartethyiaDatabase } from "../../persistence/db-handle";
 import {
   DEFAULT_API_KEY_LABEL,
-  DEFAULT_API_KEY_PREFIX,
   generateApiKeySecret,
 } from "../api-keys/contracts";
 import { resolveDefaultGatewayApiKey } from "../../config/runtime";
@@ -131,8 +130,8 @@ export class FirstBootSetupService {
     // First boot creates the default tenant, the platform-admin user, and the
     // gateway key. The advisory lock is what stops two concurrent boots from
     // both passing the "no admin yet" check and racing to create them, so a
-    // handle that cannot take the lock must fail closed — the previous
-    // `typeof` probe skipped the lock and ran the setup unserialized.
+    // handle that cannot take the lock must fail closed — running the setup
+    // unserialized lets two boots both pass the check.
     await this.db.transaction(async (transaction) => {
       await transaction.execute(firstBootSetupLock());
       await create(transaction as unknown as CartethyiaDatabase);
@@ -252,22 +251,24 @@ async function ensureDefaultGatewayApiKey(db: CartethyiaDatabase, tenantId: stri
     .where(and(eq(apiKeys.tenantId, tenantId), eq(apiKeys.isDefault, true)))
     .limit(1);
   if (existing.length > 0) return;
+
   const configuredSecret = resolveDefaultGatewayApiKey();
-  const secret = configuredSecret ?? generateApiKeySecret().secret;
+  const generated = generateApiKeySecret();
+  const secret = configuredSecret ?? generated.secret;
   await db.insert(apiKeys).values({
     id: randomUUID(),
     tenantId,
     keyHash: hashSecret(secret),
     label: DEFAULT_API_KEY_LABEL,
     scopes: TENANT_KEY_SCOPES,
-    keyPrefix: configuredSecret === undefined ? DEFAULT_API_KEY_PREFIX : secret.slice(0, 3),
+    keyPrefix: configuredSecret === undefined ? generated.prefix : secret.slice(0, 3),
     keyEncrypted: encryptCredential(secret),
     requestsPerMinute: 240,
     isDefault: true,
   });
 }
 
-/** Repairs existing console tenants without resetting their configuration or credentials. */
+/** Repairs initialized tenants that predate default-key recovery on startup. */
 export async function recoverMissingDefaultGatewayApiKeys(db: CartethyiaDatabase): Promise<void> {
   await db.transaction(async (transaction) => {
     await transaction.execute(firstBootSetupLock());
@@ -278,3 +279,5 @@ export async function recoverMissingDefaultGatewayApiKeys(db: CartethyiaDatabase
     }
   });
 }
+
+/** One privileged console mutation to record. */

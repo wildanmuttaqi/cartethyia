@@ -7,33 +7,74 @@ description: "Schema and telemetry changes: update the canonical schema and gene
 
 Use for a schema change, a baseline update, or a new usage/telemetry field.
 
+## Telemetry tests must not touch real data
+
+`TELEMETRY_EVENT_DIR` resolves from the data dir when `event-log` is first
+imported (`src/observability/event-log.ts`). Setting `CARTETHYIA_DATA_DIR`
+after that import is too late; leaving it unset can write to—and let cleanup
+delete—the machine's real telemetry.
+
+Create a temporary data directory and set it **before any dynamic telemetry
+import**:
+
+```ts
+const sandbox = await mkdtemp(join(tmpdir(), "carte-telemetry-test-"));
+process.env.CARTETHYIA_DATA_DIR = sandbox;
+const telemetry = await import("../../src/observability/event-day-index");
+```
+
+Use `test/observability/telemetry-window.test.ts` as the reference. Keep every
+telemetry test and cleanup inside its own sandbox.
+
 ## Schema changes
 
-The repository ships one baseline per backend plus the numbered files that
-have not yet been folded into it. A fresh database builds from
-`0000_baseline.sql`. An existing database applies every later numbered file
-whose id is absent from `cartethyia_schema_migrations`, in order, on both
-backends (`src/persistence/db-sqlite.ts`, `src/persistence/db-pg.ts`). A
-database whose ledger names a file that no longer exists is rejected: recreate
-it and restore from backup. Do not rewrite a released baseline.
+The repository ships one baseline per backend plus the numbered files after it.
+A fresh database builds from `0000_baseline.sql` and then applies **every**
+forward file in order, on both backends (`src/persistence/db-sqlite.ts`,
+`src/persistence/db-pg.ts`), and gets tables that only a numbered file creates.
+Do not restate the file count here — it grows with every migration and rots
+silently. Read `migrations/full-postgres/` (and `lite-sqlite3/`) instead; the
+one place the list is legitimately written out is the pinned baseline test.
+
+**Treat `0000_baseline.sql` as append-only history.** It is pinned by a content
+hash: `baselineSchemaMarker()` records `sha256` of the file into
+`cartethyia_schema_migrations`, and `assertMigrationHistorySupported()` rejects
+any database whose recorded marker no longer matches the file on disk. So
+editing the baseline does not upgrade existing databases — it makes them refuse
+to boot, with "Create a fresh database and restore from a backup". A fresh
+install gets forward-file changes anyway, so folding a change into the baseline
+buys nothing and costs every existing deployment.
 
 1. Update `src/persistence/schema.ts`.
-2. For a change an existing database must receive, add the next numbered file
-   to **both** `migrations/full-postgres/` and `migrations/lite-sqlite3/`. The
-   statement must be a no-op on a database the current baseline already
-   created, because a fresh install runs the baseline and then every later
-   file. `0008_add_models_route_unique_index.sql` is the shape: the bundled
-   model seed upserts on an index a pre-baseline database does not have, and
-   boot dies without it.
-3. Fold the change into `migrations/full-postgres/0000_baseline.sql` as well,
-   so a fresh database is born with it. Regenerate the SQLite baseline with
-   `bun scripts/generate/sqlite-ddl.ts`; `test/persistence/sqlite-baseline.test.ts`
-   fails when the two disagree. Do not edit the SQLite baseline by hand.
+2. Add the next numbered file to **both** `migrations/full-postgres/` and
+   `migrations/lite-sqlite3/`. The statement must be a no-op on a database the
+   current baseline already created, because a fresh install runs the baseline
+   and then every later file. `0008_add_models_route_unique_index.sql` is the
+   shape: the bundled model seed upserts on an index a pre-baseline database
+   does not have, and boot dies without it.
+3. Do not regenerate either baseline for an ordinary schema change. The SQLite
+   baseline is generated from the pinned PostgreSQL baseline, not from
+   `schema.ts` or the accumulated forward migrations. Regenerate it only for a
+   deliberate baseline/generator change that preserves released schema
+   semantics and accepted hash compatibility; do not edit it by hand.
+   `test/persistence/sqlite-baseline.test.ts` checks the current contract.
 4. Update backup validation and restore mapping for old column names, enum
    values, defaults, or required data that must survive recreation.
 5. Test the fresh schema, the numbered file against a database created before
    it, and legacy backup restoration. Never test against a live development
    or production database.
+
+Two consequences worth knowing before you touch `migrations/`:
+
+- A schema edit that no migration covers is invisible until runtime. Run
+  `bun run check:migrations` — it builds two throwaway databases (one from the
+  committed SQL, one from the DDL Drizzle derives from `schema.ts`) and diffs
+  their real catalogs. `drizzle-kit check` cannot do this: it compares against
+  `migrations/**/meta/` snapshots, which this project never generates because
+  the migrations are hand-written, so it reports "Everything's fine" even after
+  a whole new table is added to the schema with no migration.
+- Never run `drizzle-kit generate` against `migrations/`: it rewrites every
+  committed baseline.
 
 Drizzle numeric columns may require string persistence. Use bigint number mode
 for absolute epoch milliseconds. Manual migrations are not applied by the boot
@@ -41,23 +82,47 @@ ledger; report them separately.
 
 ## Persisted telemetry fields
 
-Per-request events are hourly JSONL under `./data/telemetry-events`
-(`src/observability/event-log.ts`). The database keeps aggregates in
-`telemetry_usage_totals` only; do not add a reader back onto `telemetry_events`.
-Payload capture stays a separate append-only file under
-`data/telemetry-payloads/`.
+Per-request events are appended to one file per UTC day,
+`<YYYY-MM-DD>.events.jsonl`, under the data dir's `telemetry-events/`
+(`src/observability/event-log.ts`). The day's file is append-only and is never
+rewritten while the day is open.
+
+Beside it sits `<YYYY-MM-DD>.index.json`, written by
+`src/observability/event-day-index.ts`. It carries running totals per
+tenant/key, the per-name breakdown sums, per-hour slots for the traffic chart,
+and a byte watermark of how much of the event file has been folded in. Usage,
+breakdown and chart reads go to the index — **not** to the event files — so a
+usage query does not parse the period's requests. Only the request list and the
+detail drawer read the events, and they read backwards from the tail.
+
+Folding is incremental and idempotent: bytes below the watermark are counted,
+bytes above are not, and an unterminated line is left for the next pass rather
+than counted as an event. The watermark is the whole point — deciding which file
+was still open by comparing file *names* is what let the previous scheme fold
+and unlink a file the writer was still appending to.
+
+Retention deletes whole days: the event file and its index together. Never one
+without the other.
+
+The database keeps aggregates in `telemetry_usage_totals` only; do not add a
+reader back onto `telemetry_events`. Payload capture stays a separate
+append-only file under `data/telemetry-payloads/`.
 
 A new usage field must pass through canonical usage, normalization, the file
-writer, console contract/store, dashboard validator, and Usage UI. Reject invalid
-upstream values; do not silently clamp them. An aggregate that must survive
-retention also needs the schema and both baselines. Update restore mapping when
-old backups do not carry the field or use a retired representation.
+writer, **the day index bucket**, console contract/store, dashboard validator,
+and Usage UI. Reject invalid upstream values; do not silently clamp them.
+An aggregate that must survive retention needs the canonical schema and a
+forward migration in both backend directories. Update restore mapping when old
+backups do not carry the field or use a retired representation.
+
+Costs arrive as strings from `numeric` columns and from restored rows. Coerce
+before summing: `0 + "0.000966"` concatenates instead of adding.
 
 ## Renames and strategy removal
 
 Change the canonical enum/model, router, console contract/store, validation,
-catalog snapshot, schema, both baselines, backup mapping, dashboard
-contract/hook/card, and docs. No alias fields.
+catalog snapshot, schema, forward migrations in both backend directories,
+backup mapping, dashboard contract/hook/card, and docs. No alias fields.
 
 Combo strategies are `fallback` and `round_robin`. There is no fusion strategy
 and no minimum-balance floor: do not reintroduce

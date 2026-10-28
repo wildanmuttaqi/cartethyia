@@ -6,6 +6,7 @@ import type { ProviderDispatchContext } from "../../provider-contracts";
 import { PROVIDER_COMPATIBILITY_PROFILES } from "../../provider-metadata";
 import { defineModel } from "../../provider-model-definition";
 import type { ApiKeyProviderSpec } from "../../configured-provider";
+import { resolveOpenCodeUnavailableFree } from "../../../config/providers";
 import { buildOpenCodeHeaders } from "./fingerprint";
 import { OPENCODE_TOOL_DEFINITIONS } from "./tool-definitions";
 /**
@@ -66,6 +67,28 @@ const UNAVAILABLE_FREE_ZEN_IDS: readonly string[] = [
 ];
 
 /**
+ * The unavailable list, overridable without a code change.
+ *
+ * These ids are what upstream *currently* refuses, measured 2026-10-14 — and
+ * the reference gateway takes the opposite approach entirely: it trusts
+ * metadata (`pricing.go` marks a model free when its cost is 0 and it is not
+ * deprecated) and hardcodes no ids at all. Ours is more precise while the
+ * measurements hold, and worse the moment upstream changes, because a new
+ * refusal needs a deploy.
+ *
+ * `CARTETHYIA_OPENCODE_UNAVAILABLE_FREE` lets an operator correct that
+ * immediately: a comma-separated list that *replaces* the bundled one, or the
+ * single token `none` to trust the listing completely. The bundled ids remain
+ * the default so an unconfigured install keeps these refusals.
+ */
+function unavailableFreeZenIds(): readonly string[] {
+  const override = resolveOpenCodeUnavailableFree();
+  if (override === undefined) return UNAVAILABLE_FREE_ZEN_IDS;
+  if (override === "none") return [];
+  return override;
+}
+
+/**
  * Zen ids served by the native System One decision endpoint, not the chat wire.
  *
  * These are the `kind: "systemone"` models of the Zen catalog. They carry the
@@ -93,8 +116,12 @@ export function isSystemoneZenModel(modelId: string): boolean {
  * fail a probe.
  */
 export function isFreeTierZenModel(modelId: string): boolean {
-  if (UNAVAILABLE_FREE_ZEN_IDS.includes(modelId)) return false;
-  return modelId.endsWith("-free") || KNOWN_FREE_ZEN_IDS.includes(modelId);
+  // Dispatch ids arrive provider-prefixed (`opencode/big-pickle`) while the
+  // catalog and `KNOWN_FREE_ZEN_IDS` hold the bare id, so match on the bare
+  // id rather than the prefixed one.
+  const bare = modelId.slice(modelId.indexOf("/") + 1);
+  if (unavailableFreeZenIds().includes(bare)) return false;
+  return bare.endsWith("-free") || KNOWN_FREE_ZEN_IDS.includes(bare);
 }
 
 /**
@@ -107,6 +134,17 @@ export function isFreeTierZenModel(modelId: string): boolean {
  * value, so it lives here rather than in the shared fingerprint.
  */
 const ANONYMOUS_ZEN_BEARER = "public";
+
+/**
+ * The `Accept` a free-tier dispatch advertises.
+ *
+ * What OpenCode 2.x's AI SDK puts on the wire, and what the reference gateway
+ * sends (`upstream.go:1293`). The gate has only ever been seen accepting the
+ * narrower `text/event-stream`, so nothing here fixes a live failure — this is
+ * the value a real client produces, which is the only defensible choice when
+ * the gate tightens.
+ */
+const FREE_TIER_ACCEPT = "application/json, text/event-stream";
 
 function opencodeDesktopHeaders(
   context: ProviderDispatchContext,
@@ -124,8 +162,13 @@ function opencodeDesktopHeaders(
     ...(freeModel ? { authorization: `Bearer ${ANONYMOUS_ZEN_BEARER}` } : {}),
     // The free-tier gate refuses non-streaming dispatches with 403
     // FreeTierError, so free models always advertise SSE regardless of the
-    // client's own Accept; billed models keep the JSON default.
-    ...(freeModel ? { accept: "text/event-stream" } : {}),
+    // client's own Accept; billed models keep the JSON default. The value is
+    // what OpenCode 2.x's AI SDK sends — a broader Accept than the narrower
+    // `text/event-stream` the gate is known to accept, so this is alignment
+    // with the real client rather than a fix for a live failure. It costs
+    // nothing: `stream: true` is forced on the body either way, so the upstream
+    // answers SSE regardless.
+    ...(freeModel ? { accept: FREE_TIER_ACCEPT } : {}),
   };
 }
 /**
@@ -133,8 +176,8 @@ function opencodeDesktopHeaders(
  * dispatch, captured verbatim from a real 2.0.26 client dispatch.
  *
  * Upstream rejects tool-less or *partially* agent-shaped requests with
- * `FreeTierError` (upstream 403). Verified live 2026-10-14: all eleven here
- * return 200, and so do ten (`execute` dropped), while a five-tool subset
+ * `FreeTierError` (upstream 403). Verified live 2026-10-14: the full set here
+ * returns 200, and so does one with `execute` dropped, while a five-tool subset
  * (`bash, edit, glob, grep, read`) — and any smaller set — still returns 403.
  * The gate reads the tool set, not any single name, so backfilling "the core
  * tools" is not enough: backfill the whole set. They are plain
@@ -187,7 +230,6 @@ const FREE_AGENT_TOOL_SCHEMA = {
   required: [] as string[],
 } as const;
 
-
 function ensureFreeAgentRequest(request: CanonicalRequest): CanonicalRequest {
   const present: Record<string, true> = {};
   for (const tool of request.tools ?? []) present[tool.name] = true;
@@ -207,8 +249,6 @@ function ensureFreeAgentRequest(request: CanonicalRequest): CanonicalRequest {
     tools: [...(request.tools ?? []), ...missing],
   };
 }
-
-
 
 function completeOpenCodeToolSchemas(payload: Record<string, unknown>): void {
   if (!Array.isArray(payload.tools)) return;
@@ -361,6 +401,8 @@ export async function discoverOpenCodeFreeModels(options: {
   readonly baseUrl: string;
   readonly fetcher?: typeof fetch;
 }): Promise<readonly ModelDefinition[] | null> {
+  // dynamic-import: cycle break -- the discovery helper imports this file's
+  // OPENCODE_FREE_SPEC to decide its request shape.
   const { fetchOpenAICompatibleModels } = await import("../../discovery/openai-model-discovery");
   const listed = await fetchOpenAICompatibleModels({
     baseUrl: options.baseUrl,
@@ -454,35 +496,24 @@ export function systemoneLimits(): Pick<ModelDefinition, "contextLimit" | "outpu
 
 export const OPENCODE_FREE_MODELS: readonly ModelDefinition[] = [
   ...sharedZenChat,
-  // Free-tier chat models the shared Zen listing advertises with the `-free`
-  // convention. Each was dispatched through this adapter (its own fingerprint
-  // headers, agent tools) and answered, so the row is routable, not merely
-  // listed. Limits come from the models.dev snapshot under `opencode`; a row
-  // the snapshot does not file keeps an explicit limit rather than the generic
-  // default.
-  defineModel({ id: "nemotron-3-ultra-free", providerId: "opencode", wireFamily: "chat", endpoint: `${ZEN_PATH_PREFIX}/chat/completions`, reasoning: true, free: true }),
-  defineModel({ id: "nemotron-3.5-lightning-free", providerId: "opencode", wireFamily: "chat", endpoint: `${ZEN_PATH_PREFIX}/chat/completions`, reasoning: true, free: true }),
-  // Absent from the snapshot: keep declared limits rather than the generic default.
-  defineModel({ id: "longcat-2.5-preview-free", providerId: "opencode", wireFamily: "chat", endpoint: `${ZEN_PATH_PREFIX}/chat/completions`, ctx: 1_000_000, out: 131_072, reasoning: true, free: true }),
-  // Restored 2026-10-17: this id was dropped as deprecated, but it answers
-  // `200` on the Responses wire with the agent tool set. The 403 it gives
-  // without tools is the free-tier gate refusing the request *shape*, not the
-  // model — `muse-spark-1.3-contributor-free` is the one that is genuinely gone
-  // (`410 ModelDeprecated`), and it stays out.
-  defineModel({ id: "muse-spark-1.2-contributor-free", providerId: "opencode", wireFamily: "responses", endpoint: `${ZEN_PATH_PREFIX}/responses`, vision: true, reasoning: true, reasoningEfforts: MUSE_SPARK_REASONING_EFFORTS, free: true }),
+  // `nemotron-3-ultra-free`, `nemotron-3.5-lightning-free` and
+  // `longcat-2.5-preview-free` are excluded: the live Zen roster does not list
+  // them. A row the provider's own roster dropped can disappear from the wire
+  // without notice, which makes it a stale row — one that routes to a 404 at
+  // dispatch time rather than failing at catalog load. `big-pickle` and the
+  // rest of the shared Zen listing remain.
   systemoneZen("jev-1.13-free", true),
 ];
 
 export const OPENCODE_ZEN_MODELS: readonly ModelDefinition[] = [
   ...sharedZenChat,
-  defineModel({ id: "nemotron-3-ultra-free", providerId: "opencode", wireFamily: "chat", endpoint: `${ZEN_PATH_PREFIX}/chat/completions`, reasoning: true }),
   defineModel({ id: "muse-spark-1.2", providerId: "opencode", wireFamily: "responses", endpoint: `${ZEN_PATH_PREFIX}/responses`, vision: true, reasoning: true, reasoningEfforts: MUSE_SPARK_REASONING_EFFORTS }),
   defineModel({ id: "muse-spark-1.3", providerId: "opencode", wireFamily: "responses", endpoint: `${ZEN_PATH_PREFIX}/responses`, vision: true, reasoning: true, reasoningEfforts: MUSE_SPARK_REASONING_EFFORTS }),
   systemoneZen("jev-1.13", false),
 ];
 
 export const OPENCODE_GO_MODELS: readonly ModelDefinition[] = [
-  // `muse-spark-1.2` is retired upstream; the catalog files
+  // `muse-spark-1.2` is not served upstream; the catalog files
   // `muse-spark-1.2-contributor` at 1048576/131072, which is what this row
   // serves.
   defineModel({ id: "muse-spark-1.2-contributor", providerId: "opencode-go", wireFamily: "responses", endpoint: `${GO_PATH_PREFIX}/responses`, ctx: 1048576, out: 131072, vision: true, reasoning: true }),
@@ -494,6 +525,6 @@ export const OPENCODE_GO_MODELS: readonly ModelDefinition[] = [
   defineModel({ id: "qwen3.8-max", providerId: "opencode-go", wireFamily: "chat", endpoint: `${GO_PATH_PREFIX}/chat/completions`, ctx: 1000000, out: 131072, reasoning: true }),
   defineModel({ id: "minimax-m3", providerId: "opencode-go", wireFamily: "chat", endpoint: `${GO_PATH_PREFIX}/chat/completions`, reasoning: true }),
   defineModel({ id: "deepseek-v4-pro", providerId: "opencode-go", wireFamily: "chat", endpoint: `${GO_PATH_PREFIX}/chat/completions`, reasoning: true }),
-  defineModel({ id: "deepseek-v4.1-flash", providerId: "opencode-go", wireFamily: "chat", endpoint: `${GO_PATH_PREFIX}/chat/completions`, ctx: 1000000, out: 384000, reasoning: true }),
+  defineModel({ id: "deepseek-v4.1-flash", providerId: "opencode-go", wireFamily: "chat", endpoint: `${GO_PATH_PREFIX}/chat/completions`, ctx: 1000000, out: 384000, reasoning: true, vision: true }),
   defineModel({ id: "hy3", providerId: "opencode-go", wireFamily: "chat", endpoint: `${GO_PATH_PREFIX}/chat/completions`, reasoning: true }),
 ];

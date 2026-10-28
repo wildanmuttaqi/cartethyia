@@ -3,7 +3,7 @@
 Both backends run the same Drizzle schema (`src/persistence/schema.ts`, written
 with `pg-core`) and the same stores. SQL expressions that differ are meant to
 live in `src/persistence/dialect.ts`. The SQLite baseline is generated from the
-PostgreSQL baseline by `scripts/generate/sqlite-ddl.ts`; on top of
+PostgreSQL baseline by `scripts/tools/generate-sqlite.ts`; on top of
 `0000_baseline.sql` both backends carry the same numbered forward migrations
 under `migrations/full-postgres/` and `migrations/lite-sqlite3/`
 (e.g. `0001_allow_multiple_shared_keys_per_ip.sql`), and
@@ -13,7 +13,7 @@ retired migration history are recreated and restored from backup, not upgraded
 in place. What follows is what that arrangement actually does, measured against
 a real SQLite database on 2026-10-07, not inferred from the types.
 
-The column counts are from `schema.ts`: 18 `boolean`, 14 `jsonb`, 29
+The column counts are from `schema.ts`: 20 `boolean`, 14 `jsonb`, 29
 `timestamp`, 13 `bigint` (all `mode: "number"`), 4 `numeric`, 10 `pgEnum`.
 
 ## What round-trips correctly
@@ -63,7 +63,8 @@ A caller that interpolates its own `::jsonb`, `::uuid`, or `octet_length`
 bypasses `dialect.ts` and fails on SQLite. `usage-flush.ts` is the one *store*
 that spells `::uuid` and `::bigint`, and it branches: PostgreSQL gets
 `UPDATE ... FROM (VALUES ...)` with the casts, SQLite gets a
-`SELECT ... UNION ALL` with neither, because SQLite rejects `UPDATE ... FROM`.
+`SELECT ... UNION ALL` with neither, because SQLite stores the key as text and
+rejects that `UPDATE ... FROM (VALUES ...)` form outright.
 That branch is exercised by `test/persistence/usage-flush.test.ts`, which
 flushes 25 keys in one statement on a migrated SQLite file and reads the
 totals back.

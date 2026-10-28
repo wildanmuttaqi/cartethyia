@@ -16,9 +16,9 @@ export async function seedBundledModels(
     // provider that moved from `/chat/completions` to `/v2/chat/completions`).
     // The unique key is (provider, model, endpoint), so a changed endpoint
     // would otherwise insert a second row and leave the stale route behind —
-    // the model list would then show duplicates and probes could hit the dead
-    // path. Composite `NOT IN` keeps exactly the (model, endpoint) pairs the
-    // catalog owns.
+    // the model list then shows duplicates and probes can hit the dead path.
+    // Composite `NOT IN` keeps exactly the (model, endpoint) pairs the catalog
+    // owns.
     const pairs = definitions.map(
       (definition) => sql`(${definition.modelId}, ${definition.endpointPath})`,
     );
@@ -52,6 +52,13 @@ export async function seedBundledModels(
           reasoning: definition.reasoning,
           toolCall: definition.toolCall,
           cost: definition.cost,
+          // A static row either knows it is refused on a free plan or says
+          // nothing. Never coerced to false: the column is three-valued, and
+          // "nobody established it" is not the same claim as "served on free".
+          proOnly: definition.proOnly ?? null,
+          // Same three-valued rule for the inverse: the provider's directory
+          // states the tier, so the flag is carried rather than derived.
+          freeTier: definition.freeTier ?? null,
           source: "builtin",
           sourceUpdatedAt: now,
           enabled: true,
@@ -79,6 +86,8 @@ export async function seedBundledModels(
       reasoning: sql`excluded.reasoning`,
       toolCall: sql`excluded.tool_call`,
       cost: sql`excluded.cost`,
+      proOnly: sql`excluded.pro_only`,
+      freeTier: sql`excluded.free_tier`,
       source: sql`'builtin'`,
       sourceUpdatedAt: sql`excluded.source_updated_at`,
     },

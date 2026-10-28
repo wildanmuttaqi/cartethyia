@@ -4,6 +4,7 @@ import type { ClientIdentity } from "../../security/abuse";
 import type { ResolvedApiKey } from "../../security/api-key-auth";
 import type { PreparedProxyRequest } from "./preparer";
 import type { PayloadCaptureState, TelemetryPayloadCapture } from "../../observability/payload-capture";
+import type { TelemetryPayloadDepth, TelemetryPayloadMode } from "../../console/settings/contracts";
 import { createInFlightRegistry, type InFlightSnapshot } from "./inflight";
 import { log } from "../../observability/logger";
 import { fastPathname } from "../pathname";
@@ -99,10 +100,36 @@ export interface ProxyRequestState {
    * Remote-diagnosis field: the drawer reads empty for reasons invisible from
    * the client — the tenant's capture mode, a missing tenant, a non-terminal
    * attempt — and without the reason an operator cannot tell "not configured"
-   * from "broken". The four panels are the only surface that could previously
-   * hint at it, and they look identical in both cases.
+   * from "broken". The four panels are the only surface that could hint at it,
+   * and they look identical in both cases.
    */
   payloadCaptureState?: PayloadCaptureState;
+  /**
+   * This request's resolved payload-capture preference, memoized on the request.
+   *
+   * The preference is a tenant setting, so it cannot change between attempts of
+   * one request. It is read twice — once per attempt to decide whether to tee
+   * the provider body, and again on the terminal attempt to decide what to
+   * store — so memoizing it here makes the second read free and keeps the two
+   * from disagreeing about whether capture is on.
+   */
+  payloadCapturePreference?:
+    | {
+        readonly ok: true;
+        readonly mode: TelemetryPayloadMode;
+        readonly depth: TelemetryPayloadDepth;
+        readonly retentionMs: number;
+      }
+    | { readonly ok: false };
+  /**
+   * This request's resolved inline-attachment ceiling, memoized for the same
+   * reason the capture preference is: it is a tenant setting, so it cannot
+   * change between attempts, and reading it per attempt would pay for it
+   * several times on a request that fails over.
+   *
+   * `undefined` means the deployment default.
+   */
+  imageClampMaxBytes?: number;
   /**
    * Set by the dispatch handler synchronously before returning a streaming
    * response. `afterResponse` lifecycle hooks read it to skip finalization

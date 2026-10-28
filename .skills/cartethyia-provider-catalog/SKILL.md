@@ -49,7 +49,7 @@ runtime discovery:
 | Purpose | International endpoint | Response shape |
 |---|---|---|
 | Desktop picker snapshot / manual investigation | `GET https://www.codebuddy.ai/v3/config`, `GET https://www.workbuddy.ai/v3/config`, or `GET https://www.workbuddy.cn/v3/config` | `data.agents[].models` is the picker roster; `data.models[]` has metadata |
-| Cartethyia account discovery | CodeBuddy: `/v2/enterprises/personal/models`; WorkBuddy variants: `/v2/enterprises/personal/models` | `data.models[]` plus `data.agents[]`; `disabled` and the `cli` agent roster constrain the result |
+| Cartethyia account discovery | intl: `/v3/config` first, falling back to `/v2/enterprises/personal/models`; CN variants: `/console/enterprises/personal/models` | `data.models[]` plus `data.agents[]`; `disabled` and the `cli` agent roster constrain the result |
 
 WorkBuddy CN is the same WorkBuddy client contract on `www.workbuddy.cn`.
 Its desktop client version is fetched from that host's
@@ -75,8 +75,9 @@ large installers when a small official metadata response answers the question.
 The CLI version and each bundled SDK version are separate identities. Do not use
 the standalone `@anthropic-ai/sdk` npm latest as Claude Code's bundled version,
 and do not take the first matching version string in a Kiro installer — tie it
-to the active import path. For reference, Claude Code `2.1.296` bundles SDK
-`0.128.0`; Kiro IDE `1.2.56` uses streaming SDK `1.0.39` and SSO SDK `3.980.0`.
+to the active import path. App and SDK versions are separate values; read the
+owning constants and `VERSION_SOURCES.<client>.fallback` for the value actually
+shipped rather than copying a version from this guide.
 
 After changing a pin, check any derived User-Agent/fingerprint consumers remain
 connected to the same source, add or update a focused assertion in
@@ -162,7 +163,10 @@ an operator who turned proxying back on keeps it on.
   The names, the trap, and the replay evidence are in
   [`cartethyia-trace-replay`](../cartethyia-trace-replay/references/opencode-free-tier.md).
   Free ids are chat-only (`responses` → 400 `ModelProtocolUnsupported`), and
-  `Authorization: Bearer public` is still required.
+  a free dispatch sends `Authorization: Bearer public` as an anonymous sentinel.
+  The header is not what authorizes the call — an absent one answers 200 and a
+  wrong one answers 401 — but omit it and you have changed the wire the client
+  actually produces, which is the only reason it is sent at all.
 - The offline catalog is a packed, brotli-compressed binary blob:
   `src/providers/discovery/catalog/catalog-blob.ts` (generated) +
   `catalog-format.ts` (the `PackedCatalog` reader) +
@@ -170,7 +174,7 @@ an operator who turned proxying back on keeps it on.
   authority for limits, pricing, and capability; do not add a duplicate raw or
   compact snapshot. Lookups are binary searches over typed-array columns — there
   is no JSON parse and no per-row object at boot.
-- Refresh it with `bun run scripts/generate/models-catalog.ts`. Generation
+- Refresh it with `bun run scripts/tools/generate-models.ts`. Generation
   fetches models.dev for breadth and pricing plus `models.opencode.ai` for the
   OpenCode family's authoritative limits, and the server reads only the
   committed blob.
@@ -233,9 +237,9 @@ examples are account-specific, not guarantees. After a catalog edit, restart;
 
 ## Grok video generation
 
-Unverified research notes, not a supported integration. The checked-in adapter
-targets Grok Build at `cli-chat-proxy.grok.com` and does not implement this, so
-re-probe before relying on it. The observed surface was
+Unverified historical research notes, not a supported integration. The
+checked-in adapter targets Grok Build at `cli-chat-proxy.grok.com` and does not
+implement this, so re-probe before relying on it. The observed surface was
 `POST https://console.x.ai/v1/videos/generations` returning a `request_id`, then
 `GET /v1/videos/<request_id>` for `video.url`. Model `grok-imagine-video`,
 duration 1–15 seconds, one `image.url` as HTTPS or `data:`, never bare base64.
@@ -245,10 +249,20 @@ the reported quota was about two videos then HTTP 429 — neither is verified. A
 
 ## Remove a provider
 
-Use the [provider-removal skill](../cartethyia-provider-removal/SKILL.md). It
-owns the cutover and persisted-row cleanup. Boot retires unbundled global rows;
-the catalog also hides any orphan immediately and lets tenant delete remove
-it without exposing a current builtin to deletion.
+Removing one is a catalog cutover **plus** a persisted-row cleanup: deleting the
+metadata is not enough, because an old global `providers` row can survive and
+show up as a custom card the console cannot delete. The cutover steps and the
+retirement safeguards are
+[`references/provider-removal.md`](references/provider-removal.md).
+
+## What a model can do
+
+Capabilities are not cosmetic. Route selection excludes candidates that lack a
+required capability, may choose a degraded variant, and `projectForRoute`
+throws `capability_unsupported` when the selected route cannot serve the
+request. A false declaration can therefore select the wrong route or reject a
+valid request. Setting, publishing, and proving a capability is
+[`references/capabilities.md`](references/capabilities.md).
 
 ## Verify
 

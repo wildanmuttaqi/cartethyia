@@ -66,6 +66,11 @@ export const queryKeys = {
   settings: {
 
     runtime: ["console", "settings", "runtime"] as const,
+    /** On-disk telemetry and payload sizes, and the reclaim actions. */
+    diskUsage: ["console", "settings", "disk-usage"] as const,
+  },
+  remoteSupport: {
+    status: ["console", "remote-support", "status"] as const,
   },
   cliTools: {
     registry: ["console", "cli-tools", "registry"] as const,

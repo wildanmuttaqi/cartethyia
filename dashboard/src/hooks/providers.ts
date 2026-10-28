@@ -3,7 +3,7 @@ import type { ApiErrorShape } from "../data/api";
 // Console-owned device-poll DTO; token material remains provider-internal.
 import type { AccountHealthEventRecord, ByokConnectionTestRequest, ByokConnectionTestResult, CreateProviderAccountBatchResult, CreateProviderAccountRequest, CreateProviderRequest, OAuthDevicePollResponse as OAuthDevicePollResult, ProbeAllAccountsResult, ProbeModelRequest, ProbeModelResult, ProviderAccountResponse, ProviderAccountsExportResponse, ProviderResponse, SetModelEnabledRequest, UpdateProviderAccountRequest, UpdateProviderRequest } from "../data/contracts";
 import { queryKeys } from "../data/query-keys";
-import { assertModels, assertProviders, querySignal } from "../data/assert";
+import { assertModels, assertProvider, assertProviders, querySignal } from "../data/assert";
 import { DASHBOARD_QUERY_OPTIONS, POLL } from "../data/query-policy";
 import { getErrorMessage } from "../data/api";
 import { toast } from "../lib/toast";
@@ -31,8 +31,9 @@ export interface ModelMetadataPayload {
  * Loads the tenant provider catalog and observes background metadata refreshes.
  *
  * Lazy by design: the cached list renders instantly on revisit and revalidates
- * in the background (60 s freshness + 60 s poll). Mutations invalidate this
- * key, so a longer stale window can never strand a create/update/delete.
+ * in the background (the default 60 s freshness + 60 s poll). Mutations
+ * invalidate this key, so a longer stale window can never strand a
+ * create/update/delete. `staleTime` is left at the shared default.
  */
 export function useProviders() {
   return useQuery({
@@ -40,9 +41,21 @@ export function useProviders() {
     queryFn: (context) =>
       consoleRequest<unknown>("/providers", { signal: querySignal(context) }).then(assertProviders),
     ...DASHBOARD_QUERY_OPTIONS,
-    staleTime: 60_000,
     gcTime: 600_000,
     refetchInterval: POLL.catalog,
+  });
+}
+
+/** Loads one provider's detail DTO, including the private-to-detail base URL. */
+export function useProviderDetail(providerId: string | undefined) {
+  return useQuery({
+    queryKey: queryKeys.providers.detail(providerId ?? ""),
+    queryFn: (context) =>
+      consoleRequest<unknown>(`/providers/${encodeURIComponent(providerId ?? "")}`, {
+        signal: querySignal(context),
+      }).then(assertProvider),
+    enabled: Boolean(providerId),
+    ...DASHBOARD_QUERY_OPTIONS,
   });
 }
 
@@ -289,8 +302,8 @@ export function useCreateProviderAccount() {
  *
  * The server returns a per-item outcome, so a partial paste still lands the
  * accounts that were fine. Invalidation happens once, after the whole batch —
- * the old client-side loop invalidated per account, which is what made a large
- * paste re-fetch the account list dozens of times.
+ * invalidating per account would re-fetch the account list once per row in a
+ * large paste.
  */
 export function useCreateProviderAccountsBatch() {
   const queryClient = useQueryClient();
@@ -378,9 +391,9 @@ async function invalidateAccountHealthFamily(
 
 /**
  * Invalidates every cached query a provider-account mutation can stale: the
- * account list, the health-event family, and the provider list itself. Four
- * mutations used to spell this trio out separately, so a fifth could silently
- * forget one and leave a stale list on screen.
+ * account list, the health-event family, and the provider list itself. Every
+ * account mutation goes through this one helper, so none can silently forget
+ * one of the three and leave a stale list on screen.
  */
 async function invalidateProviderAccounts(
   queryClient: QueryClient,
@@ -420,6 +433,44 @@ export function useRecoverAccount() {
     },
     onError: (error) => {
       toast.error("Could not recover the account.", getErrorMessage(error));
+    },
+  });
+}
+
+/**
+ * Deletes one account's health & error log, from its own modal.
+ *
+ * The modal refetches on completion rather than waiting for the poll: rows the
+ * operator just told to leave must not survive one visible cycle. The settings
+ * disk-usage count invalidates too, so the management row stays honest about
+ * how many rows the global purge still holds.
+ */
+export function usePurgeAccountHealthEvents() {
+  const queryClient = useQueryClient();
+  return useMutation<
+    { deleted: number },
+    ApiErrorShape,
+    { providerId: string; accountId: string; title?: string }
+  >({
+    mutationFn: ({ providerId, accountId }) =>
+      consoleRequest<{ deleted: number }>(
+        `/providers/${encodeURIComponent(providerId)}/accounts/${encodeURIComponent(accountId)}/health-events`,
+        { method: "DELETE" },
+      ),
+    onSuccess: async (result, variables) => {
+      await Promise.all([
+        queryClient.invalidateQueries({
+          queryKey: queryKeys.providers.healthEvents(variables.providerId, variables.accountId),
+        }),
+        queryClient.invalidateQueries({ queryKey: queryKeys.settings.diskUsage }),
+      ]);
+      toast.success(
+        result.deleted === 0 ? "Health log was already empty" : `Purged ${result.deleted} health events`,
+        variables.title,
+      );
+    },
+    onError: (error) => {
+      toast.error("Could not purge the health log.", getErrorMessage(error));
     },
   });
 }

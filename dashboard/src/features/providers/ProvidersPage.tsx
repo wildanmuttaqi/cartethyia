@@ -9,7 +9,7 @@ import {
 } from "../../components/HeaderPairsEditor";
 import { ProviderCardGrid } from "../../components/ProviderCardGrid";
 import { ProviderIcon } from "../../components/ProviderIcon";
-import { modelCoolingCount } from "../../components/AccountCooldown";
+import { activeModelCooldowns } from "../../components/AccountCooldown";
 import { Badge } from "../../components/ui/badge";
 import { Button } from "../../components/ui/button";
 import { Card, CardBody, CardHeader } from "../../components/ui/card";
@@ -22,6 +22,7 @@ import { EmptyState, ErrorState, LoadingState } from "../../components/ui/state"
 import { Switch } from "../../components/ui/switch";
 import { Inline } from "../../components/ui/inline";
 import { Stack } from "../../components/ui/stack";
+import { useHideUnconfiguredProviders } from "../../lib/privacy-mode";
 const CARD_SHELL = cn(
   "relative flex flex-col min-w-0 border border-inner-border rounded-card",
   "transition-[transform,border-color,box-shadow]",
@@ -434,6 +435,15 @@ function CustomProviderCard({ customProvider }: { customProvider: ProviderRespon
             >
               {customProvider.label || customProvider.providerId}
             </div>
+            {customProvider.baseUrl ? (
+              <div
+                className="mt-1 min-w-0 truncate font-mono text-micro text-text-tertiary"
+                title={customProvider.baseUrl}
+              >
+                <span className="font-semibold text-text-secondary">Base URL</span>{" "}
+                {customProvider.baseUrl}
+              </div>
+            ) : null}
             <div className="mt-1.5 flex flex-wrap gap-2">
               {accounts === undefined ? (
                 <SecondaryQueryBadge
@@ -660,7 +670,6 @@ const FREE_LIMITED_IDS = new Set([
   // its `/v1/models` marks those rows at zero price, so discovery can keep the
   // list current instead of encoding it by hand.
   "hermes",
-  "commandcode",
   // Kilo Code resells the OpenRouter catalog — `/api/openrouter`, the same
   // upstream Cline fronts — and serves a `kilo-auto/free` routing alias
   // alongside its paid rows, so its free allowance is metered against that
@@ -684,6 +693,10 @@ const WELL_KNOWN_API_KEY_IDS = new Set([
   "mistral",
   "meta",
   "deepseek",
+  "commandcode",
+  // Alibaba's OpenAI-compatible DashScope: a household-enough name that an
+  // operator looks for beside the other majors rather than in "Other".
+  "dashscope",
 ]);
 
 function hasInteractiveOAuth(provider: ProviderResponse): boolean {
@@ -691,35 +704,59 @@ function hasInteractiveOAuth(provider: ProviderResponse): boolean {
 }
 
 /**
+ * True when the provider holds a credential that expires and renews.
+ *
+ * A provider with neither a browser redirect nor a device code still belongs
+ * under OAuth when it imports a refreshable token pair: filing it with the API
+ * keys hides that it expires, and the account's renewal is then unexplained.
+ * Import-only clients that cannot refresh stay where they are.
+ */
+function hasRefreshableCredential(provider: ProviderResponse): boolean {
+  return provider.oauthFlows?.refreshable === true;
+}
+
+/**
  * Connection counts for one provider's card.
  *
  * Computed once here because both card variants render the same badges from the
- * same accounts, and keeping two copies is what let the per-model case go
- * missing from the list: an account throttled for one model keeps
- * `status: "active"` (see `account-health-service.ts`), so a rollup built from
- * `status === "cooldown"` alone reported it as a healthy connection while its
- * own detail page said "1 model cooling".
+ * same accounts. The counts are mutually exclusive and add up to the account
+ * total, so a card never reports two problems for one connection.
  *
- * `active` and `cooling` are therefore separate counts over the same account,
- * and both are meant to show at once: a cooling account IS connected and
- * routable for its other models, it is just not being routed to for the models
- * named in `modelCooldowns`. The card keeps every status in its own badge so
- * one account is not counted as unhealthy merely because it is cooling or in
- * cooldown.
+ * `healthy` means fully routable: not in an account-wide cooldown and not
+ * carrying a live per-model backoff. A throttled account is *connected* but it
+ * is not healthy, and counting it as healthy is what made the card read "2
+ * Healthy · 1 Cooling" for two accounts — one of which could not serve.
+ *
+ * The two throttle kinds are merged into one badge because they are the same
+ * fact at the card's level: this connection is being held back. Which kind, and
+ * which models, belongs on the detail page where there is room to say.
  */
 interface AccountStatusCounts {
-  readonly active: number;
-  readonly cooldown: number;
+  readonly healthy: number;
+  /** Account-wide cooldown or a live per-model backoff; never both. */
+  readonly throttled: number;
   readonly disabled: number;
   readonly cooling: number;
 }
 
-function summarizeAccounts(accounts: readonly ProviderAccountResponse[]): AccountStatusCounts {
+export function summarizeAccounts(
+  accounts: readonly ProviderAccountResponse[],
+): AccountStatusCounts {
+  // A live per-model backoff is checked before status, so an account cooling
+  // some models is never also counted as healthy for them.
+  const isThrottled = (account: ProviderAccountResponse): boolean =>
+    account.status === "cooldown" || activeModelCooldowns(account) !== undefined;
   return {
-    active: accounts.filter((account) => account.status === "active").length,
-    cooldown: accounts.filter((account) => account.status === "cooldown").length,
+    healthy: accounts.filter(
+      (account) => account.status === "active" && !isThrottled(account),
+    ).length,
+    throttled: accounts.filter(isThrottled).length,
     disabled: accounts.filter((account) => account.status === "disabled").length,
-    cooling: modelCoolingCount(accounts),
+    // Kept only so the caller can describe the kind when every throttled
+    // account is the model-scoped one; it is not rendered as its own badge.
+    cooling: accounts.filter(
+      (account) => account.status !== "cooldown" && activeModelCooldowns(account) !== undefined,
+    ).length,
   };
 }
 
@@ -731,16 +768,23 @@ function AccountStatusBadges({
   readonly total: number;
 }): ReactNode {
   const hasBadge =
-    counts.active > 0 ||
-    counts.cooldown > 0 ||
-    counts.cooling > 0 ||
+    counts.healthy > 0 ||
+    counts.throttled > 0 ||
     counts.disabled > 0;
   if (!hasBadge) return <Badge tone="warn" dot>{total} Connected</Badge>;
+  // One badge for both throttle kinds. Naming the kind is still worth it:
+  // "Cooldown" means the whole account, "Cooling" means specific models, and an
+  // operator deciding whether to wait or to reroute needs to know which.
+  const throttleLabel =
+    counts.throttled === counts.cooling ? "Cooling" : "Cooldown";
   return (
     <>
-      {counts.active > 0 ? <Badge tone="ok" dot>{counts.active} Healthy</Badge> : null}
-      {counts.cooldown > 0 ? <Badge tone="warn" dot>{counts.cooldown} Cooldown</Badge> : null}
-      {counts.cooling > 0 ? <Badge tone="warn" dot>{counts.cooling} Cooling</Badge> : null}
+      {counts.healthy > 0 ? <Badge tone="ok" dot>{counts.healthy} Healthy</Badge> : null}
+      {counts.throttled > 0 ? (
+        <Badge tone="warn" dot>
+          {counts.throttled} {throttleLabel}
+        </Badge>
+      ) : null}
       {counts.disabled > 0 ? <Badge tone="warn" dot>{counts.disabled} Unhealthy</Badge> : null}
     </>
   );
@@ -937,9 +981,12 @@ const SECTIONS = [
   {
     title: "OAuth & Agent Providers",
     // Import-only clients validate and store API keys; only browser/device
-    // authorization belongs in this section.
+    // authorization belongs in this section — plus an import-only client whose
+    // credential is a refreshable token pair, which is OAuth in every way the
+    // operator experiences except the missing button.
     filter: (p: ProviderResponse) =>
-      hasInteractiveOAuth(p) && !FREE_LIMITED_IDS.has(p.providerId.toLowerCase()),
+      (hasInteractiveOAuth(p) || hasRefreshableCredential(p)) &&
+      !FREE_LIMITED_IDS.has(p.providerId.toLowerCase()),
   },
   {
     title: "Well Known API Key Providers",
@@ -949,7 +996,8 @@ const SECTIONS = [
       WELL_KNOWN_API_KEY_IDS.has(p.providerId.toLowerCase()) &&
       !FOUNDING_IDS.has(p.providerId.toLowerCase()) &&
       !FREE_LIMITED_IDS.has(p.providerId.toLowerCase()) &&
-      !hasInteractiveOAuth(p),
+      !hasInteractiveOAuth(p) &&
+      !hasRefreshableCredential(p),
   },
   {
     title: "Other API Key Providers",
@@ -959,7 +1007,8 @@ const SECTIONS = [
       !WELL_KNOWN_API_KEY_IDS.has(p.providerId.toLowerCase()) &&
       !FOUNDING_IDS.has(p.providerId.toLowerCase()) &&
       !FREE_LIMITED_IDS.has(p.providerId.toLowerCase()) &&
-      !hasInteractiveOAuth(p),
+      !hasInteractiveOAuth(p) &&
+      !hasRefreshableCredential(p),
   },
 ];
 
@@ -968,18 +1017,24 @@ const SECTIONS = [
 export default function Providers(): ReactNode {
   const [collapsedSections, setCollapsedSections] = useState<ReadonlySet<string>>(readCollapsedSections);
   const q = useProviders();
+  const hideUnconfigured = useHideUnconfiguredProviders();
+  const hideUnconfiguredOn = hideUnconfigured.enabled;
+  // A credential-less provider (OpenCode Free, Exa, Parallel) is usable with no
+  // account, so hiding it would hide a working route rather than a dead one.
+  const isVisible = (p: ProviderResponse) =>
+    !hideUnconfiguredOn || p.configured === true || p.requiresAccount === false;
   const allProviders = useMemo(() => q.data ?? [], [q.data]);
   const customProviders = useMemo(
-    () => [...allProviders.filter((p) => !p.isBuiltIn)].sort(compareConfiguredProviders),
-    [allProviders],
+    () => [...allProviders.filter((p) => !p.isBuiltIn && isVisible(p))].sort(compareConfiguredProviders),
+    [allProviders, hideUnconfiguredOn],
   );
   const searchProviders = useMemo(
-    () => allProviders.filter((p) => providerServiceKinds(p).includes("websearch")),
-    [allProviders],
+    () => allProviders.filter((p) => providerServiceKinds(p).includes("websearch") && isVisible(p)),
+    [allProviders, hideUnconfiguredOn],
   );
   const llmProviders = useMemo(
-    () => allProviders.filter((p) => providerServiceKinds(p).includes("llm")),
-    [allProviders],
+    () => allProviders.filter((p) => providerServiceKinds(p).includes("llm") && isVisible(p)),
+    [allProviders, hideUnconfiguredOn],
   );
   const [searchParams, setSearchParams] = useSearchParams();
   const requestedTab = searchParams.get("tab");
@@ -997,10 +1052,11 @@ export default function Providers(): ReactNode {
     () =>
       allProviders.filter(
         (p) =>
-          providerServiceKinds(p).includes("imageGeneration") ||
-          providerServiceKinds(p).includes("videoGeneration"),
+          (providerServiceKinds(p).includes("imageGeneration") ||
+            providerServiceKinds(p).includes("videoGeneration")) &&
+          isVisible(p),
       ),
-    [allProviders],
+    [allProviders, hideUnconfiguredOn],
   );
   const orderedSearch = useMemo(
     () => [...searchProviders].sort((a, b) => (a.label || a.displayName).localeCompare(b.label || b.displayName)),
@@ -1083,6 +1139,19 @@ export default function Providers(): ReactNode {
             </button>
           ))}
         </div>
+        <Button
+          variant="ghost"
+          size="sm"
+          icon={hideUnconfiguredOn ? <EyeOff size={12} /> : <Eye size={12} />}
+          onClick={() => hideUnconfigured.setEnabled(!hideUnconfiguredOn)}
+          title={
+            hideUnconfiguredOn
+              ? "Show providers that have no account yet"
+              : "Hide providers that have no account yet"
+          }
+        >
+          {hideUnconfiguredOn ? "Show unconfigured" : "Hide unconfigured"}
+        </Button>
         <span className="ml-auto text-micro text-text-tertiary">
           {tab === "search"
             ? "Fallback runs only when the model invokes Websearch"

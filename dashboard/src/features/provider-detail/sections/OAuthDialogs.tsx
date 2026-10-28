@@ -24,7 +24,8 @@ import { useTrackedTimeout } from "../../../hooks/use-timeout";
  * expired code` — an error that names the code but is really a failed parse, so
  * the operator retries the same broken paste. A URL with `error` is reported
  * with the provider's own description instead, and a URL with neither is
- * rejected as an unrecognized redirect.
+ * rejected as an unrecognized redirect — unless it carries a provider payload
+ * in place of a `code`, which is forwarded whole.
  */
 export function extractOAuthCode(raw: string): { code: string } | { error: string } {
   const trimmed = raw.trim();
@@ -42,6 +43,16 @@ export function extractOAuthCode(raw: string): { code: string } | { error: strin
   if (code) return { code };
   const providerError = params.get("error_description") ?? params.get("error");
   if (providerError) return { error: `The provider refused the login: ${providerError}` };
+  /**
+   * Not every provider redirects with `code`. Trae's page sends its payload
+   * directly — `authCodeInfo` for the PKCE flow, `refreshToken` for the other —
+   * and the server's parser reads the whole query. Passing it through is what
+   * lets that login finish; the server rejects anything it cannot redeem, with
+   * a message specific to the provider.
+   */
+  if (params.has("authCodeInfo") || params.has("refreshToken") || params.has("refresh_token")) {
+    return { code: params.toString() };
+  }
   // A query string or a bare code both parse to no `code` param. Only a value
   // that is recognizably a URL is refused; anything else is handed on as the
   // code the operator pasted.
@@ -291,8 +302,8 @@ export function DeviceCodeDialog({
   useEffect(() => {
     // StrictMode mounts, unmounts, and remounts this dialog in development, and
     // this effect starts a device flow on every mount. Both requests reach the
-    // provider. Whichever resolves last used to win `setSession`, so the code on
-    // screen and the code being polled could belong to a flow the operator never
+    // provider. Letting whichever resolves last win `setSession` would put the
+    // code on screen and the code being polled in a flow the operator never
     // approved — the provider then answers "still pending" forever. The first
     // start is the one shown and polled; a later one is dropped.
     let cancelled = false;
@@ -359,8 +370,8 @@ export function DeviceCodeDialog({
     // to the session that sent it. Applying it anyway showed "connected" for a
     // login whose row was never written.
     let stale = false;
-    // One timer, ever. Rescheduling used to add a fresh interval beside the one
-    // already running, so two polls left per cadence. GitHub's device flow
+    // One timer, ever. Rescheduling must not add a fresh interval beside the one
+    // already running, or two polls leave per cadence. GitHub's device flow
     // answers `slow_down` the moment a poll arrives inside its minimum, and
     // keeps answering it — the code the operator approves then never yields a
     // token. The next poll is always scheduled from the answer, not piled on.

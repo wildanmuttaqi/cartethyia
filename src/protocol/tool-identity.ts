@@ -7,12 +7,33 @@ export interface ToolCallState {
 }
 
 /**
- * Per-state argument fragments. `ToolCallState.arguments` stays a plain
- * string field for readers, but the tracker accumulates fragments here and
- * joins once per read instead of re-copying the whole prefix on every
- * delta (which is O(n²) for large tool arguments).
+ * Per-state argument fragments and their joined snapshot.
+ *
+ * The snapshot is cached on the CHUNK ARRAY, not on the state, because the
+ * array is deliberately handed forward from a superseded state to its
+ * replacement and mutated in place — so a reader holding the older
+ * `ToolCallState` still observes the newest total. Caching per state would
+ * freeze each state at the value it had when created and silently break that
+ * invariant (pinned by test/protocol/tool-identity.test.ts).
+ *
+ * The cache is dropped on push, so N deltas cost O(N) total: without it each
+ * read re-joined the whole array, and a reader that slices the string per
+ * delta — as the Messages stream does — re-joined and re-sliced once per
+ * fragment, which is O(n²) over a large tool argument.
  */
 const argumentChunks = new WeakMap<ToolCallState, string[]>();
+const argumentJoined = new WeakMap<string[], string>();
+
+/** The accumulated arguments, joining only when a fragment has been added. */
+function joinedArguments(state: ToolCallState): string {
+  const chunks = argumentChunks.get(state);
+  if (chunks === undefined) return "";
+  const cached = argumentJoined.get(chunks);
+  if (cached !== undefined) return cached;
+  const value = chunks.join("");
+  argumentJoined.set(chunks, value);
+  return value;
+}
 
 /**
  * Single tool-call tracking home: id/index/arguments-accumulation keyed by
@@ -60,17 +81,17 @@ export function trackToolCall(
   tracker.nextIndex = Math.max(tracker.nextIndex, index + 1);
   const prior = tracker.states.get(tool.id);
   const name = tool.name ?? prior?.name;
-  // Append the fragment in O(1) amortized; the joined snapshot is produced
-  // lazily by the `arguments` getter below, so N deltas cost O(N) total
-  // instead of O(N²) prefix re-copies. The chunk array is shared forward
-  // along one call id (superseded states are never read after replacement).
+  // Append the fragment in O(1) amortized. The chunk array is shared forward
+  // along one call id, so the joined cache is keyed on the array and dropped
+  // here: the next read re-joins once and re-caches.
   const chunks =
     prior !== undefined ? (argumentChunks.get(prior) ?? [prior.arguments]) : [];
   chunks.push(tool.args ?? "");
+  argumentJoined.delete(chunks);
   const state: ToolCallState = {
     id: tool.id || prior?.id || "",
     get arguments() {
-      return chunks.join("");
+      return joinedArguments(state);
     },
     index,
   };
@@ -78,6 +99,19 @@ export function trackToolCall(
   if (name !== undefined) state.name = name;
   tracker.states.set(tool.id, state);
   return { index, isFirst: prior === undefined, state };
+}
+
+/**
+ * The not-yet-emitted tail of a call's arguments, from `offset`.
+ *
+ * Reads the cached joined string rather than re-joining the chunk array, so a
+ * caller that asks once per delta — as the Messages stream does — stays
+ * linear in the total argument length instead of quadratic. The `slice` itself
+ * is unavoidable: the caller needs the tail, and its own length is the output.
+ */
+export function argumentsFrom(state: ToolCallState, offset: number): string {
+  const all = joinedArguments(state);
+  return offset <= 0 ? all : all.slice(offset);
 }
 
 // ===== Emission ledger =====

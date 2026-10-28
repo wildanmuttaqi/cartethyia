@@ -124,9 +124,12 @@
 }
 
 /* Custom background, rendered by `BackgroundLayer` and framed by the variables
-   the Customization page writes onto `<html>`. It mounts inside
-   `.app-main-column`, so a card's backdrop-filter samples this image instead
-   of the black body. Inert — it must never catch a click meant for the page.
+   the Customization page writes onto `<html>`. Mounted in the shell fragment
+   root, outside any stacking context created by `.app-shell-frame` or
+   `.app-main-column`, so `position: fixed` always covers the full viewport
+   regardless of sidebar or column width. Cards still sample it via
+   `backdrop-filter` because compositing reads painted pixels, not the DOM
+   tree. Inert — it must never catch a click meant for the page.
 
    The media is oversized by the zoom and anchored with the offsets, then the
    layer clips it. That is what makes "taller" and "shift left" real instead of
@@ -223,27 +226,35 @@
 
 /* Update badge: a flat pill, no glow. It sits beside the version so an operator
  * sees "an update exists" without the badge reading as an alert. */
+/* The update badge is the one thing in the sidebar that should pull the eye:
+   it is the only row that asks the operator to act. It uses the danger token
+   rather than the accent so it stands out in both themes — the accent is the
+   chrome colour, and a badge in the chrome colour reads as another label. */
 .brand-update-badge {
   display: inline-flex;
   align-items: center;
-  gap: 2px;
-  padding: 0 5px;
+  gap: 3px;
+  padding: 1px 6px;
   border-radius: 6px;
   font-size: 9.5px;
   font-weight: 700;
-  color: var(--accent);
-  background: var(--accent-soft);
+  letter-spacing: 0.02em;
+  color: var(--status-danger);
+  background: color-mix(in srgb, var(--status-danger) 14%, transparent);
   text-decoration: none;
-  transition: background var(--dur-micro) var(--ease-spring);
+  transition:
+    background var(--dur-micro) var(--ease-spring),
+    color var(--dur-micro) var(--ease-spring);
 }
 
 .brand-update-badge:hover {
-  background: var(--active-pill);
+  color: var(--accent-foreground);
+  background: var(--status-danger);
 }
 
 /* Navigation Groups */
 .nav-group-section {
-  margin-top: 14px;
+  margin-top: 9px;
 }
 
 .nav-group-section:first-child {
@@ -251,12 +262,12 @@
 }
 
 .nav-group-title {
-  font-size: 10.5px;
+  font-size: 10px;
   font-weight: 700;
   text-transform: uppercase;
   letter-spacing: 0.08em;
   color: var(--text-tertiary);
-  padding: 4px 10px 6px;
+  padding: 3px 10px 4px;
 }
 
 
@@ -264,7 +275,7 @@
   position: relative;
   display: flex;
   flex-direction: column;
-  gap: 2px;
+  gap: 1px;
 }
 
 .sidebar-active-indicator {
@@ -286,10 +297,10 @@
   position: relative;
   display: flex;
   align-items: center;
-  gap: 10px;
-  padding: 8px 10px;
+  gap: 8px;
+  padding: 5.4px 10px;
   border-radius: var(--radius-control);
-  font-size: 13.5px;
+  font-size: 12.75px;
   font-weight: 500;
   color: var(--text-secondary);
   text-decoration: none;
@@ -598,6 +609,28 @@ main.route-enter .state-viewport-compact {
 }
 
 .topbar-icon-button:hover {
+  background: var(--active-pill);
+  color: var(--text-primary);
+}
+
+/* The donate control is the only one that carries a label, so it cannot be the
+ * fixed square the icon buttons use: that size lays a label and an icon out on
+ * two rows. Sized by its content instead, on one row. */
+.topbar-donate-button {
+  height: 38px;
+  padding: 0 14px;
+  display: inline-flex;
+  flex-direction: row;
+  align-items: center;
+  gap: 8px;
+  white-space: nowrap;
+  border-radius: var(--radius-control);
+  border: 1px solid var(--inner-border);
+  background: var(--hover);
+  color: var(--text-secondary);
+}
+
+.topbar-donate-button:hover {
   background: var(--active-pill);
   color: var(--text-primary);
 }
@@ -956,14 +989,46 @@ html[data-app="landing"] .landing-header-menu-toggle {
 }
 
 html[data-app="landing"] .landing-header-github {
+  /* The split control paints its own chip and toggle, so the wrapper must not
+     paint a second border around them. It keeps the sizing only. */
   min-height: 38px;
-  padding-inline: 10px;
+  padding-inline: 0;
+  border: 0;
+  background: transparent;
+  color: var(--color-story-white);
+}
+
+/* The landing header is dark, so the split control's two halves take the story
+   palette rather than the neutral chip colors the console theme uses. */
+html[data-app="landing"] .landing-header-github .github-badge {
+  min-height: 38px;
   border-color: color-mix(in srgb, var(--color-story-white) 25%, transparent);
   background-color: color-mix(in srgb, var(--color-story-white) 8%, transparent);
   color: var(--color-story-white);
 }
 
-html[data-app="landing"] .landing-header-github:hover,
+html[data-app="landing"] .landing-header-github .github-badge:hover {
+  border-color: var(--color-story-white);
+  background-color: var(--color-story-white);
+  color: var(--story-deep);
+}
+
+html[data-app="landing"] .landing-header-github .github-split-toggle {
+  border-color: color-mix(in srgb, var(--color-story-white) 25%, transparent);
+  background-color: color-mix(in srgb, var(--color-story-white) 8%, transparent);
+  color: var(--color-story-white);
+}
+
+html[data-app="landing"] .landing-header-github .github-split-toggle:hover,
+html[data-app="landing"] .landing-header-github .github-split-toggle[aria-expanded="true"] {
+  border-color: var(--color-story-white);
+  background-color: var(--color-story-white);
+  color: var(--story-deep);
+}
+
+/* Only the standalone control keeps a wrapper hover; the split control handles
+   its own two halves above, and a wrapper hover here would paint a third
+   rectangle behind them. */
 html[data-app="landing"] .landing-header-control:hover {
   border-color: var(--color-story-white);
   background-color: var(--color-story-white);
@@ -1109,20 +1174,14 @@ html[data-app="landing"] .landing-story-visual {
 }
 
 @media (max-width: 1024px) {
-  html[data-app="landing"] .landing-header-menu-toggle,
-  html[data-app="landing"] .landing-header-menu-overlay {
+  /* No burger: the mobile menu held exactly one action ("Enter console"), so a
+     hamburger to reveal a single button was a click that bought nothing. The
+     console button is shown directly instead. */
+  html[data-app="landing"] .landing-header-console {
     display: inline-flex;
   }
 
-  html[data-app="landing"] .landing-header-menu-overlay {
-    display: block;
-  }
-
-  html[data-app="landing"] .landing-header-mobile-nav {
-    display: grid;
-  }
-
-  html[data-app="landing"] .landing-header-console {
+  html[data-app="landing"] .landing-header-show-all {
     display: none;
   }
 }
@@ -1145,9 +1204,15 @@ html[data-app="landing"] .landing-story-visual {
     display: none;
   }
 
+  /* The split control is two elements wide (chip + toggle), so it cannot be
+     pinned to a single 38px box. Collapse the chip to its mark instead. */
   html[data-app="landing"] .landing-header-github {
-    width: 38px;
+    width: auto;
     padding-inline: 0;
+  }
+
+  html[data-app="landing"] .landing-header-github .github-badge {
+    padding-inline: 10px;
   }
 }
 
@@ -1624,4 +1689,49 @@ html[data-app="landing"] .landing-story-visual {
   border-color: var(--banner-line);
   background: var(--banner-surface);
   color: var(--banner-ink);
+}
+
+/* ===== stat card value fit =====
+ * The headline number on a stat card is the one value on the page whose width
+ * the caller does not control: a token count can be `1.5M` or `1,234,567,890`.
+ * A fixed size that fits one clips or overflows the other, so the size steps
+ * down as the string grows — a short number keeps the display weight, a long
+ * one shrinks instead of spilling out of the card.
+ *
+ * Three steps, chosen from the length of the rendered string rather than from
+ * the viewport: the card's width does not change, the content does. `fit=long`
+ * additionally allows a break so a value that is still too wide wraps within
+ * the card instead of pushing past its padding.
+ */
+.stat-card-value {
+  font-family: var(--font-mono, monospace);
+  font-variant-numeric: tabular-nums;
+  font-weight: 700;
+  line-height: 1.15;
+  /* Long values must never widen the card: break anywhere rather than overflow. */
+  overflow-wrap: anywhere;
+}
+.stat-card-value[data-fit="default"] {
+  font-size: var(--text-display);
+}
+.stat-card-value[data-fit="medium"] {
+  font-size: var(--text-body-lg);
+}
+.stat-card-value[data-fit="long"] {
+  font-size: var(--text-caption);
+  letter-spacing: -0.01em;
+}
+
+/*
+ * The donation dialog's QR column: a fixed-width rail beside the prose.
+ *
+ * One width, stated once. The grid template and the QR image's own max width
+ * were two separate `220px` literals, which is how a layout decision ends up
+ * needing two edits to change and a third to stay in sync.
+ */
+.donate-qr-grid {
+  grid-template-columns: minmax(0, 220px) minmax(0, 1fr);
+}
+.donate-qr-image {
+  max-width: 220px;
 }

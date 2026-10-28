@@ -27,6 +27,7 @@ import { describe, expect, test } from "bun:test";
 import { recordAccountFailure } from "../../src/providers/operations/account-health-service";
 import type { CartethyiaDatabase } from "../../src/persistence/db-handle";
 import type { AccountFailureEvidence } from "../../src/providers/operations/account-health-service";
+import { resetCooldownCacheForTests } from "../../src/config/cooldowns";
 
 interface Captured {
   readonly updates: Record<string, unknown>[];
@@ -349,6 +350,40 @@ describe("recordAccountFailure — a frequency window cools the model, not the a
   });
 });
 
+describe("recordAccountFailure — a Trae quota exhaustion that arrives as 502", () => {
+  test("a quota body on a 5xx status is quota, not a gateway failure", async () => {
+    // Trae answers an exhausted quota with HTTP 502 and the body `Your requests
+    // have exceeded the quota.`. The status is what misled the classifier: 502
+    // read as a gateway failure, so this became `server_error` — a 30s cooldown
+    // that does not mutate the account, which kept the account in rotation and
+    // kept invoking every other model on it inside a window the provider had
+    // already closed. The body is the verdict here, not the status.
+    const account = coolingAccount();
+    account["status"] = "active";
+    account["cooldownUntil"] = null;
+    const { db, captured } = dbDouble(account);
+    await recordAccountFailure(
+      db,
+      "acc-trae",
+      new Error("Your requests have exceeded the quota."),
+      { origin: "upstream", scope: "account", statusCode: 502, providerId: "trae" },
+    );
+    const payload = onlyUpdate(captured);
+    // Account-wide, so no other model on this account is invoked: a
+    // `modelCooldowns` write would have left the rest of the catalog dialling
+    // an account with no quota left.
+    expect(payload.modelCooldowns).toBeUndefined();
+    expect(payload.status).toBe("cooldown");
+    // Hours, not the 30s a transient 5xx gets — and deliberately not 24h: the
+    // provider states no reset, so the window re-probes rather than parking
+    // the account for a day on one unconfirmed reading.
+    expect(payload.cooldownUntil as unknown as Date).toBeInstanceOf(Date);
+    expect(
+      (payload.cooldownUntil as unknown as Date).getTime() - Date.now(),
+    ).toBeGreaterThan(60 * 60 * 1000 - 60_000);
+  });
+});
+
 describe("recordAccountFailure — an auth rejection writes a cooldown, not a disable", () => {
   test("an expired OAuth token cools the account", async () => {
     // `disabled` is the one state no sweep recovers, and an expiry is the
@@ -435,6 +470,7 @@ describe("recordAccountFailure — an auth rejection writes a cooldown, not a di
     // The documented escape hatch. It has to change the write, or the comment
     // promising the old behavior is a lie.
     process.env.CARTETHYIA_ACCOUNT_DISABLED_RECOVERY_MS = "0";
+    resetCooldownCacheForTests();
     try {
       const account = coolingAccount();
       account["status"] = "active";
@@ -452,6 +488,7 @@ describe("recordAccountFailure — an auth rejection writes a cooldown, not a di
       expect(onlyUpdate(captured).cooldownUntil).toBeNull();
     } finally {
       delete process.env.CARTETHYIA_ACCOUNT_DISABLED_RECOVERY_MS;
+      resetCooldownCacheForTests();
     }
   });
 });

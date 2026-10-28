@@ -148,7 +148,40 @@ export const CONFIG_SPEC = {
    */
   CARTETHYIA_DISABLED_TASKS: { kind: "list" },
 
+  /**
+   * How long a day's telemetry is kept, in days.
+   *
+   * The retention unit is the whole day: a day's event file and its index are
+   * deleted together, and the current day is never touched. Past this age an
+   * individual request no longer exists anywhere, so its detail is gone —
+   * totals, breakdowns and spend are unaffected, because the index keeps
+   * running sums rather than the rows.
+   *
+   * This is the knob that decides how long the request list, per-request
+   * filters, and the detail drawer stay complete.
+   */
   CARTETHYIA_TELEMETRY_RETENTION_DAYS: { kind: "int", default: 30, min: 3, max: 365 },
+  /**
+   * Age at which a request's detail is described as no longer stored.
+   *
+   * Retention itself is `CARTETHYIA_TELEMETRY_RETENTION_DAYS`; this only words
+   * the operator-facing message shown when a request that old is asked for.
+   */
+  CARTETHYIA_TELEMETRY_COMPACT_AFTER_DAYS: { kind: "int", default: 7, min: 1, max: 365 },
+  /**
+   * How often each day's index is brought up to date, in minutes.
+   *
+   * Bringing an index up to date means folding the bytes appended since the
+   * last pass — not re-reading the day. Reads fold before they answer too, so
+   * raising this does not make the numbers stale; it only leaves the on-disk
+   * index further behind, and the next read pays for the remainder.
+   */
+  CARTETHYIA_TELEMETRY_COMPACT_INTERVAL_MINUTES: {
+    kind: "int",
+    default: 60,
+    min: 5,
+    max: 1440,
+  },
   CARTETHYIA_TELEMETRY_PAYLOAD_MAX_BYTES: {
     kind: "int",
     default: 16 * 1024 * 1024,
@@ -157,7 +190,14 @@ export const CONFIG_SPEC = {
   },
 
   // Upstream request timeout + retry backoff
-  CARTETHYIA_UPSTREAM_TIMEOUT_MS: { kind: "int", default: 120_000, min: 5_000, max: 600_000 },
+  //
+  // Strictly under 90s: a client whose own deadline is 90s must never be
+  // waiting on a gateway that is still holding a request open past it, and a
+  // provider that has not answered within 75s is not answering — the request
+  // is queued upstream or the egress is stuck, and the honest move is to fail
+  // over to another account rather than burn the caller's whole budget on one.
+  // 120s outlived the clients that call this, which cap lower.
+  CARTETHYIA_UPSTREAM_TIMEOUT_MS: { kind: "int", default: 75_000, min: 5_000, max: 600_000 },
   CARTETHYIA_STREAM_STALL_TIMEOUT_MS: {
     kind: "int",
     default: 360_000,
@@ -181,7 +221,24 @@ export const CONFIG_SPEC = {
   CARTETHYIA_ACCOUNT_QUOTA_COOLDOWN_MS: { kind: "int", default: 3_600_000, min: 0, max: 86_400_000 },
   CARTETHYIA_ACCOUNT_MODEL_CAPACITY_COOLDOWN_MS: { kind: "int", default: 120_000, min: 0, max: 86_400_000 },
   CARTETHYIA_ACCOUNT_TRANSIENT_COOLDOWN_MS: { kind: "int", default: 30_000, min: 0, max: 86_400_000 },
-  CARTETHYIA_ACCOUNT_UNCLASSIFIED_COOLDOWN_MS: { kind: "int", default: 60_000, min: 0, max: 86_400_000 },
+  /**
+   * An unmapped upstream failure cools the account down for 15 minutes.
+   *
+   * A shorter window puts the account straight back into rotation and re-dials
+   * an upstream that has just answered something this gateway does not
+   * understand — so the same unknown error is retried every minute, and an
+   * account that is actually broken contributes a steady stream of failed
+   * attempts instead of one. Fifteen minutes is long enough for a transient
+   * provider condition to clear on its own and short enough that no operator
+   * action is needed to recover it. It is still a cooldown with a deadline,
+   * never `disabled`, so nothing here can strand an account.
+   */
+  CARTETHYIA_ACCOUNT_UNCLASSIFIED_COOLDOWN_MS: {
+    kind: "int",
+    default: 900_000,
+    min: 0,
+    max: 86_400_000,
+  },
   CARTETHYIA_ACCOUNT_COOLDOWN_ESCALATION_MAX_MS: { kind: "int", default: 3_600_000, min: 0, max: 86_400_000 },
   CARTETHYIA_POOL_COOLDOWN_MS: { kind: "int", default: 120_000, min: 0, max: 86_400_000 },
   CARTETHYIA_ACCOUNT_AUTH_REJECTED_COOLDOWN_MS: { kind: "int", default: 300_000, min: 0, max: 86_400_000 },
@@ -200,6 +257,18 @@ export const CONFIG_SPEC = {
   CARTETHYIA_MODEL_STRIKE_THRESHOLD: { kind: "int", default: 10, min: 1, max: 100 },
   CARTETHYIA_MODEL_STRIKE_WINDOW_MS: { kind: "int", default: 1_800_000, min: 1_000, max: 86_400_000 },
   CARTETHYIA_MODEL_BAN_TTL_MS: { kind: "int", default: 21_600_000, min: 1_000, max: 604_800_000 },
+  /**
+   * The longest ban the console will record, however long a request asks for.
+   * The "Permanent" choice is a very long TTL rather than an unbounded one,
+   * and this is what keeps a typo in a duration from parking a caller for a
+   * decade.
+   */
+  CARTETHYIA_MODEL_BAN_MAX_TTL_MS: {
+    kind: "int",
+    default: 604_800_000,
+    min: 1_000,
+    max: 604_800_000,
+  },
   CARTETHYIA_ENCRYPTION_KEY: {
     kind: "required",
     error:
@@ -214,6 +283,15 @@ export const CONFIG_SPEC = {
   // Provider OAuth hosts
   CARTETHYIA_KIMI_OAUTH_HOST: { kind: "text", default: DEFAULT_KIMI_OAUTH_HOST },
   /**
+   * Loopback port the browser-OAuth callback listener binds.
+   *
+   * Configurable because the default is a fixed number: a busy port would strand
+   * the operator, since the login could not start and there would be no way to
+   * move it. Codex's authorization server still expects 59653, so changing this
+   * only helps the providers whose redirect URI is not allowlisted upstream.
+   */
+  CARTETHYIA_OAUTH_CALLBACK_PORT: { kind: "int", default: 59_653, min: 1_024, max: 65_535 },
+  /**
    * Kimi Code quota/billing base. The `/usages` path joins on this, so the
    * default includes the `/v1` segment the bundled provider metadata implies.
    */
@@ -225,6 +303,17 @@ export const CONFIG_SPEC = {
    * an operator on one has no other way to point the login at it.
    */
   CARTETHYIA_GITHUB_ENTERPRISE_DOMAIN: { kind: "text", default: "" },
+  /**
+   * Free-tier OpenCode ids the listing still advertises but upstream refuses.
+   * Replaces the bundled list outright; the single token `none` trusts the
+   * listing completely.
+   *
+   * The bundled ids were measured, not declared — upstream can start serving
+   * a refused id or start refusing a served one at any time, and either way
+   * the correct answer stopped being the one compiled in. This is the escape
+   * hatch that needs no deploy.
+   */
+  CARTETHYIA_OPENCODE_UNAVAILABLE_FREE: { kind: "list" },
 } as const satisfies Readonly<Record<string, ConfigEntry>>;
 
 // ─── Spec readers ───────────────────────────────────────────────────────────

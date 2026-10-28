@@ -270,6 +270,40 @@ describe("Codex Responses stream text", () => {
     expect(textDeltas(events)).toEqual(["Final-only answer."]);
   });
 
+  test("appends the missing suffix when a final snapshot completes partial text deltas", () => {
+    const processor = new CodexStreamFrameProcessor(1);
+    const partial = "The response should end";
+    const complete = "The response should end with this sentence.";
+    const events = [
+      ...processor.process({
+        type: "response.output_text.delta",
+        item_id: "message-1",
+        output_index: 0,
+        content_index: 0,
+        delta: partial,
+      }),
+      ...processor.process({
+        type: "response.output_text.done",
+        item_id: "message-1",
+        output_index: 0,
+        content_index: 0,
+        text: complete,
+      }),
+      ...processor.process({
+        type: "response.output_item.done",
+        output_index: 0,
+        item: {
+          id: "message-1",
+          type: "message",
+          content: [{ type: "output_text", text: complete }],
+        },
+      }),
+    ];
+
+    expect(textDeltas(events).join("")).toBe(complete);
+    expect(textDeltas(events)).toEqual([partial, complete.slice(partial.length)]);
+  });
+
   test("does not repeat text already delivered as deltas", () => {
     const processor = new CodexStreamFrameProcessor(1);
     const outputText = "A streamed answer.";

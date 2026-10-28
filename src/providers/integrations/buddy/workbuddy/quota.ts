@@ -26,13 +26,17 @@ import { buddyAccountUid } from "../buddy-oauth-shared";
  * WorkBuddy-specific.
  */
 
+/**
+ * The CN billing realm's host.
+ *
+ * The reference bills the CN realm here rather than on the CN chat host
+ * (`www.workbuddy.cn`): billing is a separate service, and the chat host does
+ * not serve the meter path.
+ */
+const WORKBUDDY_CN_BILLING_BASE_URL = "https://www.codebuddy.cn";
+
 export const WORKBUDDY_USAGE_URL =
   `${providerBaseUrl("workbuddy")}/v2/billing/meter/get-user-resource`;
-
-export const WORKBUDDY_REQUEST_USAGE_URL =
-  `${providerBaseUrl("workbuddy")}/billing/meter/get-user-request-usage`;
-export const WORKBUDDY_CN_REQUEST_USAGE_URL =
-  `${providerBaseUrl("workbuddycn")}/billing/meter/get-user-request-usage`;
 
 async function billingHeaders(
   domain: string,
@@ -104,10 +108,14 @@ async function fetchWorkBuddyQuotaFor(args: {
   const clientVersion = providerId === "workbuddycn"
     ? getWorkBuddyCnClientVersion()
     : getWorkBuddyClientVersion();
+  // The reference bills the CN realm on `www.codebuddy.cn`, not the chat host:
+  // the billing realm is a different service from the one that serves chat,
+  // and the CN chat host answers the meter path with an HTML error page.
+  const billingBase = providerId === "workbuddycn" ? WORKBUDDY_CN_BILLING_BASE_URL : providerBaseUrl(providerId);
   return fetchTencentBillingQuota({
     source: providerId,
     display,
-    url: `${providerBaseUrl(providerId)}/v2/billing/meter/get-user-resource`,
+    url: `${billingBase}/v2/billing/meter/get-user-resource`,
     headers: await billingHeaders(domain, clientVersion, enterpriseId),
     credential,
     fetcher,
@@ -150,10 +158,3 @@ export async function fetchWorkBuddyRequestUsage(
     uid: buddyAccountUid(credential),
   });
 }
-
-export const fetchWorkBuddyCnRequestUsage = (
-  credential: string,
-  fetcher: FetchLike,
-  days: number = 30,
-): Promise<BuddyUsageResult> =>
-  fetchWorkBuddyRequestUsage(credential, fetcher, { providerId: "workbuddycn", days });

@@ -16,7 +16,9 @@
  * needs both for COSY signing.
  */
 import { createHash, randomBytes, randomUUID } from "node:crypto";
+import { QODER_REALMS, type QoderRealm } from "./qoder-realm";
 import {
+  base64UrlEncode,
   nonEmptyTrimmedString,
   record,
 } from "../../authentication/oauth-flow-store";
@@ -29,9 +31,107 @@ import type {
 import type { OAuthTokenRefreshResult } from "../../authentication/oauth-refresh-service";
 import { OAuthDeviceFlow } from "../../authentication/oauth-device-flow";
 
+/** One Qoder account profile, as much of it as the gateway uses. */
+export interface QoderUserInfo {
+  readonly name: string;
+  readonly email: string;
+  readonly id: string;
+  /** Organization the account belongs to; empty when it belongs to none. */
+  readonly organizationId: string;
+  readonly organizationName: string;
+  /** The upstream's own account class, when it states one. */
+  readonly userType: string;
+  readonly isOrganization: boolean;
+  /** Display label for an organization with no name; empty when there is none. */
+  readonly organizationLabel: string;
+}
+
+/** The profile a lookup that learned nothing returns, so callers need no `?.`. */
+const EMPTY_USERINFO: QoderUserInfo = {
+  name: "",
+  email: "",
+  id: "",
+  organizationId: "",
+  organizationName: "",
+  userType: "",
+  isOrganization: false,
+  organizationLabel: "",
+};
+
+/**
+ * Reads one userinfo body into {@link QoderUserInfo}.
+ *
+ * Exported and pure so the organization rule is testable without a network: the
+ * rule is the part that decides how an account is labelled and, downstream,
+ * which quota pool it draws from.
+ *
+ * Every field accepts both spellings the upstream has shipped (`user_type` and
+ * `userType`, `organization_id` and `organizationId`) because the two login
+ * paths — OAuth and PAT import — do not agree on one, and an account that took
+ * the other path would otherwise read as personal.
+ */
+export function readQoderUserInfo(body: Record<string, unknown>): QoderUserInfo {
+  const first = (...keys: readonly string[]): string =>
+    keys.map((key) => nonEmptyTrimmedString(body[key])).find((value) => value !== undefined) ?? "";
+  const organizationId = first("organization_id", "organizationId");
+  const organizationName = first("organization_name", "organizationName");
+  const userType = first("user_type", "userType");
+  const credits = record(body.credits);
+  const shared = credits === undefined ? undefined : record(credits["shared"]);
+  const sharedPool =
+    (shared !== undefined &&
+      (Number(shared["size"]) > 0 || shared["unlimited"] === true)) ||
+    (Array.isArray(body.packages) &&
+      body.packages.some(
+        (pkg) => record(pkg) !== undefined && nonEmptyTrimmedString(record(pkg)!["name"]) === "shared",
+      ));
+  return {
+    name: (nonEmptyTrimmedString(body.name) ?? nonEmptyTrimmedString(body.username) ?? "").trim(),
+    email: (nonEmptyTrimmedString(body.email) ?? "").trim(),
+    id: first("id", "userId", "user_id"),
+    organizationId,
+    organizationName,
+    userType,
+    // An organization is enough on its own: an enterprise account whose
+    // `userType` reads personal is still enterprise once it carries one.
+    isOrganization:
+      organizationId.length > 0 ||
+      organizationName.length > 0 ||
+      /team|enterprise/.test(userType.toLowerCase()) ||
+      sharedPool,
+    organizationLabel:
+      organizationName.length > 0
+        ? organizationName
+        : organizationId.length > 0
+          ? `org ${organizationId.slice(0, 8)}`
+          : "",
+  };
+}
+
+/** Global/intl endpoints. Kept as the default realm's values, unchanged. */
 export const QODER_LOGIN_URL = "https://qoder.com/device/selectAccounts" as const;
 export const QODER_DEVICE_TOKEN_URL = "https://openapi.qoder.sh/api/v1/deviceToken/poll" as const;
 export const QODER_USERINFO_URL = "https://openapi.qoder.sh/api/v1/userinfo" as const;
+
+/**
+ * Per-realm device endpoints, derived from `QODER_REALMS`.
+ *
+ * Every realm's openapi host differs, so the three URLs are built from the
+ * table rather than hardcoded — a CN login pointed at `openapi.qoder.sh` is
+ * refused before it ever reaches an approval screen.
+ */
+export function qoderOAuthUrls(realm: QoderRealm): {
+  readonly loginUrl: string;
+  readonly deviceTokenUrl: string;
+  readonly userinfoUrl: string;
+} {
+  const config = QODER_REALMS[realm];
+  return {
+    loginUrl: `${config.website}/device/selectAccounts`,
+    deviceTokenUrl: `${config.openapi}/api/v1/deviceToken/poll`,
+    userinfoUrl: `${config.openapi}/api/v1/userinfo`,
+  };
+}
 
 /** Device authorizations live 5 minutes in the dashboard before expiring. */
 const DEVICE_EXPIRY_SECONDS = 300;
@@ -58,13 +158,6 @@ export function parseQoderOAuthState(value: unknown): QoderOAuthState | undefine
   return { userId, machineId };
 }
 
-function base64Url(buffer: Buffer): string {
-  return buffer
-    .toString("base64")
-    .replace(/=/g, "")
-    .replace(/\+/g, "-")
-    .replace(/\//g, "_");
-}
 
 /**
  * Converts the upstream's expiry hint into a Unix-millisecond timestamp.
@@ -121,6 +214,25 @@ export class QoderOAuthClient extends OAuthDeviceFlow {
   override readonly supportsDeviceCode = true;
   override readonly supportsBrowserCode = false;
 
+  /**
+   * Which deployment this login talks to.
+   *
+   * Defaults to intl, whose parameter set is left exactly as it was working:
+   * the CN shape below is the only branch that changes behavior, so adding a
+   * realm cannot regress an existing global login.
+   */
+  private readonly realm: QoderRealm;
+
+  constructor(fetchFn: typeof fetch = globalThis.fetch, realm: QoderRealm = "intl") {
+    super(fetchFn);
+    this.realm = realm;
+  }
+
+  /** The three device endpoints for this client's realm. */
+  get urls(): { loginUrl: string; deviceTokenUrl: string; userinfoUrl: string } {
+    return qoderOAuthUrls(this.realm);
+  }
+
   protected override readonly providerLabel = "Qoder";
   // The device endpoints take no client id; the abstract field stays empty
   // rather than inventing one, and every request below omits it.
@@ -131,9 +243,13 @@ export class QoderOAuthClient extends OAuthDeviceFlow {
   override async startDeviceAuth(
     _context?: OAuthDeviceFlowContext,
   ): Promise<OAuthDeviceStartResult> {
-    const verifier = base64Url(randomBytes(32));
-    const challenge = base64Url(createHash("sha256").update(verifier).digest());
-    const nonce = randomUUID();
+    const verifier = base64UrlEncode(randomBytes(32));
+    const challenge = base64UrlEncode(createHash("sha256").update(verifier).digest());
+    // CN carries a dashed nonce and additionally states the client id and
+    // native redirect; intl stays on the 32-hex nonce and the two params it
+    // has always sent. Both shapes are upstream fact from the donor, and only
+    // the CN branch is new, so the working intl URL is untouched.
+    const nonce = this.realm === "cn" ? randomUUID() : randomUUID().replaceAll("-", "");
     const machineId = randomUUID();
     const params = new URLSearchParams({
       challenge,
@@ -141,8 +257,13 @@ export class QoderOAuthClient extends OAuthDeviceFlow {
       machine_id: machineId,
       nonce,
     });
+    if (this.realm === "cn") {
+      const config = QODER_REALMS.cn;
+      params.set("client_id", config.clientId);
+      params.set("redirect_uri", config.redirectUri);
+    }
     return {
-      verificationUri: `${QODER_LOGIN_URL}?${params.toString()}`,
+      verificationUri: `${qoderOAuthUrls(this.realm).loginUrl}?${params.toString()}`,
       // This flow shows no user code: approval happens against the
       // nonce-bound browser session, so there is nothing to type back.
       userCode: "",
@@ -160,7 +281,7 @@ export class QoderOAuthClient extends OAuthDeviceFlow {
     const state = parseDeviceState(context?.providerState);
     if (state === undefined) return { status: "failed", reason: "unknown device authorization" };
     const url =
-      `${QODER_DEVICE_TOKEN_URL}?nonce=${encodeURIComponent(deviceAuthId)}` +
+      `${qoderOAuthUrls(this.realm).deviceTokenUrl}?nonce=${encodeURIComponent(deviceAuthId)}` +
       `&verifier=${encodeURIComponent(state.verifier)}&challenge_method=S256`;
     let response: Response;
     try {
@@ -223,10 +344,19 @@ export class QoderOAuthClient extends OAuthDeviceFlow {
     return { status: "complete", result };
   }
 
-  /** Best-effort profile lookup for the account label; never blocks login. */
-  async fetchUserInfo(accessToken: string): Promise<{ name: string; email: string; id: string }> {
+  /**
+   * Best-effort profile lookup for the account label; never blocks login.
+   *
+   * Also reports whether the account belongs to an organization. Upstream
+   * decides that from whichever signal is present, in this order: an
+   * organization id or name, a `userType` naming a team or enterprise, or a
+   * shared credit pool. Any one of them is enough — an enterprise account whose
+   * `userType` reads personal is still enterprise as soon as it carries an
+   * organization, which is the case the organization check exists for.
+   */
+  async fetchUserInfo(accessToken: string): Promise<QoderUserInfo> {
     try {
-      const response = await this.fetchFn(QODER_USERINFO_URL, {
+      const response = await this.fetchFn(qoderOAuthUrls(this.realm).userinfoUrl, {
         method: "GET",
         headers: {
           authorization: `Bearer ${accessToken}`,
@@ -235,20 +365,12 @@ export class QoderOAuthClient extends OAuthDeviceFlow {
         },
         signal: AbortSignal.timeout(POLL_TIMEOUT_MS),
       });
-      if (!response.ok) return { name: "", email: "", id: "" };
+      if (!response.ok) return EMPTY_USERINFO;
       const body = record(await response.json());
-      if (body === undefined) return { name: "", email: "", id: "" };
-      return {
-        name: (nonEmptyTrimmedString(body.name) ?? nonEmptyTrimmedString(body.username) ?? "").trim(),
-        email: (nonEmptyTrimmedString(body.email) ?? "").trim(),
-        id:
-          nonEmptyTrimmedString(body.id) ??
-          nonEmptyTrimmedString(body.userId) ??
-          nonEmptyTrimmedString(body.user_id) ??
-          "",
-      };
+      if (body === undefined) return EMPTY_USERINFO;
+      return readQoderUserInfo(body);
     } catch {
-      return { name: "", email: "", id: "" };
+      return EMPTY_USERINFO;
     }
   }
 
@@ -261,3 +383,6 @@ export class QoderOAuthClient extends OAuthDeviceFlow {
 }
 
 export const qoderOAuthClient = new QoderOAuthClient();
+
+/** Device-login client for the China deployment. */
+export const qoderCnOAuthClient = new QoderOAuthClient(globalThis.fetch, "cn");

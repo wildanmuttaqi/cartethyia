@@ -54,14 +54,23 @@ export function radixRootValue(value: string): string | undefined {
 }
 
 /**
- * Whether an emission from Radix is a real selection the caller should store.
+ * Whether an option with this value may be picked.
  *
- * Radix can emit `""`; storing it puts the caller's state on the same dead
- * value the trigger renders as "Select…", after which the field looks reset no
- * matter what was picked. Refusing it keeps the last real selection.
+ * The empty string is Radix's placeholder convention, so a bare `""` emission
+ * cannot be accepted blindly — storing it is what made the API-format dropdown
+ * read as reset after every pick. But `""` is also a legitimate value for a
+ * caller that spells "no choice" that way: the routing card's Client identity
+ * offers `{ value: "", label: "None" }`, and refusing it made picking None do
+ * nothing at all — the handler returned before calling `onValueChange`, so the
+ * stored identity never changed and the control looked inert.
+ *
+ * The two are told apart by the options list: an `""` the caller published as a
+ * labelled option is a real choice, while an `""` that no option carries is the
+ * placeholder convention leaking through.
  */
-export function isSelectableValue(next: string): boolean {
-  return next !== "";
+export function isSelectableValue(next: string, options: readonly SelectOption[] = []): boolean {
+  if (next !== "") return true;
+  return options.some((option) => option.value === "");
 }
 
 export function Select({
@@ -80,9 +89,12 @@ export function Select({
 }: SelectProps): ReactNode {
   const rootValue = radixRootValue(value);
   const handler = (next: string): void => {
-    if (!isSelectableValue(next)) return;
+    if (!isSelectableValue(next, options)) return;
     onValueChange?.(next);
   };
+  // Resolved against the caller's own value, not Radix's root value: `None` is
+  // a real selection (`""`), and reading the label from `rootValue` — which is
+  // `undefined` for it — would render the placeholder instead of "None".
   const selectedLabel = options.find((option) => option.value === value)?.label;
 
 
@@ -97,7 +109,11 @@ export function Select({
         // order, not by the caller's intent, and the control would silently take the
         // atom's size instead of the one asked for.
         className={cn(
-          "radix-select-trigger inline-flex items-center justify-between gap-4 w-full px-6 rounded-control border border-inner-border bg-surface-2 text-text-primary text-caption font-sans text-left cursor-pointer transition-[border-color,background-color] duration-150 ease-spring hover:border-border-strong focus-visible:outline-2 focus-visible:outline-focus-ring focus-visible:outline-offset-1 aria-disabled:opacity-70 aria-disabled:cursor-default aria-disabled:pointer-events-none [&_svg]:text-text-tertiary [&_svg]:transition-transform [&_svg]:duration-150 [&_svg]:ease-spring data-[state=open]:[&_svg]:rotate-180",
+          // `text-body` (13px) matches the label above it. At `text-caption`
+          // (12px) the selected value read as subordinate to its own label and
+          // the same size as the help text beneath — so a field's three parts
+          // had two sizes between them and no clear order.
+          "radix-select-trigger inline-flex items-center justify-between gap-4 w-full px-6 rounded-control border border-inner-border bg-surface-2 text-text-primary text-body font-sans text-left cursor-pointer transition-[border-color,background-color] duration-150 ease-spring hover:border-border-strong focus-visible:outline-2 focus-visible:outline-focus-ring focus-visible:outline-offset-1 aria-disabled:opacity-70 aria-disabled:cursor-default aria-disabled:pointer-events-none [&_svg]:text-text-tertiary [&_svg]:transition-transform [&_svg]:duration-150 [&_svg]:ease-spring data-[state=open]:[&_svg]:rotate-180",
           SIZE_HEIGHT_CLASS[size],
           className,
         )}

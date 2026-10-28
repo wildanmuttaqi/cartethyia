@@ -15,6 +15,7 @@ import { GatewayError, publicGatewayErrorBody } from "../protocol/gateway-error"
 import { shutdownError, shutdownNotice } from "../transport/shutdown-notice";
 import type { CanonicalAdapter } from "../transport/contracts";
 import type { ApiKeyAuthorizationSnapshot } from "../security/api-key-auth";
+import { modelsListApiKeyError } from "../security/api-key-auth";
 import { getDbHandle } from "../persistence/boot";
 import { isPgHandle } from "../persistence/db-pg";
 import { resolveRedisClient } from "../persistence/redis";
@@ -34,14 +35,21 @@ import {
 import { createResponsesCompactHandler } from "../transport/dispatch/responses-compact";
 import { createSystemoneHandler } from "../transport/dispatch/systemone";
 import { createWebsearchHandler } from "../transport/dispatch/websearch";
-import { createImageGenerationHandler, createVideoGenerationHandler } from "../transport/dispatch/generation";
+import {
+  createAudioSpeechHandler,
+  createAudioTranscriptionHandler,
+  createEmbeddingHandler,
+  createImageGenerationHandler,
+  createVideoGenerationHandler,
+} from "../transport/dispatch/generation";
 import { createTokenCountHandler } from "../transport/dispatch/token-count";
 
 import { createTransportPipeline } from "../transport/guards/pipeline";
 import { createDrainHandler, isLoopbackPeer, tokenMatches } from "../transport/drain-endpoint";
 import { createConsoleAccountResetHandler } from "../console/auth/account-reset";
+import { resetConsoleAuthState } from "../console/auth/account-reset-store";
 import { createBackupExportHandler } from "../console/backup/export-endpoint";
-import { consoleUsers, tenants } from "../persistence/schema";
+import { tenants } from "../persistence/schema";
 import { PublicModelCatalogStore, type AllowedModelEntry } from "../console/providers/catalog/public-model-store";
 import type { IpAbuseProtectionService } from "../security/abuse";
 import type { ReadinessCheckResult } from "../persistence/readiness";
@@ -72,7 +80,7 @@ import type { ShutdownDrainSource } from "../transport/contracts";
  * discriminant narrows `deps` to `ProductionAppDeps`. Listing them here would
  * let a caller pass a value the shell silently ignores.
  */
-export interface GatewayShellDeps {
+interface GatewayShellDeps {
   readonly mode: "route-only";
   readonly dashboardDist?: string;
   readonly checkDb?: () => Promise<void>;
@@ -151,7 +159,7 @@ export interface ProductionAppDeps {
 }
 
 /** Either app mode. The discriminant decides which builder path runs. */
-export type GatewayAppDeps = GatewayShellDeps | ProductionAppDeps;
+type GatewayAppDeps = GatewayShellDeps | ProductionAppDeps;
 
 function checkDatabaseConnection(): Promise<void> {
   return getDbHandle()
@@ -196,7 +204,9 @@ export function createGatewayApp(deps: GatewayAppDeps) {
   const peerAddresses = new WeakMap<Request, string>();
   const serveDashboard = async ({ request }: { request: Request }): Promise<Response> => {
     const pathname = fastPathname(request.url);
-    const result = await staticHandler(pathname);
+    // The client's `accept-encoding` is what decides whether a precompressed
+    // `.gz` sibling can be served instead of the plain asset.
+    const result = await staticHandler(pathname, request.headers.get("accept-encoding"));
     return new Response(result.body ? (result.body as unknown as BodyInit) : null, {
       status: result.status,
       headers: result.headers,
@@ -399,7 +409,7 @@ export function createGatewayApp(deps: GatewayAppDeps) {
     const handleModelsList = async ({ request }: { request: Request }): Promise<Response> => {
       const state = requestStateStore.require(request);
       const auth = state.authorization;
-      if (!auth) throw new GatewayError("invalid_request", 401, "This API key is unknown, revoked, or expired. Issue a new key and send it as: Authorization: Bearer <key>.");
+      if (!auth) throw modelsListApiKeyError();
       const data = await queryAllowedModels(auth);
       return new Response(JSON.stringify({ object: "list", data }), {
         headers: {
@@ -422,7 +432,7 @@ export function createGatewayApp(deps: GatewayAppDeps) {
     }): Promise<Response> => {
       const state = requestStateStore.require(request);
       const auth = state.authorization;
-      if (!auth) throw new GatewayError("invalid_request", 401, "This API key is unknown, revoked, or expired. Issue a new key and send it as: Authorization: Bearer <key>.");
+      if (!auth) throw modelsListApiKeyError();
       const raw = params?.["*"] ?? params?.id ?? "";
       const targetId = new URL(request.url).searchParams.get("id") ?? raw;
       const found = await publicModelStore.getPublicModelDetail(
@@ -512,6 +522,13 @@ export function createGatewayApp(deps: GatewayAppDeps) {
     // Mounted with no model behind it on purpose: the surface exists so it can
     // be finished when an upstream is known, rather than 404ing like a typo.
     const handleVideoGeneration = createVideoGenerationHandler(generationDeps);
+    // Passthrough surfaces: routed and accounted for, but never interpreted.
+    // No bundled adapter implements embeddings or audio, and inventing a wire
+    // for them would be a guess; what these need to be useful is the route, the
+    // pipeline, and a compatible upstream behind it.
+    const handleEmbedding = createEmbeddingHandler(generationDeps);
+    const handleAudioTranscription = createAudioTranscriptionHandler(generationDeps);
+    const handleAudioSpeech = createAudioSpeechHandler(generationDeps);
     // Shares the generation dependency bundle: same pipeline, and a count is
     // neither chat-shaped nor generation-shaped, so it needs exactly the same
     // routing, leasing, and accounting surface.
@@ -533,6 +550,9 @@ export function createGatewayApp(deps: GatewayAppDeps) {
         routes.post("/search", handleWebsearch);
         routes.post("/images/generations", handleImageGeneration);
         routes.post("/videos/generations", handleVideoGeneration);
+        routes.post("/embeddings", handleEmbedding);
+        routes.post("/audio/transcriptions", handleAudioTranscription);
+        routes.post("/audio/speech", handleAudioSpeech);
         routes.get("/models", handleModelsList);
         routes.get("/models/info", handleModelsDetail);
         routes.get("/models/*", handleModelsDetail);
@@ -580,10 +600,7 @@ export function createGatewayApp(deps: GatewayAppDeps) {
         createConsoleAccountResetHandler({
           token: deps.drainToken,
           resolvePeerAddress: (request) => peerAddresses.get(request) ?? null,
-          resetConsoleAccount: async () => {
-            const users = await deps.db.delete(consoleUsers);
-            return users.rowCount ?? 0;
-          },
+          resetConsoleAccount: () => resetConsoleAuthState(deps.db),
         }),
       );
     }
@@ -597,10 +614,14 @@ export function createGatewayApp(deps: GatewayAppDeps) {
       const tasks = deps.scheduledTasks;
       const token = deps.drainToken;
       app.post("/admin/tasks/:name/run", async ({ request, params }) => {
+        // `policy_rejected`, not `invalid_request`: the request may be perfectly
+        // well-formed. What refused it is where it came from — the client asked
+        // for something only the local host may ask. `invalid_request` told an
+        // operator to fix the body, when the body was never the problem.
         if (!isLoopbackPeer(peerAddresses.get(request) ?? null))
-          throw new GatewayError("invalid_request", 403, "task trigger is only available from loopback");
+          throw new GatewayError("policy_rejected", 403, "task trigger is only available from loopback");
         if (!tokenMatches(request.headers.get("x-drain-token"), token))
-          throw new GatewayError("invalid_request", 401, "invalid drain token");
+          throw new GatewayError("authentication_failed", 401, "invalid drain token");
         const name = params.name;
         if (!tasks.names().includes(name))
           throw new GatewayError("invalid_request", 404, `no such task: ${name}`);

@@ -140,7 +140,13 @@ export interface ApiKeyConfig {
 export interface ShareKeyResponse {
   readonly id: string;
   readonly url: string;
-  readonly token: string;
+  /**
+   * The bearer half of the link. Null when the row was written under an
+   * encryption key this deployment no longer holds: the page stays reachable
+   * from `url`, but the secret cannot be shown again and must be regenerated
+   * before the link can authenticate.
+   */
+  readonly token: string | null;
   readonly kind: ShareLinkKind;
   readonly expiresAt: string | null;
 }
@@ -155,23 +161,36 @@ export interface ShareLinkResponse {
   readonly lastViewedAt: string | null;
 }
 
-/** Default prefix for newly generated API keys. */
-export const DEFAULT_API_KEY_PREFIX = "carte_";
+/**
+ * Default prefix for newly generated API keys.
+ *
+ * The separator is a hyphen, not an underscore, and the random tail is a fixed
+ * 16 characters: `pn-carte-` for personal keys, `sh-carte-` for the ones a
+ * share template issues. Both are metadata shown in the console — nothing
+ * looks a key up by its prefix — so changing these does not invalidate rows
+ * already stored, which keep the prefix they were issued with.
+ */
+export const DEFAULT_API_KEY_PREFIX = "pn-carte-";
 /** Default prefix used by share templates and the keys they issue. */
-export const DEFAULT_SHARE_API_KEY_PREFIX = "sh-carte_";
+export const DEFAULT_SHARE_API_KEY_PREFIX = "sh-carte-";
+
+/**
+ * Bytes of entropy behind the random tail.
+ *
+ * 12 bytes base64url-encodes to exactly 16 characters with no padding, which
+ * is the whole reason for the number: the length in the constants above and
+ * the length a generated key actually has cannot disagree.
+ */
+const KEY_SECRET_BYTES = 12;
 
 /** Label of the default gateway API key seeded at first boot; never revoked. */
 export const DEFAULT_API_KEY_LABEL = "Default Cartethyia API key";
 
-/** Recognizes the default key and legacy rows restored before its flag existed. */
+/** Recognizes the default gateway API key by its persisted flag. */
 export function isDefaultGatewayApiKey(
-  record: Pick<ApiKeyRecord, "isDefault" | "keyMode" | "label" | "parentKeyId">,
+  record: Pick<ApiKeyRecord, "isDefault">,
 ): boolean {
-  return record.isDefault || (
-    record.keyMode === "personal" &&
-    record.parentKeyId === undefined &&
-    record.label === DEFAULT_API_KEY_LABEL
-  );
+  return record.isDefault;
 }
 
 /** Generates an inbound key and its one-way hash. */
@@ -180,7 +199,7 @@ export function generateApiKeySecret(prefix = DEFAULT_API_KEY_PREFIX): {
   hash: string;
   prefix: string;
 } {
-  const secret = `${prefix}${randomBytes(9).toString("base64url")}`;
+  const secret = `${prefix}${randomBytes(KEY_SECRET_BYTES).toString("base64url")}`;
   return { secret, hash: hashSecret(secret), prefix };
 }
 
@@ -190,10 +209,10 @@ export function resolveKeyPrefix(raw: string | undefined): string {
   return trimmed && trimmed.length > 0 ? trimmed : DEFAULT_API_KEY_PREFIX;
 }
 
-/** Resolves the share-key prefix and upgrades the legacy default prefix. */
+/** Resolves the share-key prefix; falls back to the default. */
 export function resolveShareKeyPrefix(raw: string | undefined): string {
   const trimmed = raw?.trim();
-  return !trimmed || trimmed === "rk_" ? DEFAULT_SHARE_API_KEY_PREFIX : trimmed;
+  return !trimmed ? DEFAULT_SHARE_API_KEY_PREFIX : trimmed;
 }
 
 /** Maximum hint the enroll page accepts; the dashboard caps its input there. */
@@ -340,8 +359,8 @@ export function sanitizeApiKeyResponse(record: ApiKeyRecord): ApiKeyResponse {
     keyMode: record.keyMode,
     scopes: record.scopes,
     /**
-     * Current keys use the persisted flag. The canonical label is a compatibility
-     * marker for legacy restores and is promoted to the flag on the next update.
+     * The persisted flag alone decides this: the label is display text, so
+     * renaming the key cannot change which key is the default.
      */
     isDefault: isDefaultGatewayApiKey(record),
     ...(keyPrefix === undefined ? {} : { keyPrefix }),

@@ -73,8 +73,9 @@ const BUDDY_IMAGE_MODEL_IDS: readonly { id: string; endpoint: string; ctx: numbe
  * `seedance-2.5` is the text-to-video model the buddy facade exposes. It is a
  * distinct service kind (`videoGeneration`), not a chat or image row, so it is
  * built by {@link makeBuddyVideoModels} and reached through
- * `/v1/videos/generations` rather than a chat wire. CodeBuddy CN is
- * deliberately absent — it publishes a different roster.
+ * `/videos/generations` (relative to each variant's own base, which is why the
+ * WorkBuddy rows carry the `/v2` segment themselves) rather than a chat wire.
+ * CodeBuddy CN is deliberately absent — it publishes a different roster.
  */
 const BUDDY_VIDEO_MODEL_IDS: readonly { id: string; endpoint: string; ctx: number; out: number }[] = [
   { id: "seedance-2.5", endpoint: "/videos/generations", ctx: 1_000_000, out: 128_000 },
@@ -90,6 +91,40 @@ const BUDDY_VIDEO_MODEL_IDS: readonly { id: string; endpoint: string; ctx: numbe
 export const BUDDY_IMAGE_MODEL_ID_SET: ReadonlySet<string> = new Set(
   BUDDY_IMAGE_MODEL_IDS.map((entry) => entry.id),
 );
+
+/**
+ * Ids the buddy facade refuses on a free plan.
+ *
+ * The international CodeBuddy and WorkBuddy catalogs share this roster and
+ * the same Pro-tier model classification.
+ *
+ * Nothing in the console directory predicts it. `credits` does not — `kimi-k3`
+ * bills `x1.62` and is served while `gpt-5.6-luna` bills `x0.14` and is
+ * refused — and `vendor` does not either. Only the refusal itself is a signal,
+ * which is why this is a list and not a rule.
+ *
+ * Hardcoded deliberately: it is one account's tier, so it is a fact about that
+ * plan rather than about the model. A pro account serves all six. The pill is
+ * therefore a hint about a free account, and a dispatch is what settles it.
+ *
+ * @see `.skills/cartethyia-reverse-engineering/references/codebuddy-dispatch-headers.md`
+ */
+export const BUDDY_PRO_ONLY_MODEL_IDS: ReadonlySet<string> = new Set([
+  "primary-model",
+  "gpt-5.6-terra",
+  "gpt-5.6-luna",
+  "gpt-5.6-sol",
+  "gpt-6-luna",
+  "gpt-6-sol",
+  "gpt-6.1-sol",
+  "gpt-5.5",
+  "gpt-5.4",
+  "gemini-3.5-flash",
+  "gemini-3.8-flash",
+  "grok-4.6",
+  "grok-4.7",
+  "kimi-k3.1-pro-highspeed",
+]);
 
 /**
  * Builds the image-generation rows for one buddy provider.
@@ -184,6 +219,11 @@ export function makeBuddyModel(
   if (!entry[0]) throw new GatewayError("invalid_request", 400, "invalid model");
   const image = BUDDY_IMAGE_MODEL_ID_SET.has(entry[0]);
   const efforts = (realm === "cn" ? BUDDY_CN_EFFORTS : BUDDY_INTL_EFFORTS)[entry[0].toLowerCase()];
+  // Refused on free is only a question for the intl realm. cbcn serves every
+  // model on its free plan (none of the six ids here is refused there), so
+  // the same set applied to a CN row would publish a tier fact that nobody
+  // measured and that the CN account would simply disagree with on dispatch.
+  const proOnly = realm === "intl" && BUDDY_PRO_ONLY_MODEL_IDS.has(entry[0].toLowerCase());
   return defineModel({
     id: entry[0],
     providerId,
@@ -195,6 +235,7 @@ export function makeBuddyModel(
     ctx: entry[4],
     out: entry[5],
     ...(image ? { toolCall: false } : entry[6] === undefined ? {} : { toolCall: entry[6] }),
+    ...(proOnly ? { proOnly: true } : {}),
   });
 }
 
@@ -217,9 +258,8 @@ export const BUDDY_SHARED_RAW: readonly BuddyRawEntry[] = [
   ["claude-opus-4.6", "Claude Opus 4.6", true, true, 200_000, 64_000],
   ["claude-opus-4.7-1m", "Claude Opus 4.7 1M", true, true, 1_000_000, 64_000],
   ["claude-sonnet-4.6", "Claude Sonnet 4.6", true, true, 200_000, 32_000],
-  ["deepseek-v4.1-flash", "DeepSeek V4.1 Flash", true, false, 1_000_000, 384_000],
-  ["deepseek-v4.1-flash-sg", "DeepSeek V4.1 Flash SG", true, false, 1_000_000, 128_000],
-  ["deepseek-v4.1-pro", "DeepSeek V4.1 Pro", true, false, 1_000_000, 384_000],
+  ["deepseek-v4.1-flash", "DeepSeek V4.1 Flash", true, true, 1_000_000, 384_000],
+  ["deepseek-v4.1-flash-sg", "DeepSeek V4.1 Flash SG", true, true, 1_000_000, 128_000],
   ["gemini-2.5-flash-image", "Gemini 2.5 Flash Image", true, true, 1_000_000, 64_000],
   ["gemini-3.0-pro-image", "Gemini 3.0 Pro Image", true, true, 1_000_000, 64_000],
   ["gemini-3.1-flash-image", "Gemini 3.1 Flash Image", true, true, 1_000_000, 64_000],
@@ -238,7 +278,6 @@ export const BUDDY_SHARED_RAW: readonly BuddyRawEntry[] = [
   ["gpt-5.6-sol", "GPT-5.6 Sol", true, true, 1_050_000, 128_000],
   ["gpt-5.6-terra", "GPT-5.6 Terra", true, true, 1_050_000, 128_000],
   ["gpt-6-luna", "GPT-6 Luna", true, true, 1_050_000, 128_000],
-  ["deep-model", "Deep Model", true, true, null, null],
   ["gpt-6-sol", "GPT-6 Sol", true, true, 1_000_000, 128_000, true],
   ["gpt-6.1-sol", "GPT-6.1 Sol", true, true, 1_050_000, 128_000],
   ["gpt-image-2", "GPT-Image-2", true, true, 400_000, 128_000],
@@ -246,13 +285,15 @@ export const BUDDY_SHARED_RAW: readonly BuddyRawEntry[] = [
   ["grok-4.7", "Grok 4.7", true, true, 500_000, 500_000],
   ["hy3", "Hy3", true, false, 192_000, 64_000, true],
   ["hy3-preview", "Hy3 Preview", true, false, 262_144, 64_000],
-  ["hy4-preview", "Hy4 Preview", true, false, 1_000_000, 64_000, true],
-  ["hy4-preview-f", "Hy4 Preview F", true, false, 1_000_000, 64_000, true],
+  ["hy4-preview", "Hy4 Preview", true, true, 1_000_000, 64_000, true],
+  ["hy4-preview-f", "Hy4 Preview F", true, true, 1_000_000, 64_000, true],
   ["kimi-k2.5", "Kimi K2.5", true, false, 164_000, 262_144],
   ["kimi-k2.6", "Kimi K2.6", true, false, 256_000, 262_144],
   ["kimi-k2.7", "Kimi K2.7", true, false, 256_000, 65_536],
   ["kimi-k2.8-preview", "Kimi K2.8 Preview", true, false, 1_048_576, 65_536],
   ["kimi-k3", "Kimi K3", true, false, 1_048_576, 131_072],
+  ["kimi-k3.1-pro", "Kimi K3.1 Pro", true, true, 1_000_000, 64_000],
+  ["kimi-k3.1-pro-highspeed", "Kimi K3.1 Pro Highspeed", true, true, 1_000_000, 64_000],
   ["minimax-m3", "MiniMax-M3", true, false, 512_000, 512_000],
   ["step-5-preview", "Step-5-Preview", true, true, 1_000_000, 64_000, true],
 ];

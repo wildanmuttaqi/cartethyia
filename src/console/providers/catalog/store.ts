@@ -13,11 +13,11 @@ import { buddyTaskLedger, models, providerAccounts, providerOauthStates, provide
 import { queryTelemetryEvents } from "../../../observability/event-log";
 import { isGatewayError } from "../../../observability/telemetry-status";
 import type { WireFamily } from "../../../protocol/canonical-model";
-import { listAccountHealthEvents, recoverAccount, type AccountHealthEventRecord } from "../../../providers/operations/account-health-service";
+import { listAccountHealthEvents, recoverAccount, deleteAccountHealthEvents, type AccountHealthEventRecord } from "../../../providers/operations/account-health-service";
 import { invalidateCredentialCache } from "../../../providers/operations/provider-credential-service";
 import { encryptCredential, hashSecret } from "../../../security/crypto";
 import type { TelemetryBatchBuffer } from "../../../observability/telemetry-buffer";
-import type { BundledProviderCatalog } from "../../../providers/operations/provider-catalog-service";
+import { bumpCatalogRevision, type BundledProviderCatalog } from "../../../providers/operations/provider-catalog-service";
 import type { AccountInflightReading, BuddyGrowthTaskLedgerEntry, ByokConnectionTestRequest, ByokConnectionTestResult, CreateProviderAccountBatchItemResult, CreateProviderAccountBatchResult, CreateProviderAccountRequest, CredentialMode, ModelCatalogEntry, ProbeAllAccountsResult, ProbeAllModelsResult, ProbeModelRequest, ProbeModelResult, ProviderAccountResponse, ProviderAccountTokenUsage, ProviderCatalogStore, ProviderRecord, SetModelEnabledRequest, UpdateModelMetadataRequest, UpdateProviderAccountRequest, ModelMetadataOverride } from "./contracts";
 import { isServiceKind, validateCompatibilityProfile } from "./contracts";
 import { ProviderProbingService, type ProbeOutboundResolver } from "../../../providers/discovery/probing-service";
@@ -184,8 +184,8 @@ export function parsePastedOAuthCredential(raw: string): {
  * The account configuration a pasted export carries beside its tokens.
  *
  * Kiro refuses a generation request that omits the profile the account is bound
- * to, and legacy exports carry that profile under a different key. Reading
- * neither is how an imported account probes with no
+ * to, and exports from older installs carry that profile under a different key.
+ * Reading neither is how an imported account probes with no
  * profile and is answered `400 profileArn is required`.
  */
 function pastedAuthState(
@@ -266,7 +266,7 @@ function firstStringFrom(
  *
  * Expired entries are dropped rather than returned: the sweep that clears them
  * runs on a timer, so between the deadline passing and the sweep a raw read
- * would report a cooldown that no longer applies.
+ * would report a cooldown that is not in force.
  */
 function liveModelCooldowns(
   raw: unknown,
@@ -335,6 +335,13 @@ export function mapModelRow(
     cost: row.cost as ModelCatalogEntry["cost"],
     source: row.source,
     ...(unfiled ? { limitsEstimated: true } : {}),
+    // Three-valued on the wire as it is in the column: only a row that claims
+    // `true` is pro-only. Absence means nobody established the tier, and the
+    // surface must render that as unknown rather than as free.
+    ...(row.proOnly === true ? { proOnly: true } : {}),
+    // Same three-valued rule, from the provider's own directory. Qoder states
+    // `is_free` per row, so a plan change moves the pill without a code change.
+    ...(row.freeTier === true ? { freeTier: true } : {}),
     sourceUpdatedAt: row.sourceUpdatedAt?.toISOString() ?? null,
   } satisfies ModelCatalogEntry;
 }
@@ -487,6 +494,10 @@ export class DrizzleProviderCatalogStore implements ProviderCatalogStore {
       .returning({ id: providers.id });
     if (deleted.length === 0) return false;
     this.providerRegistry.unregister(providerId);
+    // The provider left the registry, so the compiled catalog is now missing it
+    // — the snapshot's re-seed is gated on that revision, and a delete that did
+    // not bump it would leave the provider's model rows behind.
+    bumpCatalogRevision();
     return true;
   }
   async updateGlobal(
@@ -630,12 +641,12 @@ export class DrizzleProviderCatalogStore implements ProviderCatalogStore {
       staticEndpoint === undefined ? undefined : { [family]: staticEndpoint },
     );
     if (modelIds.length === 0) return;
-    // Single multi-row insert (was N sequential round-trips) and upsert the
-    // capability flags so a re-registration repairs a row whose `tool_call`
-    // (and `reasoning`) was seeded false — a manual add previously persisted
-    // schema defaults, which capability preflight reads as "route cannot use
-    // tools" and silently strips `tools` from every request. `enabled` stays
-    // operator-owned; `source` is refreshed to `manual`.
+    // Single multi-row insert and upsert of the capability flags so a
+    // re-registration repairs a row whose `tool_call` (and `reasoning`) was
+    // seeded false — a manual add persists schema defaults, which capability
+    // preflight reads as "route cannot use tools" and silently strips `tools`
+    // from every request. `enabled` stays operator-owned; `source` is refreshed
+    // to `manual`.
     await this.db
       .insert(models)
       .values(
@@ -1455,6 +1466,27 @@ export class DrizzleProviderCatalogStore implements ProviderCatalogStore {
       .limit(1);
     if (owned.length === 0) return [];
     return listAccountHealthEvents(this.db, accountId);
+  }
+
+  /** Deletes one account's stored health & error rows, for the modal's purge. */
+  async purgeAccountHealthEvents(
+    tenantId: string,
+    providerId: string,
+    accountId: string,
+  ): Promise<number> {
+    const owned = await this.db
+      .select({ id: providerAccounts.id })
+      .from(providerAccounts)
+      .where(
+        and(
+          eq(providerAccounts.id, accountId),
+          eq(providerAccounts.providerId, providerId),
+          globalOrOwnedBy(providerAccounts.tenantId, tenantId),
+        ),
+      )
+      .limit(1);
+    if (owned.length === 0) return 0;
+    return deleteAccountHealthEvents(this.db, accountId);
   }
   async listBuddyGrowthTasks(
     tenantId: string,

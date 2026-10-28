@@ -29,7 +29,30 @@ const CRED_CACHE_MAX_ENTRIES = 2_000;
 interface CredCacheEntry {
   readonly at: number;
   readonly value: ResolvedCredential;
+  /**
+   * When this entry must stop being served, or `undefined` for "the default
+   * TTL applies".
+   *
+   * Per-entry rather than global because a credential's usable lifetime is a
+   * property of the credential: an OAuth token with 30 minutes left can be
+   * served for the full window, one with 20 seconds left for almost none of
+   * it. Storing the bound on the entry lets both share one cache.
+   */
+  readonly expiresAt?: number;
 }
+
+/**
+ * Margin kept between a cached OAuth token's expiry and the moment the cache
+ * stops serving it.
+ *
+ * The old rule refused to cache OAuth at all unless the token outlived the
+ * whole 5 s window, which meant every attempt paid a SELECT + AES-GCM decrypt
+ * for every OAuth account — the largest remaining per-request DB read. Caching
+ * against the token's own expiry is the same safety with a fraction of the
+ * reads. The margin covers clock skew between this process and the issuer, and
+ * the time a request already in flight may hold the value.
+ */
+const CRED_CACHE_EXPIRY_MARGIN_MS = 30_000;
 
 const credCache = new Map<string, CredCacheEntry>();
 
@@ -129,14 +152,33 @@ export async function loadAccountWithFreshness(
   const row = rows[0];
   if (!row) return undefined;
   const lead = skewMs ?? refreshLeadMs(row.providerId);
+  // A refresh-capable OAuth account with no stored expiry is unknown-liveness:
+  // we have no evidence the access token still works. The old rule left
+  // `dueAt` undefined for these, so `resolveCredentialForAccount` skipped the
+  // refresh branch and dispatch sent the pasted token as-is. For a token that
+  // had already expired on another installation (a 9router/Omniroute import
+  // carrying `accessToken` + `refreshToken` + a past `expiresAt` that was
+  // dropped by validation, a hand-pasted OAuth bundle with no expiry field,
+  // or an upstream that stopped minting expiries) that produced the exact
+  // "re-authenticate" refusal the refresh grant exists to prevent. Marking the
+  // token due immediately refreshes it on first use; the sweep handles the
+  // normal case where `expires_at` is populated.
+  const hasRefreshGrant = row.refreshCiphertext != null;
+  const kindOauth = row.credentialKind === "oauth";
+  const unknownExpiryButRefreshable =
+    kindOauth && !row.staticToken && hasRefreshGrant && row.expiresAt == null;
   return {
     row,
     // A static token is never "due": it is used as issued and there is no
     // refresh to run, so the dispatch path must not treat it as stale.
     dueAt:
-      row.staticToken || row.expiresAt == null
+      row.staticToken
         ? undefined
-        : row.expiresAt.getTime() - lead,
+        : row.expiresAt != null
+          ? row.expiresAt.getTime() - lead
+          : unknownExpiryButRefreshable
+            ? 0
+            : undefined,
   };
 }
 
@@ -159,9 +201,14 @@ export async function resolveCredentialForAccount(
   // the cached value would contain a soon-to-expire secret.
   const now = Date.now();
   const cached = credCache.get(credCacheKey(providerId, accountId));
-  if (cached && now - cached.at < CRED_CACHE_TTL_MS) {
-    const kind = (cached.value as { credential_kind?: string }).credential_kind;
-    if (kind !== "oauth") return cached.value;
+  if (cached) {
+    // Two independent bounds: the cache window (rotation freshness) and, for a
+    // credential whose usable life was known, the moment that life ends. The
+    // shorter one wins, so a token about to expire is never served past it and
+    // no credential is served stale for longer than the window.
+    const withinWindow = now - cached.at < CRED_CACHE_TTL_MS;
+    const withinLife = cached.expiresAt === undefined || now < cached.expiresAt;
+    if (withinWindow && withinLife) return cached.value;
   }
 
   const parsedProviderId = parseProviderId(providerId);
@@ -195,7 +242,14 @@ export async function resolveCredentialForAccount(
   if (row.credentialKind === "oauth" && oauth && dueAt !== undefined && dueAt <= Date.now()) {
     const refresher = await oauth.resolveRefresher(row.providerId);
     if (refresher) {
-      secret = await oauth.refreshService.ensureFreshAccessToken(accountId, refresher) ?? undefined;
+      // Try to refresh. If it fails (refresh grant dead, upstream unreachable,
+      // etc.) keep the already-decrypted stale secret rather than wiping it:
+      // dispatch then sends the token we have, and the upstream's own 401 is
+      // the authoritative verdict. Wiping it here turned "token expired" into
+      // a credential-less GatewayError before the request ever left, which is
+      // worse than letting the server say so.
+      const refreshed = await oauth.refreshService.ensureFreshAccessToken(accountId, refresher);
+      if (refreshed) secret = refreshed;
     }
   }
 
@@ -208,11 +262,22 @@ export async function resolveCredentialForAccount(
     ...(authState === undefined ? {} : { auth_state: authState }),
   };
   const value = resolver.resolve(parsedProviderId, [alternative]).credential;
-  // Cache non-OAuth credentials unconditionally; OAuth only when far from expiry.
+  // Every credential is cached; an OAuth token with a known expiry simply gets
+  // a shorter bound. Refusing to cache OAuth was the safe-looking choice that
+  // cost a SELECT + decrypt per attempt, and it was stricter than necessary:
+  // the risk is serving an expired token, which a TTL tied to that token
+  // expiry prevents as completely as not caching does.
   const isOAuth = row.credentialKind === "oauth";
-  const safeToCache = !isOAuth || (dueAt !== undefined && dueAt > now + CRED_CACHE_TTL_MS);
-  if (safeToCache) {
-    credCache.set(credCacheKey(providerId, accountId), { at: now, value });
+  const lifeBound =
+    isOAuth && dueAt !== undefined ? dueAt - CRED_CACHE_EXPIRY_MARGIN_MS : undefined;
+  // A token already inside the margin must not be cached at all — its bound
+  // would be in the past, so the entry would be dead on arrival.
+  if (lifeBound === undefined || lifeBound > now) {
+    credCache.set(credCacheKey(providerId, accountId), {
+      at: now,
+      value,
+      ...(lifeBound === undefined ? {} : { expiresAt: lifeBound }),
+    });
     evictCredCacheOldest();
   }
   return value;

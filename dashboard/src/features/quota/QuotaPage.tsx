@@ -9,7 +9,6 @@ import {
   Loader2,
   RefreshCw,
   RotateCcw,
-  SlidersHorizontal,
   Trash2,
   TriangleAlert,
   Zap,
@@ -28,7 +27,7 @@ import { HealthEventsModal } from "../../components/HealthEventsModal";
 import { Select } from "../../components/ui/select";
 
 import { Stack } from "../../components/ui/stack";
-import { Card, CardBody, CardHeader } from "../../components/ui/card";
+import { Card, CardBody } from "../../components/ui/card";
 import { toast } from "../../lib/toast";
 import {
   useQuotaOverview,
@@ -124,13 +123,16 @@ function QuotaAccountResetModal({
             {(resets.data?.availableCount ?? 0) === 1 ? "" : "s"}
           </Badge>
         </div>
+        {/* `compact` throughout: these render in a dialog body rather than a
+            route, so they must not reserve the route-level centering floor. */}
 
         {resets.isPending ? (
-          <LoadingState label="Reading saved resets…" />
+          <LoadingState compact label="Reading saved resets…" />
         ) : resets.isError ? (
-          <ErrorState message="Failed to read saved resets" onRetry={() => void resets.refetch()} />
+          <ErrorState compact message="Failed to read saved resets" onRetry={() => void resets.refetch()} />
         ) : credits.length === 0 ? (
           <EmptyState
+            compact
             title="No saved resets"
             message="This account has no saved rate-limit reset credits right now."
             icon={<Zap size={20} />}
@@ -506,9 +508,9 @@ function QuotaCard({
           <Button
             variant="ghost"
             size="sm"
-            // The card no longer carries a status pill, so this is where the
-            // status is read: the account's own state, then where to inspect it.
-            // A healthy account still just says "Health & Error Log".
+            // This is where the status is read: the account's own state, then
+            // where to inspect it. A healthy account still just says
+            // "Health & Error Log".
             title={
               healthStatus === "active"
                 ? "Health & Error Log"
@@ -783,9 +785,6 @@ export default function QuotaPage(): ReactNode {
 
   return (
     <Stack gap="16px" className="dashboard-page min-h-0 flex-1">
-      <Card>
-        <CardHeader title="Quota" subtitle="Provider account limits and what is left of them" icon={<SlidersHorizontal size={16} />} />
-      </Card>
       <Card>
         <CardBody className="flex flex-col gap-5">
       <div className="flex flex-wrap items-center justify-between gap-5">

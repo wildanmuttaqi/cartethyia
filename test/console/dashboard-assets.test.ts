@@ -48,6 +48,14 @@ beforeAll(async () => {
   await writeFile(join(buildDir, "favicon.webp"), "RIFF");
   await mkdir(join(buildDir, "providers"), { recursive: true });
   await writeFile(join(buildDir, "providers", "openai-light.svg"), "<svg/>");
+  // A hashed asset and its precompressed sibling, as the Vite build emits
+  // them: immutable bytes, compressed once at build time.
+  await mkdir(join(buildDir, "hashassets"), { recursive: true });
+  await writeFile(join(buildDir, "hashassets", "app.a1b2c3d4.js"), "console.log('bundle')");
+  await writeFile(
+    join(buildDir, "hashassets", "app.a1b2c3d4.js.gz"),
+    Bun.gzipSync(new TextEncoder().encode("console.log('bundle')")),
+  );
   await mkdir(join(buildDir, "nested"), { recursive: true });
   await writeFile(join(buildDir, "nested", "deep.txt"), "deep");
   // A sibling of the build dir, to prove traversal cannot reach it.
@@ -57,6 +65,104 @@ beforeAll(async () => {
 
 afterAll(async () => {
   await rm(buildDir, { recursive: true, force: true }).catch(() => undefined);
+});
+
+describe("static assets — precompressed siblings", () => {
+  test("a gzip client gets the .gz with content-encoding set", async () => {
+    const result = await handler("/hashassets/app.a1b2c3d4.js", "gzip");
+    expect(result.status).toBe(200);
+    expect(result.headers["content-encoding"]).toBe("gzip");
+    // The bytes are what a browser would decompress back to the source.
+    expect(new TextDecoder().decode(Bun.gunzipSync(result.body as Uint8Array<ArrayBuffer>))).toBe(
+      "console.log('bundle')",
+    );
+  });
+
+  test("vary is set so a cache cannot serve gzip to a client that did not ask", async () => {
+    // The URL is identical either way, so `accept-encoding` is the only thing
+    // that distinguishes the two representations.
+    const result = await handler("/hashassets/app.a1b2c3d4.js", "gzip");
+    expect(result.headers.vary).toBe("accept-encoding");
+  });
+
+  test("the immutable cache-control is preserved", async () => {
+    const gzipped = await handler("/hashassets/app.a1b2c3d4.js", "gzip");
+    const plain = await handler("/hashassets/app.a1b2c3d4.js");
+    expect(gzipped.headers["cache-control"]).toBe(plain.headers["cache-control"]);
+  });
+
+  test("a client that did not offer gzip gets the plain file", async () => {
+    const result = await handler("/hashassets/app.a1b2c3d4.js", "identity");
+    expect(result.headers["content-encoding"]).toBeUndefined();
+    expect(bodyText(result)).toBe("console.log('bundle')");
+  });
+
+  test("an absent header serves the plain file", async () => {
+    // The non-HTTP caller path: no header, no guess.
+    const result = await handler("/hashassets/app.a1b2c3d4.js");
+    expect(result.headers["content-encoding"]).toBeUndefined();
+    expect(bodyText(result)).toBe("console.log('bundle')");
+  });
+
+  test("a hashed asset with no .gz falls back to the plain file", async () => {
+    // A build without the precompress plugin must still work.
+    const result = await handler("/assets.js", "gzip");
+    expect(result.status).toBe(200);
+    expect(result.headers["content-encoding"]).toBeUndefined();
+    expect(bodyText(result)).toBe("console.log('bundle')");
+  });
+
+  test("an unhashed asset is never served from a .gz, even when one exists", async () => {
+    // The risky pair: an unhashed file may be replaced in place, so a `.gz`
+    // left beside an earlier copy would not describe the bytes now on disk.
+    // The plain file is always correct; the compression is not worth the doubt.
+    await writeFile(
+      join(buildDir, "assets.js.gz"),
+      Bun.gzipSync(new TextEncoder().encode("stale bundle from an older build")),
+    );
+    const plain = await handler("/assets.js", "gzip");
+    expect(plain.status).toBe(200);
+    expect(plain.headers["content-encoding"]).toBeUndefined();
+    expect(bodyText(plain)).toBe("console.log('bundle')");
+  });
+
+  test("the content type is the asset's own, not the archive's", async () => {
+    const result = await handler("/hashassets/app.a1b2c3d4.js", "gzip");
+    expect(result.headers["content-type"]).toContain("javascript");
+  });
+});
+
+describe("static assets — hashed vs unhashed", () => {
+  /**
+   * The cache header for a hashed asset is `immutable`; for anything else it
+   * revalidates. So this predicate is load-bearing in both directions: a hashed
+   * asset treated as unhashed is re-downloaded after every deploy, and an
+   * unhashed one treated as hashed is pinned in the browser cache until it
+   * expires.
+   */
+  const cases: ReadonlyArray<{ name: string; hashed: boolean; why: string }> = [
+    { name: "app-BCnqn3N3.js", hashed: true, why: "the modern Vite spelling: hyphen separator" },
+    { name: "app.a1b2c3d4.js", hashed: true, why: "the older dot-separated spelling" },
+    { name: "entry-CBp7BXQq.js", hashed: true, why: "a chunk entry, same shape" },
+    { name: "app-N-ONyork.css", hashed: true, why: "CSS chunk, hash contains hyphens" },
+    { name: "script_ab12cd34ef.js", hashed: true, why: "underscore separator" },
+    { name: "index.html", hashed: false, why: "the entry document is never immutable" },
+    { name: "console-backgrounds.jpg", hashed: false, why: "a word, despite matching the separator" },
+    { name: "openai-light.svg", hashed: false, why: "a provider icon; must revalidate" },
+    { name: "favicon.jpg", hashed: false, why: "no hash segment at all" },
+    { name: "wuthering-waves-hiyuki-aemeath-hiyuki-rover.webp", hashed: false, why: "story art: words, not a hash" },
+  ];
+
+  for (const testCase of cases) {
+    test(`${testCase.name} is ${testCase.hashed ? "hashed" : "unhashed"} — ${testCase.why}`, async () => {
+      const dir = join(buildDir, "hashdetect");
+      await mkdir(dir, { recursive: true });
+      await writeFile(join(dir, testCase.name), "x");
+      const result = await handler(`/hashdetect/${testCase.name}`);
+      const cacheControl = result.headers["cache-control"] ?? "";
+      expect(cacheControl.includes("immutable")).toBe(testCase.hashed);
+    });
+  }
 });
 
 describe("static assets — served files", () => {
