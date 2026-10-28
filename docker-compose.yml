@@ -26,7 +26,7 @@ services:
     restart: unless-stopped
     networks:
       cartethyia:
-        ipv4_address: 172.30.0.2
+        ipv4_address: 172.30.0.3
 
   nginx:
     image: nginx:alpine
@@ -42,7 +42,7 @@ services:
     restart: unless-stopped
     networks:
       cartethyia:
-        ipv4_address: ${CARTETHYIA_CLOUDFLARED_IP:-172.30.0.3}
+        ipv4_address: ${CARTETHYIA_CLOUDFLARED_IP:-172.30.0.4}
 
   # Redis is bundled for Docker's default full capabilities. Set
   # CARTETHYIA_REDIS_URL empty for the in-memory backend. PostgreSQL is never
